@@ -1,6 +1,8 @@
 """Gate 3 Slice 3 — governed conversion of a recommendation into an investment
 decision (+ optional Gate 1 ActionRequest), with staleness, compatibility, an
-independent BUILD re-gate, and the VALIDATE spend boundary.
+independent BUILD re-gate, the VALIDATE spend boundary, and submission of any
+consequential ActionRequest into the existing Gate 1 policy boundary
+(ALLOW / REQUIRE_APPROVAL / DENY), without approving or executing.
 """
 from __future__ import annotations
 
@@ -8,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 
-from aidan_core import commitment, nextaction, validation, ventures
+from aidan_core import approvals, budget, commitment, execution, killswitch, nextaction, validation, ventures
 from aidan_core.errors import (
     BuildGateNotSatisfiedError,
     ConsequentialSpendError,
@@ -81,6 +83,22 @@ def _count(conn, table, vid):
     with conn.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {table} WHERE venture_id = %s", (vid,))
         return cur.fetchone()[0]
+
+
+def _validate_ready(conn, vid, opp, *, max_spend=1000):
+    """A state the allocator recommends VALIDATE for, with a bounded test."""
+    aid = _assume(conn, vid, opp)
+    tid = _test(conn, vid, opp, aid, max_spend=max_spend)
+    return aid, tid
+
+
+def _no_execution_side_effects(conn, action_id):
+    """A governed decision + policy evaluation must not execute or prove."""
+    assert execution.get_status(conn, action_id) != "SUCCEEDED"
+    with conn.cursor() as cur:
+        for table in ("proof_receipt", "execution_attempt"):
+            cur.execute(f"SELECT count(*) FROM {table}")
+            assert cur.fetchone()[0] == 0, table
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +253,7 @@ def test_build_refused_when_acquisition_validation_absent(migrated):
 
 def test_build_with_bounded_amount_creates_pending_actionrequest(migrated):
     vid = ventures.create_venture(migrated, slug="c-buildamt")
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
     opp = _opp(migrated, vid)
     _build_ready(migrated, vid, opp)
     rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
@@ -242,13 +261,18 @@ def test_build_with_bounded_amount_creates_pending_actionrequest(migrated):
 
     out = commitment.commit_recommendation(migrated, rec.recommendation_id, requested_amount=250)
     assert out.decision == "BUILD" and out.resulting_action_id is not None
+    # The consequential BUILD action entered the Gate 1 policy boundary.
+    assert out.policy_decision == "ALLOW" and out.policy_decision_id is not None
+    assert execution.get_status(migrated, out.resulting_action_id) == "PENDING"
     with migrated.cursor() as cur:
-        cur.execute("SELECT status, requested_amount FROM action_request WHERE id = %s", (out.resulting_action_id,))
-        status, amount = cur.fetchone()
-    assert status == "PENDING" and amount == Decimal("250.0000")
-    # A decision + resulting action do NOT authorise, spend, or execute.
-    with migrated.cursor() as cur:
-        for table in ("policy_decision", "capital_entry", "proof_receipt", "execution_attempt"):
+        cur.execute("SELECT requested_amount FROM action_request WHERE id = %s", (out.resulting_action_id,))
+        assert cur.fetchone()[0] == Decimal("250.0000")
+        # Policy evaluated (one decision); nothing reserved, executed, or proven.
+        cur.execute("SELECT count(*) FROM policy_decision WHERE action_request_id = %s", (out.resulting_action_id,))
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT reserved_amount, committed_amount FROM budget_account WHERE venture_id = %s", (vid,))
+        assert cur.fetchone() == (Decimal("0.0000"), Decimal("0.0000"))
+        for table in ("proof_receipt", "execution_attempt"):
             cur.execute(f"SELECT count(*) FROM {table}")
             assert cur.fetchone()[0] == 0, table
     assert ventures.get_venture(migrated, vid)[2] == "DISCOVERED"
@@ -260,6 +284,7 @@ def test_build_with_bounded_amount_creates_pending_actionrequest(migrated):
 # --------------------------------------------------------------------------
 def test_validate_spend_within_max_spend_creates_action(migrated):
     vid = ventures.create_venture(migrated, slug="c-spendok")
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
     opp = _opp(migrated, vid)
     aid = _assume(migrated, vid, opp)
     tid = _test(migrated, vid, opp, aid, max_spend=500)
@@ -269,6 +294,7 @@ def test_validate_spend_within_max_spend_creates_action(migrated):
 
     out = commitment.commit_recommendation(migrated, rec.recommendation_id, requested_amount=400)
     assert out.decision == "VALIDATE" and out.resulting_action_id is not None
+    assert out.policy_decision == "ALLOW"
     with migrated.cursor() as cur:
         cur.execute("SELECT status, requested_amount, payload FROM action_request WHERE id = %s", (out.resulting_action_id,))
         status, amount, payload = cur.fetchone()
@@ -328,8 +354,18 @@ def test_commit_is_idempotent_per_recommendation(migrated):
     assert second.created is False
     assert second.decision_id == first.decision_id
     assert second.resulting_action_id == first.resulting_action_id
+    # Same canonical policy outcome on retry; no duplicate decision/action/policy.
+    assert second.policy_decision == first.policy_decision
     assert _count(migrated, "investment_decision_record", vid) == 1
     assert _count(migrated, "action_request", vid) == 1
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM policy_decision WHERE action_request_id = %s", (first.resulting_action_id,))
+        assert cur.fetchone()[0] == 1  # exactly one policy decision, not two
+        cur.execute(
+            "SELECT count(*) FROM audit_event WHERE action_id = %s AND event_type = 'policy.evaluated'",
+            (first.resulting_action_id,),
+        )
+        assert cur.fetchone()[0] == 1  # no duplicate policy audit
 
 
 def test_missing_recommendation_raises(migrated):
@@ -337,3 +373,116 @@ def test_missing_recommendation_raises(migrated):
 
     with pytest.raises(NotFoundError):
         commitment.commit_recommendation(migrated, "00000000-0000-0000-0000-000000000000")
+
+
+# --------------------------------------------------------------------------
+# Gate 1 policy boundary: a consequential VALIDATE action must enter the existing
+# ActionRequest -> Policy path and yield ALLOW / REQUIRE_APPROVAL / DENY, without
+# approving, executing, moving capital, or manufacturing success.
+# --------------------------------------------------------------------------
+def test_policy_allow(migrated):
+    vid = ventures.create_venture(migrated, slug="c-allow", autonomy_level=1)
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
+    opp = _opp(migrated, vid)
+    _validate_ready(migrated, vid, opp, max_spend=1000)
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+    assert rec.action_type == "VALIDATE"
+
+    out = commitment.commit_recommendation(
+        migrated, rec.recommendation_id, requested_amount=400, required_autonomy=1
+    )
+    assert out.decision == "VALIDATE" and out.policy_decision == "ALLOW"
+    assert out.approval_id is None
+    # ALLOW does not execute: status stays PENDING, no approval opened.
+    assert execution.get_status(migrated, out.resulting_action_id) == "PENDING"
+    _no_execution_side_effects(migrated, out.resulting_action_id)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT decision, reason FROM policy_decision WHERE action_request_id = %s", (out.resulting_action_id,))
+        assert cur.fetchone() == ("ALLOW", "ALLOWED")
+        cur.execute("SELECT count(*) FROM approval WHERE action_request_id = %s", (out.resulting_action_id,))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT reserved_amount, committed_amount FROM budget_account WHERE venture_id = %s", (vid,))
+        assert cur.fetchone() == (Decimal("0.0000"), Decimal("0.0000"))  # ALLOW != reservation
+    assert ventures.get_venture(migrated, vid)[2] == "DISCOVERED"
+
+
+def test_policy_require_approval_not_auto_granted(migrated):
+    vid = ventures.create_venture(migrated, slug="c-appr", autonomy_level=0)
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
+    opp = _opp(migrated, vid)
+    _validate_ready(migrated, vid, opp, max_spend=1000)
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+
+    # required_autonomy above the venture's autonomy -> REQUIRE_APPROVAL.
+    out = commitment.commit_recommendation(
+        migrated, rec.recommendation_id, requested_amount=400, required_autonomy=2
+    )
+    assert out.policy_decision == "REQUIRE_APPROVAL"
+    assert out.approval_id is not None
+    # The approval is opened PENDING and NOT automatically granted.
+    assert approvals.get_approval(migrated, out.approval_id)[3] == "PENDING"
+    assert execution.get_status(migrated, out.resulting_action_id) == "AWAITING_APPROVAL"
+    _no_execution_side_effects(migrated, out.resulting_action_id)
+    assert ventures.get_venture(migrated, vid)[2] == "DISCOVERED"
+
+
+def test_policy_deny_kill_switch(migrated):
+    vid = ventures.create_venture(migrated, slug="c-deny-ks", autonomy_level=1)
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
+    opp = _opp(migrated, vid)
+    _validate_ready(migrated, vid, opp, max_spend=1000)
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+    killswitch.engage_global(migrated, engaged_by="op")
+
+    out = commitment.commit_recommendation(
+        migrated, rec.recommendation_id, requested_amount=400, required_autonomy=1
+    )
+    # Kill switch has highest precedence -> DENY. Decision + action still recorded.
+    assert out.decision == "VALIDATE" and out.policy_decision == "DENY"
+    with migrated.cursor() as cur:
+        cur.execute("SELECT reason FROM policy_decision WHERE action_request_id = %s", (out.resulting_action_id,))
+        assert cur.fetchone()[0] == "KILL_SWITCH_GLOBAL"
+    assert execution.get_status(migrated, out.resulting_action_id) == "PENDING"
+    _no_execution_side_effects(migrated, out.resulting_action_id)
+    # The investment decision remains a separate historical record.
+    assert _count(migrated, "investment_decision_record", vid) == 1
+
+
+def test_policy_deny_insufficient_budget(migrated):
+    vid = ventures.create_venture(migrated, slug="c-deny-bud", autonomy_level=1)
+    # No budget granted -> available 0 < requested amount.
+    opp = _opp(migrated, vid)
+    _validate_ready(migrated, vid, opp, max_spend=1000)
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+
+    out = commitment.commit_recommendation(
+        migrated, rec.recommendation_id, requested_amount=400, required_autonomy=1
+    )
+    assert out.policy_decision == "DENY"
+    with migrated.cursor() as cur:
+        cur.execute("SELECT reason FROM policy_decision WHERE action_request_id = %s", (out.resulting_action_id,))
+        assert cur.fetchone()[0] == "INSUFFICIENT_BUDGET"
+    _no_execution_side_effects(migrated, out.resulting_action_id)
+    # Governance denial is not market evidence: no validation result fabricated.
+    assert _count(migrated, "validation_result", vid) == 0
+
+
+def test_separation_decision_persists_while_action_awaits_governance(migrated):
+    vid = ventures.create_venture(migrated, slug="c-sep", autonomy_level=0)
+    budget.grant_budget(migrated, vid, amount=1000, currency="USD")
+    opp = _opp(migrated, vid)
+    _validate_ready(migrated, vid, opp, max_spend=1000)
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+    results_before = _count(migrated, "validation_result", vid)
+
+    out = commitment.commit_recommendation(
+        migrated, rec.recommendation_id, requested_amount=400, required_autonomy=2
+    )
+    # The investment decision exists as a durable record while the action still
+    # awaits governance (REQUIRE_APPROVAL, not executed, not succeeded).
+    assert _count(migrated, "investment_decision_record", vid) == 1
+    assert out.policy_decision == "REQUIRE_APPROVAL"
+    assert execution.get_status(migrated, out.resulting_action_id) == "AWAITING_APPROVAL"
+    # Policy evaluation did not mutate validation evidence or lifecycle.
+    assert _count(migrated, "validation_result", vid) == results_before
+    assert ventures.get_venture(migrated, vid)[2] == "DISCOVERED"

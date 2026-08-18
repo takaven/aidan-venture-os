@@ -11,11 +11,16 @@ The separations Gate 3 must preserve are enforced here, not assumed:
   Recommendation  !=  Investment Decision  !=  ActionRequest
                   !=  Policy Authorization  !=  Execution  !=  Lifecycle State
 
-Concretely, ``commit_recommendation`` only ever writes an investment decision and
-(optionally) a PENDING ActionRequest. It never evaluates policy, approves,
+Concretely, ``commit_recommendation`` writes an investment decision and, when a
+bounded consequential amount is supplied, an ActionRequest that it immediately
+submits into the EXISTING Gate 1 policy boundary (``execution.request_execution``
+-> ``policy``): a canonical ``policy_decision`` (ALLOW / REQUIRE_APPROVAL / DENY)
+is evaluated from live state (kill switch, budget, autonomy) and persisted, and a
+PENDING approval is opened when approval is required. It never GRANTS approval,
 reserves/commits capital, executes, sets ActionRequest SUCCESS, writes a Proof
 Receipt, or moves venture lifecycle — those remain the Gate 1 chain's authority
-(ActionRequest -> Policy -> Approval -> Execution -> Proof Receipt).
+(ActionRequest -> Policy -> Approval -> Execution -> Proof Receipt). No Gate 3
+policy/approval/budget engine is introduced; the Gate 1 primitives are reused.
 
 Doctrine enforced:
 - STALENESS: a recommendation encodes an exact input basis. Before conversion the
@@ -31,9 +36,11 @@ Doctrine enforced:
   canonical state is independently re-verified before a BUILD decision.
 - VALIDATE BOUNDARY: a consequential validation amount may not exceed the selected
   validation test's precommitted ``max_spend``.
-- ATOMICITY: the decision and any resulting ActionRequest are written in one
-  transaction, so a decision never claims an action that failed to persist and a
-  refused decision leaves no orphan ActionRequest.
+- ATOMICITY: the decision, any resulting ActionRequest, and its Gate 1 policy
+  evaluation are written in one transaction, so a decision never claims an action
+  that failed to persist, a refused decision leaves no orphan ActionRequest, and
+  an exact retry produces the same decision/action/policy outcome with no
+  duplicate policy decision.
 """
 from __future__ import annotations
 
@@ -43,7 +50,7 @@ from typing import Any, Optional, Union
 
 from psycopg.types.json import Json
 
-from . import audit, db, nextaction
+from . import approvals, audit, db, execution, nextaction, policy
 from .actions import canonical_payload_hash
 from .errors import (
     BuildGateNotSatisfiedError,
@@ -76,6 +83,11 @@ class CommitmentResult:
     decision: str
     resulting_action_id: Optional[str]
     created: bool
+    # Gate 1 policy outcome for the resulting ActionRequest (None when the
+    # decision creates no consequential action).
+    policy_decision: Optional[str] = None
+    policy_decision_id: Optional[str] = None
+    approval_id: Optional[str] = None
 
 
 def _as_decision_value(decision: Union[str, InvestmentDecision]) -> str:
@@ -224,11 +236,29 @@ def _validate_spend_bound(cur, venture_id, selected_test_id, amount: Decimal) ->
         )
 
 
+def _existing_policy_outcome(cur, action_request_id):
+    """Return ``(policy_decision_id, decision)`` for an action, or ``(None, None)``.
+
+    Used on an idempotent retry so the same policy outcome is returned without
+    persisting a second policy_decision.
+    """
+    if action_request_id is None:
+        return (None, None)
+    cur.execute(
+        "SELECT id, decision FROM policy_decision WHERE action_request_id = %s "
+        "ORDER BY evaluated_at DESC, id DESC LIMIT 1",
+        (action_request_id,),
+    )
+    row = cur.fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
+
+
 def _intake_action(
     cur, *, venture_id, recommendation_id, action_type, payload, required_autonomy,
     amount: Decimal, currency: str, actor: str,
 ) -> str:
-    """Idempotently intake a PENDING ActionRequest (no policy/approval/execution)."""
+    """Idempotently intake a PENDING ActionRequest (the caller then submits it to
+    the Gate 1 policy boundary; this function alone approves/executes nothing)."""
     payload_hash = canonical_payload_hash(payload)
     idempotency_key = f"commit:{recommendation_id}"
     cur.execute(
@@ -263,22 +293,28 @@ def commit_recommendation(
     requested_currency: str = "USD",
     required_autonomy: int = 0,
     action_type: Optional[str] = None,
+    approval_threshold: Decimal = policy.DEFAULT_APPROVAL_THRESHOLD,
     actor: str = "aidan",
 ) -> CommitmentResult:
     """Convert a current recommendation into a governed investment decision.
 
     ``decision`` may be omitted (derived from the recommendation) or given
     explicitly; an incompatible explicit target is refused. ``requested_amount``,
-    when > 0, creates a PENDING Gate 1 ActionRequest for the consequential
-    request (VALIDATE spend bounded by the test's max_spend; BUILD only when a
-    bounded amount is honestly supplied). Idempotent per recommendation.
+    when > 0, creates an ActionRequest for the consequential request (VALIDATE
+    spend bounded by the test's max_spend; BUILD only when a bounded amount is
+    honestly supplied) and immediately submits it into the existing Gate 1 policy
+    boundary — the resulting ``CommitmentResult.policy_decision`` is the canonical
+    ALLOW / REQUIRE_APPROVAL / DENY outcome. No approval is granted and nothing is
+    executed here. Idempotent per recommendation.
     """
     with db.transaction(conn) as cur:
         rec_id, venture_id, opportunity_id, action_type_rec, input_hash, selected_test = _load_recommendation(
             cur, recommendation_id
         )
 
-        # Idempotent: one governed decision per recommendation.
+        # Idempotent: one governed decision per recommendation. On retry return the
+        # same decision/action and its already-evaluated policy outcome, creating
+        # no duplicate decision, action, or policy_decision.
         cur.execute(
             "SELECT id, decision, resulting_action_id FROM investment_decision_record "
             "WHERE source_recommendation_id = %s",
@@ -286,7 +322,11 @@ def commit_recommendation(
         )
         existing = cur.fetchone()
         if existing is not None:
-            return CommitmentResult(existing[0], existing[1], existing[2], created=False)
+            existing_policy_id, existing_policy = _existing_policy_outcome(cur, existing[2])
+            return CommitmentResult(
+                existing[0], existing[1], existing[2], created=False,
+                policy_decision=existing_policy, policy_decision_id=existing_policy_id,
+            )
 
         # RESEARCH_MORE (and any non-standard action) maps to no investment decision.
         target = _RECOMMENDATION_TO_DECISION.get(action_type_rec)
@@ -322,7 +362,8 @@ def commit_recommendation(
             _validate_spend_bound(cur, venture_id, selected_test, amount)
 
         # Optionally intake the consequential ActionRequest (VALIDATE spend or a
-        # BUILD with an honestly supplied bounded amount). No policy/approval/exec.
+        # BUILD with an honestly supplied bounded amount). It is submitted to the
+        # Gate 1 policy boundary below; nothing is approved or executed here.
         resulting_action_id = None
         if consequential and decision_value in ("VALIDATE", "BUILD"):
             payload = {
@@ -358,4 +399,30 @@ def commit_recommendation(
                 "resulting_action_id": str(resulting_action_id) if resulting_action_id else None,
             },
         )
-    return CommitmentResult(decision_id, decision_value, resulting_action_id, created=True)
+
+        # Submit any consequential ActionRequest into the EXISTING Gate 1 policy
+        # boundary, in THIS same transaction, reusing the Gate 1 primitives
+        # (policy.current_evaluation / persist_decision, approvals.create_pending,
+        # execution._set_status) — the same composition request_execution performs.
+        # A canonical policy_decision (ALLOW / REQUIRE_APPROVAL / DENY) is evaluated
+        # from live kill-switch/budget/autonomy state and persisted; REQUIRE_APPROVAL
+        # opens a PENDING approval and moves the action to AWAITING_APPROVAL. No
+        # approval is granted, no capital reserved, nothing executed, no proof written.
+        policy_outcome: Optional[str] = None
+        policy_decision_id: Optional[str] = None
+        approval_id: Optional[str] = None
+        if resulting_action_id is not None:
+            result, _pol_venture, inp = policy.current_evaluation(
+                cur, resulting_action_id, approval_threshold
+            )
+            policy_decision_id = policy.persist_decision(cur, resulting_action_id, venture_id, result, inp)
+            policy_outcome = result.decision
+            if result.decision == "REQUIRE_APPROVAL":
+                approval_id = approvals.create_pending(
+                    cur, resulting_action_id, policy_decision_id, result.inputs_hash
+                )
+                execution._set_status(cur, resulting_action_id, "AWAITING_APPROVAL", actor="policy_engine")
+    return CommitmentResult(
+        decision_id, decision_value, resulting_action_id, created=True,
+        policy_decision=policy_outcome, policy_decision_id=policy_decision_id, approval_id=approval_id,
+    )

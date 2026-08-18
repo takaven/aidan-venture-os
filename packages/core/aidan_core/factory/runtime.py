@@ -23,7 +23,9 @@ from typing import Optional
 
 from .. import audit, db, execution, policy
 from ..errors import ApprovalRequiredError, ExecutionBlockedError, NotFoundError
+from . import artifacts as artifacts_mod
 from . import spec as spec_mod
+from .verifiers import VerificationRequest, VerifierRegistry
 from .workers import WorkerRegistry, WorkerRequest
 
 
@@ -153,6 +155,13 @@ def execute_action(
         conn, action_request_id, external_result_id=result.external_result_id,
         reported_outcome=result.reported_outcome, raw_payload=raw_payload, attempt_id=handle.attempt_id,
     )
+    # Capture declared artifacts as append-only provenance (kernel-computed hashes).
+    # This is provenance only — it never implies verification or success.
+    if result.artifacts:
+        artifacts_mod.capture_artifacts(
+            conn, action_request_id=str(action_request_id), execution_attempt_id=str(handle.attempt_id),
+            venture_id=str(venture_id), declarations=[dict(a) for a in result.artifacts], actor=actor,
+        )
     with db.transaction(conn) as cur:
         audit.record_event(
             cur, event_type="factory.worker_result_captured", actor=actor, venture_id=venture_id,
@@ -169,4 +178,63 @@ def execute_action(
         reported_outcome=result.reported_outcome,
         action_status=execution.get_status(conn, action_request_id),
         dispatched=True,
+    )
+
+
+def verify_and_complete(
+    conn,
+    action_request_id: str,
+    *,
+    verifier_registry: VerifierRegistry,
+    actual_cost,
+    actor: str = "factory",
+):
+    """Phase 2 — verify a captured attempt deterministically and, only if VERIFIED,
+    complete it through the existing canonical proof-gated path.
+
+    The verifier is selected by the IMMUTABLE ``execution_spec.verifier_kind`` (the
+    caller cannot override it) and runs over canonical inputs (contract, captured
+    worker result, captured artifacts) with no DB access. Its verdict is derived —
+    never caller-supplied — and is converted into the one canonical Proof Receipt
+    by the existing proof authority. Deterministic verification outranks the
+    worker's self-report in both directions. Returns the canonical
+    ``CompletionOutcome`` (SUCCEEDED only when VERIFIED).
+    """
+    row = spec_mod.get_execution_spec(conn, action_request_id)
+    if row is None:
+        raise NotFoundError(f"no execution spec for action {action_request_id}")
+    verifier_kind = row[7]
+    expected_output_contract = dict(row[6] or {})
+    spec_hash = row[11]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, execution_attempt_id, external_result_id, raw_payload, reported_outcome "
+            "FROM execution_result WHERE action_request_id = %s ORDER BY received_at DESC, id DESC LIMIT 1",
+            (action_request_id,),
+        )
+        res = cur.fetchone()
+    if res is None:
+        raise NotFoundError(f"no captured worker result to verify for action {action_request_id}")
+    _res_id, attempt_id, external_result_id, raw_payload, reported_outcome = res
+    structured_output = dict((raw_payload or {}).get("structured_output", {}))
+
+    # Pre-load canonical artifacts so the verifier receives DATA, never a connection.
+    captured = tuple(artifacts_mod.get_artifacts(conn, attempt_id))
+
+    def _verify(_cur, aid, _result_id):
+        request = VerificationRequest(
+            action_request_id=str(aid), execution_attempt_id=str(attempt_id),
+            verifier_kind=verifier_kind, expected_output_contract=expected_output_contract,
+            worker_structured_output=structured_output, artifacts=captured, spec_hash=spec_hash,
+        )
+        verifier = verifier_registry.get(verifier_kind)  # KeyError -> deterministic failure, no receipt
+        vr = verifier.verify(request)
+        proof_verdict = "VERIFIED" if vr.verdict == "VERIFIED" else "FAILED"
+        return proof_verdict, vr.verification_type, vr.evidence_hash
+
+    return execution.complete_execution(
+        conn, action_request_id, external_result_id=external_result_id,
+        reported_outcome=reported_outcome, raw_payload=raw_payload, actual_cost=actual_cost,
+        attempt_id=attempt_id, verifier=_verify, verifier_name=f"gate4.{verifier_kind}", actor=actor,
     )

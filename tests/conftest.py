@@ -24,12 +24,15 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0012; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0013; dropped for a clean slate per test.
 # 0011 only ALTERs investment_decision_record (adds a column, two composite FKs
 # and a partial-unique index); dropping that table CASCADE below removes them.
 # 0012 adds execution_spec and a success-guard trigger/function on action_request
 # (the trigger drops with action_request; the function is dropped explicitly).
+# 0013 adds execution_artifact and ALTERs execution_attempt/proof_receipt (dropped
+# with their tables CASCADE below).
 _DROP_SQL = """
+DROP TABLE IF EXISTS execution_artifact CASCADE;
 DROP TABLE IF EXISTS execution_spec CASCADE;
 DROP TABLE IF EXISTS recommendation_validation_result CASCADE;
 DROP TABLE IF EXISTS recommendation_validation_test CASCADE;

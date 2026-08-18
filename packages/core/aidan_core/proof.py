@@ -52,23 +52,38 @@ def _record_receipt(
     execution_result_id: str,
     reported_outcome: str,
     raw_payload,
+    *,
+    verifier=None,
+    verifier_name: str = VERIFIER,
+    execution_attempt_id=None,
 ) -> tuple:
     """Verify deterministically and persist the receipt (cursor-based).
 
-    Returns ``(verdict, proof_id)``. The verdict is ALWAYS derived here by the
-    deterministic verifier; there is no parameter through which a caller can
-    supply ``VERIFIED``. This is the only path that writes a proof receipt.
+    Returns ``(verdict, proof_id)``. The verdict is ALWAYS derived here — either by
+    the built-in token-match verifier (default) or by an injected DETERMINISTIC
+    ``verifier(cur, action_request_id, execution_result_id) -> (verdict,
+    verification_type, evidence_hash)`` supplied by the trusted kernel. There is no
+    parameter through which a caller can supply ``VERIFIED`` directly. This remains
+    the ONLY path that writes a proof receipt; the receipt optionally records the
+    execution attempt whose machine verification produced it.
     """
-    verdict, verification_type, evidence_hash = deterministic_verify(
-        action_request_id, reported_outcome, raw_payload
-    )
+    if verifier is not None:
+        verdict, verification_type, evidence_hash = verifier(
+            cur, action_request_id, execution_result_id
+        )
+    else:
+        verdict, verification_type, evidence_hash = deterministic_verify(
+            action_request_id, reported_outcome, raw_payload
+        )
     cur.execute(
         """
         INSERT INTO proof_receipt
-            (action_request_id, execution_result_id, verification_type, verifier, result, evidence_hash)
-        VALUES (%s, %s, %s, %s, %s, %s)
+            (action_request_id, execution_result_id, execution_attempt_id,
+             verification_type, verifier, result, evidence_hash)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (action_request_id, execution_result_id, verification_type, VERIFIER, verdict, evidence_hash),
+        (action_request_id, execution_result_id, execution_attempt_id,
+         verification_type, verifier_name, verdict, evidence_hash),
     )
     return verdict, cur.fetchone()[0]

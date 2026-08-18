@@ -258,6 +258,8 @@ def complete_execution(
     attempt_id: Optional[str] = None,
     lifecycle_to: Optional[str] = None,
     actor: str = "executor",
+    verifier=None,
+    verifier_name: Optional[str] = None,
 ) -> CompletionOutcome:
     """The canonical success transaction. Success only after VERIFIED proof, once.
 
@@ -295,9 +297,12 @@ def complete_execution(
             cur, action_id, attempt_id, external_result_id, reported_outcome, raw_payload
         )
 
-        # 2/3. deterministic verification + receipt (verdict derived internally).
+        # 2/3. deterministic verification + receipt (verdict derived internally,
+        # optionally by an injected deterministic verifier; never caller-supplied).
         verdict, proof_id = proof._record_receipt(
-            cur, action_id, result_id, reported_outcome, raw_payload
+            cur, action_id, result_id, reported_outcome, raw_payload,
+            verifier=verifier, verifier_name=verifier_name or proof.VERIFIER,
+            execution_attempt_id=attempt_id,
         )
 
         if verdict != "VERIFIED":

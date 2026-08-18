@@ -17,9 +17,10 @@ class _FakeWorker:
 
     kind = "fake"
 
-    def __init__(self, *, reported_outcome="success", structured_output=None, external_suffix="1"):
+    def __init__(self, *, reported_outcome="success", structured_output=None, artifacts=(), external_suffix="1"):
         self._outcome = reported_outcome
         self._out = structured_output or {}
+        self._artifacts = tuple(artifacts)
         self._suffix = external_suffix
         self.calls = 0
         self.last_request = None
@@ -33,6 +34,7 @@ class _FakeWorker:
             reported_outcome=self._outcome,
             worker_version="test",
             structured_output=self._out,
+            artifacts=self._artifacts,
         )
 
 
@@ -52,9 +54,9 @@ def registry_with(*adapters) -> WorkerRegistry:
 
 
 def spec_action(
-    conn, slug, *, worker_kind="fake-a", autonomy_level=1, required_autonomy=0, amount=10,
-    grant=100, capabilities=("READ_REPOSITORY",), timeout=60, max_attempts=3,
-    task_payload=None, expected_output_contract=None,
+    conn, slug, *, worker_kind="fake-a", verifier_kind="token-match-v1", autonomy_level=1,
+    required_autonomy=0, amount=10, grant=100, capabilities=("READ_REPOSITORY",), timeout=60,
+    max_attempts=3, task_payload=None, expected_output_contract=None,
 ):
     """Create a governed ActionRequest and freeze an execution spec for it.
 
@@ -65,7 +67,7 @@ def spec_action(
         amount=amount, grant=grant,
     )
     spec = spec_mod.create_execution_spec(
-        conn, aid, worker_kind=worker_kind, verifier_kind="token-match-v1",
+        conn, aid, worker_kind=worker_kind, verifier_kind=verifier_kind,
         timeout_seconds=timeout, max_attempts=max_attempts, capability_scope=list(capabilities),
         task_payload=task_payload or {"goal": "bounded-task"},
         expected_output_contract=expected_output_contract or {"kind": "structured"},

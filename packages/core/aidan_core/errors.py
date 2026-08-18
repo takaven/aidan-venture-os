@@ -68,3 +68,12 @@ class InconsistentCanonicalStateError(AidanCoreError):
 
 class InvalidAcquisitionError(AidanCoreError):
     """An acquired source (untrusted external input) failed validation."""
+
+
+class EvidenceRelationConflictError(AidanCoreError):
+    """The same claim/observation pair was asserted with a conflicting stance.
+
+    A single observation cannot both support and contradict the same claim;
+    the second, opposite-stance assertion is rejected deterministically rather
+    than silently replacing the first.
+    """

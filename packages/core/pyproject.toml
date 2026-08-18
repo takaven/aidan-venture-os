@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aidan-core"
+version = "0.1.0"
+description = "AI-DAN Venture OS canonical truth & governance kernel (Gate 1, Slice 1 foundation)."
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["aidan_core"]

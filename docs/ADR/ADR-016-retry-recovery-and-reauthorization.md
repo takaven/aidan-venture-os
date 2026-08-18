@@ -41,14 +41,47 @@ a run exceeding `execution_spec.timeout_seconds` (measured by an injectable
 monotonic clock) is TIMEOUT; a verifier rejection is VERIFICATION_FAILED. The
 worker's own `failure_metadata` is inert — the kernel determines the class.
 
-### Reauthorization before every attempt
+### Reauthorization before every attempt AND before completion
 
 Every dispatch — first or retry — re-checks kill switch, policy, budget and
 approval by reusing the existing spec-bound authorization gate and
-`authorize_and_claim`. Stale authorization is never reused: a kill switch, a
-policy DENY, an insufficient budget, or a missing/stale post-spec approval blocks
-the retry with no worker dispatch. The Slice 1 approval chronology binding
-remains in force.
+`authorize_and_claim`. Completion is also gated: `_complete` re-evaluates current
+governance before recording a VERIFIED proof / SUCCESS, so a kill switch engaged
+(or a policy that became DENY) between dispatch and completion cannot be bypassed
+by a late result — governance denial blocks completion, records no proof, and
+preserves worker/result history (it is not verification evidence). Stale
+authorization is never reused; the Slice 1 approval chronology binding remains in
+force.
+
+### A retry reuses the action's own reservation
+
+An ActionRequest's own active reservation is available to itself: policy
+evaluation adds the action's held RESERVE back into available budget, so a retry
+(or the completion-time recheck) of an already-reserved action never requires a
+second copy of the same capital. There is exactly one RESERVE per action across
+all attempts; a genuine shortfall (capital needed beyond the action's own
+reservation) still DENYs. This also keeps the policy inputs-hash stable across
+reservation, so an approval bound before the claim stays valid through completion.
+
+### Recovery obeys spec, max_attempts and current authorization
+
+`resume_action` is the Factory recovery entry: a durably captured result is
+verified/completed without re-dispatching the worker; a crashed CLAIMED attempt
+(expired lease, no result) is abandoned by safety mode — UNSAFE → RECOVERY_REQUIRED
+(no auto-rerun); IDEMPOTENT/RECONCILABLE → the action returns to a claimable state
+and a FRESH attempt is dispatched only through `execute_action`, which
+re-authorizes and enforces `max_attempts`. Recovery therefore never exceeds the
+retry budget and never bypasses authorization; if the crashed attempt was the last
+budgeted one the action is terminal FAILED. Gate 1's `recovery.recover_action`
+remains the primitive for non-spec actions.
+
+### Result identity is conflict-checked
+
+A reused `external_result_id` converges only for an identical result; different
+content, a different reported outcome, or a different execution attempt is a
+deterministic `IdempotencyConflictError` — a new result is never silently aliased
+to an earlier attempt's row, protecting attempt → result → artifact → proof
+provenance across retries.
 
 ### Timeout and late results
 

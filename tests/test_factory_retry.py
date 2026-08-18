@@ -11,8 +11,8 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from aidan_core import approvals, budget, execution, killswitch, recovery
-from aidan_core.errors import ApprovalRequiredError, ExecutionBlockedError
+from aidan_core import approvals, budget, execution, killswitch
+from aidan_core.errors import ApprovalRequiredError, ExecutionBlockedError, IdempotencyConflictError
 from aidan_core.factory import runtime, spec as spec_mod
 
 from conftest import setup_action
@@ -133,15 +133,24 @@ def test_kill_switch_blocks_retry(migrated):
     assert worker.calls == 1  # retry never dispatched the worker
 
 
-def test_budget_denies_retry(migrated):
-    vid, aid, sp = spec_action(migrated, "r-I", max_attempts=3, amount=10, grant=15)
-    r1 = runtime.execute_action(migrated, aid, registry=registry_with(ErrorWorker()))
-    assert r1.failure_class == "WORKER_ERROR" and r1.action_status == "PENDING"
-    # The attempt-1 reservation is held (10 of 15) -> available 5 < 10 -> retry DENY.
-    w2 = ErrorWorker()
-    with pytest.raises(ExecutionBlockedError):
-        runtime.execute_action(migrated, aid, registry=registry_with(w2))
-    assert w2.calls == 0
+def test_exact_funded_retry_uses_own_reservation(migrated):
+    # grant == requested: a retry must reuse the ActionRequest's held reservation,
+    # not require a second copy of the capital.
+    vid, aid, sp = spec_action(migrated, "r-exact", verifier_kind="structured-contract",
+                               amount=10, grant=10, max_attempts=2,
+                               expected_output_contract={"require": {"status": "done"}})
+    worker = FlakyWorker(fail_first=1, structured_output={"status": "done"})
+    reg = registry_with(worker)
+    assert runtime.execute_action(migrated, aid, registry=reg).failure_class == "WORKER_ERROR"
+    # retry is policy-eligible on the SAME reservation (not INSUFFICIENT_BUDGET).
+    r2 = runtime.execute_action(migrated, aid, registry=reg)
+    assert r2.dispatched and r2.failure_class is None
+    out = runtime.verify_and_complete(migrated, aid, actual_cost=10)
+    assert out.status == "SUCCEEDED" and out.verified is True
+    # exactly one RESERVE entry across attempts (no double reservation).
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM capital_entry WHERE action_request_id = %s AND entry_type = 'RESERVE'", (aid,))
+        assert cur.fetchone()[0] == 1
 
 
 def test_require_approval_on_retry(migrated):
@@ -194,16 +203,81 @@ def test_resume_reports_terminal_states(migrated):
     assert runtime.resume_action(migrated, aid, actual_cost=10)["outcome"] == "terminally_failed"
 
 
-def test_crashed_claim_recovers_by_safety_mode(migrated):
-    # IDEMPOTENT: claimed attempt, expired lease, no result -> existing recovery reclaims.
-    vid, aid, sp = spec_action(migrated, "r-crashI", max_attempts=3)
+def test_idempotent_crash_recovery_actually_executes(migrated):
+    # A claimed attempt crashes before persisting a result; recovery abandons it and
+    # dispatches a FRESH AUTHORIZED attempt through the canonical path — proving the
+    # recovered work actually runs (not just a reclaimed DB row).
+    vid, aid, sp = spec_action(migrated, "r-recJ", verifier_kind="structured-contract",
+                               max_attempts=2, expected_output_contract={"require": {"status": "done"}})
+    execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT", lease_seconds=-1)  # crash
+    worker = FakeWorkerA(structured_output={"status": "done"})
+    res = runtime.resume_action(migrated, aid, registry=registry_with(worker), actual_cost=10)
+    assert res["outcome"] == "recovered_and_dispatched" and worker.calls == 1
+    out = runtime.verify_and_complete(migrated, aid, actual_cost=10)
+    assert out.status == "SUCCEEDED" and out.verified is True
+
+
+def test_recovery_respects_max_attempts(migrated):
+    vid, aid, sp = spec_action(migrated, "r-recMax", max_attempts=1)
+    execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT", lease_seconds=-1)  # crash on last budgeted attempt
+    worker = FakeWorkerA()
+    res = runtime.resume_action(migrated, aid, registry=registry_with(worker), actual_cost=10)
+    assert res["outcome"] == "recovery_exhausted" and res["status"] == "FAILED"
+    assert worker.calls == 0 and execution.get_status(migrated, aid) == "FAILED"
+
+
+def test_unsafe_crash_requires_governed_recovery(migrated):
+    vid, aid, sp = spec_action(migrated, "r-recUnsafe", max_attempts=3)
+    execution.authorize_and_claim(migrated, aid, safety_mode="UNSAFE", lease_seconds=-1)
+    worker = FakeWorkerA()
+    res = runtime.resume_action(migrated, aid, registry=registry_with(worker), actual_cost=10)
+    assert res["outcome"] == "recovery_required"
+    assert execution.get_status(migrated, aid) == "RECOVERY_REQUIRED" and worker.calls == 0
+
+
+def test_kill_during_ambiguity_blocks_recovery_dispatch(migrated):
+    vid, aid, sp = spec_action(migrated, "r-recKill", max_attempts=3)
     execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT", lease_seconds=-1)
-    assert recovery.recover_action(migrated, aid)["outcome"] == "reclaimed"
-    # UNSAFE: ambiguous crash is not auto-rerun -> RECOVERY_REQUIRED.
-    vid2, aid2, sp2 = spec_action(migrated, "r-crashU", max_attempts=3)
-    execution.authorize_and_claim(migrated, aid2, safety_mode="UNSAFE", lease_seconds=-1)
-    assert recovery.recover_action(migrated, aid2)["outcome"] == "recovery_required"
-    assert execution.get_status(migrated, aid2) == "RECOVERY_REQUIRED"
+    killswitch.engage_global(migrated, engaged_by="op")
+    worker = FakeWorkerA()
+    with pytest.raises(ExecutionBlockedError):
+        runtime.resume_action(migrated, aid, registry=registry_with(worker), actual_cost=10)
+    assert worker.calls == 0  # recovery re-authorized and was blocked before dispatch
+
+
+# --------------------------------------------------------------------------
+# execution_result idempotency: reused external ids with different content conflict.
+# --------------------------------------------------------------------------
+def test_result_exact_replay_converges(migrated):
+    vid, aid = setup_action(migrated, slug="r-resJ", autonomy_level=1, amount=10)
+    r1, c1 = execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1})
+    r2, c2 = execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1})
+    assert c1 is True and c2 is False and r1 == r2
+
+
+def test_result_changed_payload_conflicts(migrated):
+    vid, aid = setup_action(migrated, slug="r-resK", autonomy_level=1, amount=10)
+    execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1})
+    with pytest.raises(IdempotencyConflictError):
+        execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 2})
+
+
+def test_result_changed_outcome_conflicts(migrated):
+    vid, aid = setup_action(migrated, slug="r-resL", autonomy_level=1, amount=10)
+    execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1})
+    with pytest.raises(IdempotencyConflictError):
+        execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="failure", raw_payload={"a": 1})
+
+
+def test_result_cross_attempt_reuse_conflicts(migrated):
+    vid, aid, sp = spec_action(migrated, "r-resM", max_attempts=3)
+    h1 = execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT")
+    execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1}, attempt_id=h1.attempt_id)
+    execution.fail_attempt(migrated, aid, attempt_id=h1.attempt_id, failure_class="WORKER_ERROR", terminal=False)
+    h2 = execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT")
+    # Same external id, same payload, but a DIFFERENT attempt -> deterministic conflict.
+    with pytest.raises(IdempotencyConflictError):
+        execution.record_execution_result(migrated, aid, external_result_id="x", reported_outcome="success", raw_payload={"a": 1}, attempt_id=h2.attempt_id)
 
 
 # --------------------------------------------------------------------------

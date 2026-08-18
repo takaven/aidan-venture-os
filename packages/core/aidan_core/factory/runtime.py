@@ -1,11 +1,15 @@
-"""Factory runtime — durable, claim-only worker dispatch (Gate 4, Slice 1).
+"""Factory runtime — durable, claim-only worker dispatch + verification + recovery (Gate 4).
 
 ``execute_action`` drives an already-governed ActionRequest against its frozen,
 immutable execution spec: it re-checks authorization *against that spec*, claims
 a canonical execution attempt through the existing Gate 1 machinery, dispatches a
 typed replaceable worker (with no DB access), and captures the worker's result as
-a CLAIM into the existing execution_result table. It STOPS there — no verifier,
-no Proof Receipt, no canonical SUCCESS, no retries, no timeouts (later slices).
+a CLAIM into the existing execution_result table — with bounded retry (worker
+error / timeout) that leaves the action re-claimable while attempts remain.
+``verify_and_complete`` runs the immutable spec's deterministic verifier over
+durable state and completes through the proof-gated path (re-checking current
+governance first); ``resume_action`` recovers an interrupted action from durable
+PostgreSQL state. Canonical SUCCESS remains proof-gated and once.
 
 Authorization binding (load-bearing): a Policy decision or Approval created
 before the spec was frozen cannot authorize dispatch. Dispatch performs a fresh
@@ -22,7 +26,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
-from .. import audit, db, execution, policy, proof
+from .. import audit, budget, db, execution, policy, proof
 from ..errors import ApprovalRequiredError, ExecutionBlockedError, NotFoundError
 from . import artifacts as artifacts_mod
 from . import spec as spec_mod
@@ -331,19 +335,37 @@ def resume_action(
     conn,
     action_request_id: str,
     *,
+    registry: Optional[WorkerRegistry] = None,
     verifier_registry: Optional[VerifierRegistry] = None,
     actual_cost,
+    approval_threshold: Decimal = policy.DEFAULT_APPROVAL_THRESHOLD,
+    safety_mode: str = "IDEMPOTENT",
+    lease_seconds: float = 300,
+    clock=None,
     actor: str = "factory",
 ) -> dict:
     """Resume a possibly-interrupted action from DURABLE PostgreSQL state alone.
 
-    A fresh process (no in-memory WorkerResult, no runtime object) can call this to
-    finish an attempt whose worker result was already captured before a crash: it
-    verifies from durable state and completes WITHOUT re-dispatching the worker.
-    Terminal actions are reported as-is. Crashed attempts that never persisted a
-    result (lease/claim recovery) remain the province of the existing
-    ``recovery.recover_action`` safety-mode machinery, which callers invoke directly.
+    All recovery obeys the canonical Gate 4 rules — immutable spec, max_attempts, and
+    current authorization:
+
+    - a durably captured result awaiting verification is verified + completed WITHOUT
+      re-dispatching the worker (completion re-checks current governance);
+    - a crashed CLAIMED attempt whose lease expired and which never persisted a result
+      is abandoned by safety mode: UNSAFE -> RECOVERY_REQUIRED (no auto-rerun);
+      IDEMPOTENT/RECONCILABLE -> the action returns to a claimable state and, when a
+      registry is supplied and attempts remain, a FRESH AUTHORIZED attempt is
+      dispatched via ``execute_action`` (which re-evaluates policy/kill/budget/approval
+      and enforces max_attempts). If the crashed attempt was the last budgeted one,
+      the action is terminal FAILED — recovery never exceeds max_attempts.
+
+    Gate 1's ``recovery.recover_action`` remains the primitive for non-spec actions.
     """
+    row = spec_mod.get_execution_spec(conn, action_request_id)
+    if row is None:
+        raise NotFoundError(f"no execution spec for action {action_request_id}")
+    max_attempts = row[9]
+
     status = execution.get_status(conn, action_request_id)
     if status == "SUCCEEDED":
         return {"outcome": "already_succeeded", "status": status}
@@ -354,11 +376,58 @@ def resume_action(
         cur.execute("SELECT count(*) FROM execution_result WHERE action_request_id = %s", (action_request_id,))
         has_result = cur.fetchone()[0] > 0
         already_verified = proof.verified_proof_id(cur, action_request_id) is not None
+        cur.execute(
+            "SELECT id, status, attempt_number, safety_mode, lease_expires_at <= now() "
+            "FROM execution_attempt WHERE action_request_id = %s ORDER BY attempt_number DESC LIMIT 1",
+            (action_request_id,),
+        )
+        latest = cur.fetchone()
 
+    # A durable result awaiting verification -> verify from durable state (no worker rerun).
     if has_result and not already_verified:
         out = verify_and_complete(
             conn, action_request_id, verifier_registry=verifier_registry,
             actual_cost=actual_cost, actor=actor,
         )
         return {"outcome": "verified_from_durable_state", "status": out.status, "verified": out.verified}
+
+    if latest is None:
+        return {"outcome": "no_attempt", "status": status}
+    attempt_id, attempt_status, attempt_number, attempt_safety, lease_expired = latest
+
+    # A crashed CLAIMED attempt (expired lease, no result).
+    if attempt_status == "CLAIMED" and lease_expired:
+        if attempt_safety == "UNSAFE":
+            with db.transaction(conn) as cur:
+                cur.execute(
+                    "UPDATE execution_attempt SET status = 'RECOVERY_REQUIRED', failure_class = 'RECOVERY_REQUIRED', "
+                    "finished_at = now(), updated_at = now() WHERE id = %s", (attempt_id,))
+                execution._set_status(cur, action_request_id, "RECOVERY_REQUIRED", actor=actor, reason="unsafe_ambiguous")
+            return {"outcome": "recovery_required", "status": "RECOVERY_REQUIRED"}
+        if attempt_number >= max_attempts:  # the crashed attempt was the last budgeted -> terminal
+            with db.transaction(conn) as cur:
+                cur.execute(
+                    "UPDATE execution_attempt SET status = 'ABANDONED', failure_class = 'RETRY_EXHAUSTED', "
+                    "finished_at = now(), updated_at = now() WHERE id = %s", (attempt_id,))
+                budget._release(cur, action_request_id)
+                execution._set_status(cur, action_request_id, "FAILED", actor=actor, reason="recovery_exhausted")
+            return {"outcome": "recovery_exhausted", "status": "FAILED"}
+        # attempts remain: abandon the stale attempt and return the action to claimable.
+        with db.transaction(conn) as cur:
+            cur.execute(
+                "UPDATE execution_attempt SET status = 'ABANDONED', finished_at = now(), updated_at = now() "
+                "WHERE id = %s", (attempt_id,))
+            execution._set_status(cur, action_request_id, "PENDING", actor=actor, reason="recovered_retryable")
+        if registry is None:
+            return {"outcome": "recovered_pending", "status": "PENDING"}
+        # Dispatch a fresh AUTHORIZED attempt through the canonical path (reauth + max_attempts).
+        r = execute_action(
+            conn, action_request_id, registry=registry, approval_threshold=approval_threshold,
+            safety_mode=safety_mode, lease_seconds=lease_seconds, clock=clock, actor=actor,
+        )
+        return {"outcome": "recovered_and_dispatched", "status": r.action_status,
+                "dispatched": r.dispatched, "failure_class": r.failure_class}
+
+    if attempt_status == "CLAIMED":
+        return {"outcome": "lease_active", "status": status}
     return {"outcome": "no_result_to_resume", "status": status}

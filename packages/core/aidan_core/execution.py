@@ -23,6 +23,7 @@ from .approvals import create_pending, valid_approval
 from .errors import (
     ApprovalRequiredError,
     ExecutionBlockedError,
+    IdempotencyConflictError,
     InconsistentCanonicalStateError,
     NotFoundError,
 )
@@ -214,11 +215,27 @@ def _upsert_result(cur, action_id, attempt_id, external_result_id, reported_outc
     row = cur.fetchone()
     if row is not None:
         return row[0], True
+    # A row already exists for this (action, external_result_id). Converge only for an
+    # identical result; a reused external id with materially different content, a
+    # different reported outcome, or a different execution attempt is a deterministic
+    # conflict — never silently alias a new result to the earlier attempt's row.
     cur.execute(
-        "SELECT id FROM execution_result WHERE action_request_id = %s AND external_result_id = %s",
+        "SELECT id, raw_hash, reported_outcome, execution_attempt_id FROM execution_result "
+        "WHERE action_request_id = %s AND external_result_id = %s",
         (action_id, external_result_id),
     )
-    return cur.fetchone()[0], False
+    existing_id, existing_hash, existing_outcome, existing_attempt = cur.fetchone()
+    if existing_hash != raw_hash or existing_outcome != reported_outcome:
+        raise IdempotencyConflictError(
+            f"external_result_id {external_result_id!r} reused with different content/outcome "
+            f"for action {action_id}"
+        )
+    if attempt_id is not None and existing_attempt is not None and str(existing_attempt) != str(attempt_id):
+        raise IdempotencyConflictError(
+            f"external_result_id {external_result_id!r} reused by a different execution attempt "
+            f"for action {action_id}"
+        )
+    return existing_id, False
 
 
 def record_execution_result(
@@ -262,6 +279,7 @@ def complete_execution(
     attempt_id: Optional[str] = None,
     lifecycle_to: Optional[str] = None,
     actor: str = "executor",
+    approval_threshold: Decimal = policy.DEFAULT_APPROVAL_THRESHOLD,
 ) -> CompletionOutcome:
     """The canonical Gate 1 success transaction (deterministic token-match proof).
 
@@ -274,7 +292,7 @@ def complete_execution(
     return _complete(
         conn, action_id, external_result_id=external_result_id, reported_outcome=reported_outcome,
         raw_payload=raw_payload, actual_cost=actual_cost, attempt_id=attempt_id,
-        lifecycle_to=lifecycle_to, actor=actor, record_proof=None,
+        lifecycle_to=lifecycle_to, actor=actor, record_proof=None, approval_threshold=approval_threshold,
     )
 
 
@@ -290,6 +308,7 @@ def _complete(
     lifecycle_to: Optional[str],
     actor: str,
     record_proof=None,
+    approval_threshold: Decimal = policy.DEFAULT_APPROVAL_THRESHOLD,
 ) -> CompletionOutcome:
     """Shared completion core. ``record_proof(cur, action_id, result_id) -> (verdict,
     proof_id)`` is an INTERNAL trusted hook: when None, the built-in deterministic
@@ -328,6 +347,19 @@ def _complete(
             raise InconsistentCanonicalStateError(
                 f"inconsistent canonical success for {action_id}: "
                 f"verified_proof={existing is not None}, status_succeeded={is_succeeded}"
+            )
+
+        # Completion-time governance recheck: a kill switch engaged, or a policy that
+        # became DENY, between dispatch and completion must not be bypassed by a late
+        # result. Governance denial is NOT verification evidence — no proof/success is
+        # recorded and worker/result history is preserved (this transaction rolls back
+        # on the raise).
+        gov, _gv, _gi = policy.current_evaluation(cur, action_id, approval_threshold)
+        if gov.decision == "DENY":
+            raise ExecutionBlockedError(f"completion blocked by current governance: {gov.reason}")
+        if gov.decision == "REQUIRE_APPROVAL" and valid_approval(cur, action_id, gov.inputs_hash) is None:
+            raise ApprovalRequiredError(
+                "completion requires a valid approval for the current authorization state"
             )
 
         # 1. accept/dedup raw result.

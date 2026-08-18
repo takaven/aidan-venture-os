@@ -8,7 +8,7 @@ import inspect
 import psycopg
 import pytest
 
-from aidan_core import execution, proof
+from aidan_core import execution, killswitch, proof
 from aidan_core.errors import ExecutionBlockedError
 from aidan_core.factory import artifacts as artifacts_mod, runtime
 from aidan_core.factory.verifiers import ARTIFACT_HASH, STRUCTURED_CONTRACT, default_registry
@@ -244,6 +244,39 @@ def test_fresh_runtime_verifies_from_durable_state_without_redispatch(migrated):
     out = runtime.verify_and_complete(migrated, aid, actual_cost=10)
     assert out.status == "SUCCEEDED" and out.verified is True
     assert worker.calls == 1  # worker was NOT re-dispatched to reconstruct evidence
+
+
+# --------------------------------------------------------------------------
+# Completion-time governance recheck: a kill/policy revocation between dispatch
+# and completion is not bypassed by a late result.
+# --------------------------------------------------------------------------
+def test_completion_blocked_by_kill_switch(migrated):
+    aid = _struct(migrated, "cp-killcomplete", worker_outcome="success", output={"status": "done"})
+    # The worker result is durably captured and would verify VERIFIED...
+    killswitch.engage_global(migrated, engaged_by="op")  # ...but kill engages before completion.
+    with pytest.raises(ExecutionBlockedError):
+        runtime.verify_and_complete(migrated, aid, verifier_registry=default_registry(), actual_cost=10)
+    assert execution.get_status(migrated, aid) != "SUCCEEDED"
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s AND result = 'VERIFIED'", (aid,))
+        assert cur.fetchone()[0] == 0                       # no VERIFIED proof
+        cur.execute("SELECT count(*) FROM execution_result WHERE action_request_id = %s", (aid,))
+        assert cur.fetchone()[0] >= 1                        # worker/result history preserved
+
+
+def test_exact_funded_action_completes(migrated):
+    # grant == requested amount: the action's own reservation must not deny its own
+    # completion (the completion-time governance recheck sees available >= requested).
+    vid, aid, _ = spec_action(
+        migrated, "cp-exact", verifier_kind="structured-contract", amount=10, grant=10,
+        expected_output_contract={"require": {"status": "done"}})
+    runtime.execute_action(migrated, aid, registry=registry_with(FakeWorkerA(structured_output={"status": "done"})))
+    out = runtime.verify_and_complete(migrated, aid, actual_cost=10)
+    assert out.status == "SUCCEEDED" and out.verified is True
+    with migrated.cursor() as cur:  # reconciled once: committed 10, nothing reserved
+        cur.execute("SELECT reserved_amount, committed_amount FROM budget_account WHERE venture_id = %s", (vid,))
+        from decimal import Decimal
+        assert cur.fetchone() == (Decimal("0.0000"), Decimal("10.0000"))
 
 
 def test_fresh_runtime_rejects_tampered_durable_content(migrated):

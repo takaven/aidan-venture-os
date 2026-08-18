@@ -114,7 +114,19 @@ def _load_policy_input(cur, action_request_id: str, approval_threshold: Decimal)
         (venture_id, currency),
     )
     brow = cur.fetchone()
-    available = brow[0] if brow is not None else Decimal("0")
+    available = Decimal(brow[0] if brow is not None else 0)
+
+    # This action's OWN active reservation is available to itself: re-evaluating an
+    # already-reserved action (a retry, or a completion-time recheck) must not
+    # require a second copy of the same capital. Add its held reservation back to
+    # available (an entry that is RESERVEd but neither RELEASEd nor COMMITted).
+    cur.execute(
+        "SELECT entry_type FROM capital_entry WHERE action_request_id = %s AND currency = %s",
+        (action_request_id, currency),
+    )
+    own_entries = {r[0] for r in cur.fetchall()}
+    if "RESERVE" in own_entries and "RELEASE" not in own_entries and "COMMIT" not in own_entries:
+        available += Decimal(requested_amount)
 
     return (
         PolicyInput(

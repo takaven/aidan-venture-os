@@ -46,6 +46,84 @@ class FakeWorkerB(_FakeWorker):
     kind = "fake-b"
 
 
+class ErrorWorker(_FakeWorker):
+    """Raises during execute — a WORKER_ERROR. Forged failure metadata is ignored."""
+
+    kind = "fake-a"
+
+    def execute(self, request):
+        self.calls += 1
+        self.last_request = request
+        raise RuntimeError("simulated worker fault")
+
+
+class FlakyWorker(_FakeWorker):
+    """Raises on the first ``fail_first`` calls, then succeeds (worker-error retry)."""
+
+    kind = "fake-a"
+
+    def __init__(self, fail_first=1, structured_output=None, **kw):
+        super().__init__(structured_output=structured_output, **kw)
+        self._fail_first = fail_first
+
+    def execute(self, request):
+        self.calls += 1
+        self.last_request = request
+        if self.calls <= self._fail_first:
+            raise RuntimeError("simulated transient worker fault")
+        return WorkerResult(
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.action_request_id}:{self.calls}",
+            reported_outcome="success", worker_version="test", structured_output=self._out,
+        )
+
+
+class SlowWorker(_FakeWorker):
+    """Advances an injected fake clock to simulate elapsed time (deterministic timeout)."""
+
+    kind = "fake-a"
+
+    def __init__(self, clock, delay, **kw):
+        super().__init__(**kw)
+        self._clock = clock
+        self._delay = delay
+
+    def execute(self, request):
+        self._clock.advance(self._delay)
+        return super().execute(request)
+
+
+class FakeClock:
+    """Deterministic monotonic clock for timeout tests (no real sleeps)."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += float(dt)
+
+
+class ScriptedWorker(_FakeWorker):
+    """Returns a different structured_output per attempt (drives retry-then-succeed)."""
+
+    kind = "fake-a"
+
+    def __init__(self, outputs, **kw):
+        super().__init__(**kw)
+        self._outputs = list(outputs)
+
+    def execute(self, request):
+        self.calls += 1
+        self.last_request = request
+        out = self._outputs[min(self.calls - 1, len(self._outputs) - 1)]
+        return WorkerResult(
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.action_request_id}:{self.calls}",
+            reported_outcome="success", worker_version="test", structured_output=out,
+        )
+
+
 def registry_with(*adapters) -> WorkerRegistry:
     reg = WorkerRegistry()
     for a in adapters:

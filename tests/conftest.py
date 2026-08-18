@@ -24,7 +24,9 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0013; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0014; dropped for a clean slate per test.
+# 0014 only ALTERs execution_attempt (adds failure_class/failure_detail/finished_at);
+# the columns drop with the table CASCADE below.
 # 0011 only ALTERs investment_decision_record (adds a column, two composite FKs
 # and a partial-unique index); dropping that table CASCADE below removes them.
 # 0012 adds execution_spec and a success-guard trigger/function on action_request

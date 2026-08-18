@@ -38,12 +38,16 @@ _ALLOWED_STATUS = frozenset(
         ("AWAITING_APPROVAL", "RUNNING"),
         ("AWAITING_APPROVAL", "CANCELLED"),
         ("RUNNING", "FAILED"),
+        ("RUNNING", "PENDING"),          # a retryable attempt failed; re-claimable for another attempt
         ("RUNNING", "RECOVERY_REQUIRED"),
         ("RECOVERY_REQUIRED", "RUNNING"),
         ("RECOVERY_REQUIRED", "FAILED"),
     }
 )
 _CLAIMABLE = {"PENDING", "AWAITING_APPROVAL", "RECOVERY_REQUIRED"}
+
+# Machine-execution failure classes that MAY be retried while attempts remain.
+RETRYABLE_FAILURE = frozenset({"WORKER_ERROR", "TIMEOUT", "VERIFICATION_FAILED"})
 
 
 def _set_status(cur, action_id: str, to_state: str, *, actor: str, reason: Optional[str] = None) -> None:
@@ -374,6 +378,53 @@ def _complete(
             action_id=action_id, payload={"proof_id": str(proof_id)},
         )
         return CompletionOutcome("SUCCEEDED", proof_id, verified=True, duplicated=False)
+
+
+def _fail_attempt_cur(
+    cur, action_id, *, attempt_id, failure_class, detail, terminal, actor,
+) -> str:
+    """Cursor-level attempt-failure disposition (composes into a larger transaction).
+
+    A retryable failure with attempts remaining is NOT action failure: the attempt
+    is marked FAILED with its class and the action returns to PENDING (re-claimable,
+    so the next dispatch re-authorizes via the normal claim path); the single budget
+    reservation is HELD across attempts. A terminal failure (non-retryable or retry
+    exhausted) sets the action to canonical FAILED and releases the reservation.
+    """
+    to_state = "FAILED" if terminal else "PENDING"
+    if attempt_id is not None:
+        cur.execute(
+            "UPDATE execution_attempt SET status = 'FAILED', failure_class = %s, "
+            "failure_detail = %s, finished_at = now(), updated_at = now() WHERE id = %s",
+            (failure_class, Json(detail or {}), attempt_id),
+        )
+    if terminal:
+        budget._release(cur, action_id)  # release the held reservation only at terminal failure
+    _set_status(cur, action_id, to_state, actor=actor, reason=failure_class)
+    audit.record_event(
+        cur, event_type="execution.attempt_failed", actor=actor, action_id=action_id,
+        payload={"failure_class": failure_class, "terminal": terminal, "to_state": to_state},
+    )
+    return to_state
+
+
+def fail_attempt(
+    conn,
+    action_id: str,
+    *,
+    attempt_id: Optional[str],
+    failure_class: str,
+    detail: Optional[dict[str, Any]] = None,
+    terminal: bool,
+    actor: str = "factory",
+) -> str:
+    """Record a machine-execution attempt failure and set the action's disposition.
+    Returns the resulting action status. See :func:`_fail_attempt_cur`."""
+    with db.transaction(conn) as cur:
+        return _fail_attempt_cur(
+            cur, action_id, attempt_id=attempt_id, failure_class=failure_class,
+            detail=detail, terminal=terminal, actor=actor,
+        )
 
 
 def get_status(conn, action_id: str) -> str:

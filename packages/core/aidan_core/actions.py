@@ -60,8 +60,16 @@ def submit_action_request(
     actor: str,
     idempotency_key: str,
     payload: Optional[dict[str, Any]] = None,
+    required_autonomy: int = 0,
+    requested_amount: "Any" = 0,
+    requested_currency: str = "USD",
 ) -> IntakeResult:
-    """Idempotently intake an ActionRequest. See module docstring for rules."""
+    """Idempotently intake an ActionRequest. See module docstring for rules.
+
+    ``required_autonomy`` / ``requested_amount`` / ``requested_currency`` are the
+    canonical policy/budget inputs (Slice 3); they default to a no-cost,
+    lowest-autonomy action.
+    """
     if not action_type:
         raise ValueError("action_type is required")
     if not idempotency_key:
@@ -74,12 +82,16 @@ def submit_action_request(
         cur.execute(
             """
             INSERT INTO action_request
-                (venture_id, action_type, actor, payload, payload_hash, idempotency_key)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (venture_id, action_type, actor, payload, payload_hash, idempotency_key,
+                 required_autonomy, requested_amount, requested_currency)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (venture_id, idempotency_key) DO NOTHING
             RETURNING id
             """,
-            (venture_id, action_type, actor, Json(payload), payload_hash, idempotency_key),
+            (
+                venture_id, action_type, actor, Json(payload), payload_hash, idempotency_key,
+                required_autonomy, requested_amount, requested_currency,
+            ),
         )
         row = cur.fetchone()
 

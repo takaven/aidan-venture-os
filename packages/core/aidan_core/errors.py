@@ -36,3 +36,11 @@ class IdempotencyConflictError(AidanCoreError):
     This is a hard, deterministic conflict: the earlier ActionRequest is never
     silently returned for a semantically different payload.
     """
+
+
+class InsufficientBudgetError(AidanCoreError):
+    """A reservation cannot be made because available budget is insufficient."""
+
+
+class IllegalCapitalTransitionError(AidanCoreError):
+    """An invalid capital transition (e.g. commit after release) was attempted."""

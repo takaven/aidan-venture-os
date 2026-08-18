@@ -52,8 +52,17 @@ class InvestmentDecision(str, Enum):
     DO_NOTHING = "DO_NOTHING"
 
 
+class PolicyOutcome(str, Enum):
+    """Deterministic policy evaluation outcome (Slice 3)."""
+
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+    REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
+
+
 # Names of the corresponding PostgreSQL ENUM types. Distinct DB types are the
 # actual enforcement of vocabulary separation.
 LIFECYCLE_STATE_TYPE = "lifecycle_state"
 RUN_STATUS_TYPE = "run_status"
 INVESTMENT_DECISION_TYPE = "investment_decision"
+POLICY_DECISION_TYPE = "policy_decision_kind"

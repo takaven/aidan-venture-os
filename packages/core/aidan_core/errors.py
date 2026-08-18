@@ -20,3 +20,19 @@ class MigrationChecksumError(MigrationError):
     Forward-only doctrine: applied migrations must never be edited. A drift
     here is a hard failure, never a silent re-apply.
     """
+
+
+class NotFoundError(AidanCoreError):
+    """A referenced canonical entity does not exist."""
+
+
+class IllegalTransitionError(AidanCoreError):
+    """A venture lifecycle transition is not in the permitted set."""
+
+
+class IdempotencyConflictError(AidanCoreError):
+    """An idempotency key was reused with a different canonical payload.
+
+    This is a hard, deterministic conflict: the earlier ActionRequest is never
+    silently returned for a semantically different payload.
+    """

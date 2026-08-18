@@ -33,13 +33,14 @@ def test_discover_is_deterministic_and_checksummed():
 # Integration (PostgreSQL) — skipped locally without DATABASE_URL.
 # --------------------------------------------------------------------------
 def test_fresh_bootstrap_applies_all(clean_db):
+    expected = [version for version, _n, _c, _s in migrate.discover(MIGRATIONS_DIR)]
     applied = migrate.apply(clean_db, MIGRATIONS_DIR)
-    assert applied == ["0001"]
+    assert applied == expected
+    assert "0001" in applied and "0002" in applied
 
     with clean_db.cursor() as cur:
-        cur.execute("SELECT version, checksum FROM schema_migrations ORDER BY version")
-        rows = cur.fetchall()
-        assert [r[0] for r in rows] == ["0001"]
+        cur.execute("SELECT version FROM schema_migrations ORDER BY version")
+        assert [r[0] for r in cur.fetchall()] == expected
 
         cur.execute("SELECT to_regclass('public.audit_event') IS NOT NULL")
         assert cur.fetchone()[0] is True
@@ -50,20 +51,21 @@ def test_fresh_bootstrap_applies_all(clean_db):
 
 
 def test_rerun_is_a_noop(clean_db):
-    assert migrate.apply(clean_db, MIGRATIONS_DIR) == ["0001"]
+    expected = [version for version, _n, _c, _s in migrate.discover(MIGRATIONS_DIR)]
+    assert migrate.apply(clean_db, MIGRATIONS_DIR) == expected
     # Second and third runs must apply nothing and not duplicate rows.
     assert migrate.apply(clean_db, MIGRATIONS_DIR) == []
     assert migrate.apply(clean_db, MIGRATIONS_DIR) == []
     with clean_db.cursor() as cur:
         cur.execute("SELECT count(*) FROM schema_migrations")
-        assert cur.fetchone()[0] == 1
+        assert cur.fetchone()[0] == len(expected)
 
 
 def test_checksum_drift_is_hard_failure(clean_db, tmp_path):
     # Copy migrations to a temp dir so we never mutate the committed file.
     work = tmp_path / "migrations"
     shutil.copytree(MIGRATIONS_DIR, work)
-    assert migrate.apply(clean_db, work) == ["0001"]
+    assert "0001" in migrate.apply(clean_db, work)
 
     target = next(work.glob("0001_*.sql"))
     target.write_text(target.read_text(encoding="utf-8") + "\n-- tampered\n", encoding="utf-8")

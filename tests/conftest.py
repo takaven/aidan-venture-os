@@ -24,14 +24,19 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migration 0001; dropped to guarantee a clean slate per test.
+# Objects owned by migrations 0001–0002; dropped for a clean slate per test.
 _DROP_SQL = """
+DROP TABLE IF EXISTS investment_decision_record CASCADE;
+DROP TABLE IF EXISTS action_request CASCADE;
+DROP TABLE IF EXISTS venture_mandate_version CASCADE;
+DROP TABLE IF EXISTS venture CASCADE;
 DROP TABLE IF EXISTS audit_event CASCADE;
 DROP TABLE IF EXISTS schema_migrations CASCADE;
 DROP TYPE IF EXISTS lifecycle_state CASCADE;
 DROP TYPE IF EXISTS run_status CASCADE;
 DROP TYPE IF EXISTS investment_decision CASCADE;
 DROP FUNCTION IF EXISTS audit_event_immutable() CASCADE;
+DROP FUNCTION IF EXISTS append_only_guard() CASCADE;
 """
 
 
@@ -50,7 +55,16 @@ def conn():
 
 @pytest.fixture
 def clean_db(conn):
-    """Drop all Slice-1 objects so a test starts from an empty schema."""
+    """Drop all kernel objects so a test starts from an empty schema."""
     with conn.cursor() as cur:
         cur.execute(_DROP_SQL)
     return conn
+
+
+@pytest.fixture
+def migrated(clean_db):
+    """A clean database with all migrations applied."""
+    from aidan_core import migrate
+
+    migrate.apply(clean_db, MIGRATIONS_DIR)
+    return clean_db

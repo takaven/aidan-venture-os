@@ -92,3 +92,43 @@ class MandateMismatchError(AidanCoreError):
     Research must execute against an exact Board-authored canonical Mandate
     version; a mismatch is rejected rather than proceeding or mutating it.
     """
+
+
+class StaleRecommendationError(AidanCoreError):
+    """A next-action recommendation no longer matches current canonical state.
+
+    A recommendation is produced against an exact input basis (assumptions,
+    validation tests/results). If materially new decision-relevant state exists
+    when it is converted into an investment decision, the old recommendation is
+    rejected as stale rather than committed. The prior recommendation is never
+    mutated; a fresh recommendation must be obtained.
+    """
+
+
+class RecommendationNotConvertibleError(AidanCoreError):
+    """A recommendation cannot be converted into the requested investment decision.
+
+    Raised when a RESEARCH_MORE recommendation (which maps to no investment
+    decision) is converted, or when an incompatible target decision is requested
+    for a recommendation (e.g. KILL -> BUILD, BUILD -> SCALE).
+    """
+
+
+class BuildGateNotSatisfiedError(AidanCoreError):
+    """A BUILD investment decision was refused by independent canonical re-gating.
+
+    BUILD is never trusted because the allocator recommended it: current
+    canonical state (opportunity status, positive provenance, complete Kill Case,
+    unresolved critical assumptions, contextual WTP/acquisition validation,
+    decisive kill criteria, unresolved contradictions) is re-verified, and the
+    decision is refused if any required condition is not currently met.
+    """
+
+
+class ConsequentialSpendError(AidanCoreError):
+    """A requested consequential amount is not permitted for this decision.
+
+    For a VALIDATE decision the requested amount must be bounded by the selected
+    validation test's precommitted ``max_spend``. A consequential amount with no
+    precommitted bound, or one exceeding it, is rejected.
+    """

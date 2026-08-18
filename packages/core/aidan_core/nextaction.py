@@ -91,6 +91,21 @@ def _cheapest_discriminating_test(cur, venture_id, assumption_id):
 _IMPORTANCE_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
 
+def _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results):
+    """The exact canonical basis a recommendation's input_hash digests.
+
+    Shared by recommend() (to persist the hash) and current_basis() (to detect
+    staleness) so the two can never drift apart.
+    """
+    return {
+        "opportunity": str(opportunity_id),
+        "assumptions": sorted(str(a) for a in considered_assumptions),
+        "results": sorted(str(r) for r in considered_results),
+        "action": action,
+        "reason": reason,
+    }
+
+
 def _decide(cur, venture_id, opportunity_id):
     assumptions, state, all_result_ids = _gather(cur, venture_id, opportunity_id)
     considered_assumptions = [aid for aid, _imp in assumptions]
@@ -143,6 +158,31 @@ def _decide(cur, venture_id, opportunity_id):
     return ("HOLD", "NO_HIGH_VALUE_ACTION_NOW", None, considered_assumptions, considered_tests, all_result_ids)
 
 
+def current_basis(cur, venture_id: str, opportunity_id: str) -> dict:
+    """Recompute, against CURRENT canonical state, the basis a recommendation
+    encodes. ``input_hash`` is identical to what recommend() would persist now,
+    so a governed converter can detect a stale recommendation by comparison.
+
+    Read-only. Uses the caller's cursor so the check shares one transaction
+    snapshot with the conversion it guards.
+    """
+    action, reason, selected_test, considered_assumptions, considered_tests, considered_results = _decide(
+        cur, venture_id, opportunity_id
+    )
+    input_hash = canonical_payload_hash(
+        _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results)
+    )
+    return {
+        "action": action,
+        "reason": reason,
+        "selected_validation_test_id": selected_test,
+        "considered_assumptions": considered_assumptions,
+        "considered_tests": considered_tests,
+        "considered_results": considered_results,
+        "input_hash": input_hash,
+    }
+
+
 def recommend(
     conn, venture_id: str, opportunity_id: str, *, recommendation_key: str, actor: str = "aidan",
 ) -> Recommendation:
@@ -153,12 +193,9 @@ def recommend(
         action, reason, selected_test, considered_assumptions, considered_tests, considered_results = _decide(
             cur, venture_id, opportunity_id
         )
-        input_hash = canonical_payload_hash({
-            "opportunity": str(opportunity_id),
-            "assumptions": sorted(str(a) for a in considered_assumptions),
-            "results": sorted(str(r) for r in considered_results),
-            "action": action, "reason": reason,
-        })
+        input_hash = canonical_payload_hash(
+            _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results)
+        )
 
         cur.execute(
             "SELECT id, input_hash FROM next_action_recommendation WHERE venture_id = %s AND recommendation_key = %s",

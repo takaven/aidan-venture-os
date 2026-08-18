@@ -24,7 +24,9 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0010; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0011; dropped for a clean slate per test.
+# 0011 only ALTERs investment_decision_record (adds a column, two composite FKs
+# and a partial-unique index); dropping that table CASCADE below removes them.
 _DROP_SQL = """
 DROP TABLE IF EXISTS recommendation_validation_result CASCADE;
 DROP TABLE IF EXISTS recommendation_validation_test CASCADE;

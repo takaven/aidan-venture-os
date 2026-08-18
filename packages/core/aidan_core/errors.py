@@ -56,3 +56,11 @@ class ApprovalRequiredError(AidanCoreError):
 
 class ApprovalStateError(AidanCoreError):
     """An approval state change is invalid (e.g. approving a terminal approval)."""
+
+
+class InconsistentCanonicalStateError(AidanCoreError):
+    """Canonical success signals disagree (SUCCEEDED status vs VERIFIED proof).
+
+    Raised rather than silently repairing or reporting success when exactly one
+    of {status == SUCCEEDED, a VERIFIED proof receipt exists} is present.
+    """

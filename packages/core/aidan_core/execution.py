@@ -23,10 +23,13 @@ from .approvals import create_pending, valid_approval
 from .errors import (
     ApprovalRequiredError,
     ExecutionBlockedError,
+    InconsistentCanonicalStateError,
     NotFoundError,
 )
 
-# ActionRequest run-status transitions permitted through the guarded path.
+# ActionRequest run-status transitions permitted through the generic guarded
+# path. Note: (RUNNING -> SUCCEEDED) is deliberately ABSENT — canonical success
+# is reachable only through _transition_to_success(), which is proof-gated.
 _ALLOWED_STATUS = frozenset(
     {
         ("PENDING", "AWAITING_APPROVAL"),
@@ -34,7 +37,6 @@ _ALLOWED_STATUS = frozenset(
         ("PENDING", "CANCELLED"),
         ("AWAITING_APPROVAL", "RUNNING"),
         ("AWAITING_APPROVAL", "CANCELLED"),
-        ("RUNNING", "SUCCEEDED"),
         ("RUNNING", "FAILED"),
         ("RUNNING", "RECOVERY_REQUIRED"),
         ("RECOVERY_REQUIRED", "RUNNING"),
@@ -61,6 +63,36 @@ def _set_status(cur, action_id: str, to_state: str, *, actor: str, reason: Optio
     audit.record_event(
         cur, event_type="action.status_changed", actor=actor, action_id=action_id,
         payload={"from": current, "to": to_state, "reason": reason},
+    )
+
+
+def _transition_to_success(cur, action_id: str, *, actor: str) -> None:
+    """The ONLY path to canonical SUCCEEDED. Requires a matching VERIFIED proof.
+
+    Validates that a VERIFIED proof receipt belonging to *this* ActionRequest
+    exists before moving RUNNING -> SUCCEEDED. A VERIFIED receipt for another
+    action, a FAILED receipt, or no receipt all fail deterministically.
+    """
+    if proof.verified_proof_id(cur, action_id) is None:
+        raise ExecutionBlockedError(
+            "canonical success requires a VERIFIED proof receipt for this action"
+        )
+    cur.execute("SELECT status FROM action_request WHERE id = %s FOR UPDATE", (action_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise NotFoundError(f"action_request {action_id} does not exist")
+    current = row[0]
+    if current == "SUCCEEDED":
+        return
+    if current != "RUNNING":
+        raise ExecutionBlockedError(f"cannot transition {current} -> SUCCEEDED")
+    cur.execute(
+        "UPDATE action_request SET status = 'SUCCEEDED', updated_at = now() WHERE id = %s",
+        (action_id,),
+    )
+    audit.record_event(
+        cur, event_type="action.status_changed", actor=actor, action_id=action_id,
+        payload={"from": current, "to": "SUCCEEDED"},
     )
 
 
@@ -236,25 +268,37 @@ def complete_execution(
     callback never directly sets canonical success.
     """
     with db.transaction(conn) as cur:
-        cur.execute("SELECT venture_id FROM action_request WHERE id = %s FOR UPDATE", (action_id,))
+        cur.execute(
+            "SELECT venture_id, status FROM action_request WHERE id = %s FOR UPDATE", (action_id,)
+        )
         row = cur.fetchone()
         if row is None:
             raise NotFoundError(f"action_request {action_id} does not exist")
-        venture_id = row[0]
+        venture_id, status = row
+
+        # Duplicate completion: canonical success is inferred only when BOTH the
+        # SUCCEEDED status AND a matching VERIFIED proof receipt agree. If exactly
+        # one is present, the canonical state is inconsistent -> fail; never
+        # silently repair or report success from one side alone.
+        existing = proof.verified_proof_id(cur, action_id)
+        is_succeeded = status == "SUCCEEDED"
+        if existing is not None or is_succeeded:
+            if existing is not None and is_succeeded:
+                return CompletionOutcome("SUCCEEDED", existing, verified=True, duplicated=True)
+            raise InconsistentCanonicalStateError(
+                f"inconsistent canonical success for {action_id}: "
+                f"verified_proof={existing is not None}, status_succeeded={is_succeeded}"
+            )
 
         # 1. accept/dedup raw result.
         result_id, _created = _upsert_result(
             cur, action_id, attempt_id, external_result_id, reported_outcome, raw_payload
         )
 
-        # Idempotent: already canonically completed.
-        existing = proof.verified_proof_id(cur, action_id)
-        if existing is not None:
-            return CompletionOutcome("SUCCEEDED", existing, verified=True, duplicated=True)
-
-        # 2. deterministic verification. 3. record proof receipt.
-        verdict, vtype, ehash = proof.deterministic_verify(action_id, reported_outcome, raw_payload)
-        proof_id = proof.insert_receipt(cur, action_id, result_id, verdict, vtype, ehash)
+        # 2/3. deterministic verification + receipt (verdict derived internally).
+        verdict, proof_id = proof._record_receipt(
+            cur, action_id, result_id, reported_outcome, raw_payload
+        )
 
         if verdict != "VERIFIED":
             budget._release(cur, action_id)  # unblock reserved funds on failure
@@ -270,8 +314,9 @@ def complete_execution(
             )
             return CompletionOutcome("FAILED", proof_id, verified=False, duplicated=False)
 
-        # 4. transition to canonical success.
-        _set_status(cur, action_id, "SUCCEEDED", actor=actor)
+        # 4. transition to canonical success (proof-gated: validates the VERIFIED
+        # receipt just recorded for this action).
+        _transition_to_success(cur, action_id, actor=actor)
         # 5/6. reconcile budget (commit actual, release unused; reject overspend).
         budget.reconcile_completion(cur, action_id, actual_cost)
         # 7. authorized lifecycle transition, only if requested and permitted.

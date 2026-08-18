@@ -34,6 +34,18 @@ a deterministic verifier produces a `VERIFIED` `proof_receipt`; a caller cannot
 persist `result='VERIFIED'` directly. Canonical success requires a `VERIFIED`
 receipt, and at most one exists per action (partial unique index).
 
+### Proof-gated canonical success (construction-level)
+
+VERIFIED Proof Receipt creation is controlled by deterministic verification: the
+only receipt writer derives the verdict internally, so no production API accepts
+a caller-supplied `VERIFIED`. Canonical `SUCCEEDED` is reachable only through a
+dedicated transition that independently validates a `VERIFIED` receipt belonging
+to the *same* ActionRequest — a receipt for another action, a `FAILED` receipt,
+or no receipt all fail deterministically. Duplicate completion returns canonical
+success only when both signals agree (status `SUCCEEDED` **and** a matching
+`VERIFIED` receipt); if exactly one is present the canonical state is
+inconsistent and completion fails rather than reporting or repairing success.
+
 ### Exactly-once canonical completion vs conditional external exactly-once
 
 Gate 1 guarantees **exactly-once canonical completion**: the success transaction

@@ -46,15 +46,22 @@ def verified_proof_id(cur, action_request_id: str):
     return row[0] if row else None
 
 
-def insert_receipt(
+def _record_receipt(
     cur,
     action_request_id: str,
     execution_result_id: str,
-    result: str,
-    verification_type: str,
-    evidence_hash: str,
-) -> str:
-    """Insert a proof receipt (cursor-based). Callers must pass a verifier result."""
+    reported_outcome: str,
+    raw_payload,
+) -> tuple:
+    """Verify deterministically and persist the receipt (cursor-based).
+
+    Returns ``(verdict, proof_id)``. The verdict is ALWAYS derived here by the
+    deterministic verifier; there is no parameter through which a caller can
+    supply ``VERIFIED``. This is the only path that writes a proof receipt.
+    """
+    verdict, verification_type, evidence_hash = deterministic_verify(
+        action_request_id, reported_outcome, raw_payload
+    )
     cur.execute(
         """
         INSERT INTO proof_receipt
@@ -62,6 +69,6 @@ def insert_receipt(
         VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (action_request_id, execution_result_id, verification_type, VERIFIER, result, evidence_hash),
+        (action_request_id, execution_result_id, verification_type, VERIFIER, verdict, evidence_hash),
     )
-    return cur.fetchone()[0]
+    return verdict, cur.fetchone()[0]

@@ -64,3 +64,7 @@ class InconsistentCanonicalStateError(AidanCoreError):
     Raised rather than silently repairing or reporting success when exactly one
     of {status == SUCCEEDED, a VERIFIED proof receipt exists} is present.
     """
+
+
+class InvalidAcquisitionError(AidanCoreError):
+    """An acquired source (untrusted external input) failed validation."""

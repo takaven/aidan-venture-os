@@ -15,4 +15,4 @@ dependencies = [
 test = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["aidan_core"]
+packages = ["aidan_core", "aidan_core.research"]

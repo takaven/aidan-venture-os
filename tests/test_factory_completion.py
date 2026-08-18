@@ -59,12 +59,19 @@ def test_correct_structured_contract_succeeds(migrated):
     assert result == "VERIFIED" and vtype == STRUCTURED_CONTRACT and attempt is not None
 
 
-def test_wrong_structured_contract_is_rejected(migrated):
+def test_wrong_structured_contract_is_rejected_and_retryable(migrated):
+    # Default max_attempts=3: a wrong deterministic contract is REJECTED and, with
+    # retries remaining, is a retryable attempt failure — not action failure.
     aid = _struct(migrated, "cp-bad", worker_outcome="success", output={"status": "nope"})
     out = runtime.verify_and_complete(migrated, aid, verifier_registry=default_registry(), actual_cost=10)
-    assert out.status == "FAILED" and out.verified is False
-    assert execution.get_status(migrated, aid) != "SUCCEEDED"
+    assert out.verified is False
+    # Rejected proof/history preserved; no VERIFIED proof; no canonical SUCCESS.
     assert _latest_proof(migrated, aid)[0] == "FAILED"
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s AND result = 'VERIFIED'", (aid,))
+        assert cur.fetchone()[0] == 0
+    # The action remains retryable (attempts remain), not terminal.
+    assert execution.get_status(migrated, aid) == "PENDING"
 
 
 def test_worker_success_but_verifier_rejects_gives_no_success(migrated):

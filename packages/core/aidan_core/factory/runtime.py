@@ -52,13 +52,18 @@ def _decide_failure(base_class: str, attempt_number: int, max_attempts: int):
 
 
 def _record_failure(conn, action_id, attempt_id, attempt_number, max_attempts, base_class, detail):
-    """Classify + record an attempt failure. Returns (action_status, terminal)."""
+    """Classify + record an attempt failure. Returns (action_status, final_failure_class).
+
+    ``final_failure_class`` is the canonical class actually persisted on the attempt
+    (``RETRY_EXHAUSTED`` at exhaustion; otherwise the base class), so callers report
+    the persisted classification rather than the raw underlying cause.
+    """
     terminal, final_class = _decide_failure(base_class, attempt_number, max_attempts)
     to_state = execution.fail_attempt(
         conn, action_id, attempt_id=attempt_id, failure_class=final_class,
         detail={"base_class": base_class, **(detail or {})}, terminal=terminal,
     )
-    return to_state, terminal
+    return to_state, final_class
 
 
 def request_dispatch_authorization(
@@ -180,22 +185,22 @@ def execute_action(
     try:
         result = adapter.execute(request)
     except Exception as exc:  # a worker fault is a classified machine failure, not a crash
-        to_state, _terminal = _record_failure(
+        to_state, final_class = _record_failure(
             conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,
             "WORKER_ERROR", {"error_type": type(exc).__name__},
         )
         return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
-                             to_state, dispatched=True, failure_class="WORKER_ERROR")
+                             to_state, dispatched=True, failure_class=final_class)
     elapsed = clock() - started
     if elapsed > timeout_seconds:
         # Runtime-observed timeout: the result is discarded (never captured), so a
         # late/over-time result cannot become canonical success for this attempt.
-        to_state, _terminal = _record_failure(
+        to_state, final_class = _record_failure(
             conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,
             "TIMEOUT", {"elapsed_seconds": elapsed, "timeout_seconds": timeout_seconds},
         )
         return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
-                             to_state, dispatched=True, failure_class="TIMEOUT")
+                             to_state, dispatched=True, failure_class=final_class)
 
     # Capture the worker's claim as canonical raw result data (dedup reused). This is
     # NOT canonical success: no proof is created and no status becomes SUCCEEDED.

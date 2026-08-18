@@ -1,0 +1,29 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python local/runtime artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node/build artifacts
+node_modules/
+dist/
+build/
+coverage/
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# OS metadata
+.DS_Store
+Thumbs.db

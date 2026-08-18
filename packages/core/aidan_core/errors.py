@@ -77,3 +77,10 @@ class EvidenceRelationConflictError(AidanCoreError):
     the second, opposite-stance assertion is rejected deterministically rather
     than silently replacing the first.
     """
+
+
+class OpportunityNotReadyError(AidanCoreError):
+    """An opportunity cannot be finalized as CANDIDATE: structural completeness
+    (hypotheses, linked claim(s)/assumption(s), critical unknown, and a complete
+    adversarial Kill Case) is not yet satisfied.
+    """

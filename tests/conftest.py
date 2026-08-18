@@ -24,8 +24,21 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0006; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0007; dropped for a clean slate per test.
 _DROP_SQL = """
+DROP TABLE IF EXISTS research_result CASCADE;
+DROP TABLE IF EXISTS kill_case_dimension_claim CASCADE;
+DROP TABLE IF EXISTS kill_case_dimension CASCADE;
+DROP TABLE IF EXISTS kill_case CASCADE;
+DROP TABLE IF EXISTS opportunity_interpretation CASCADE;
+DROP TABLE IF EXISTS opportunity_assumption CASCADE;
+DROP TABLE IF EXISTS opportunity_claim CASCADE;
+DROP TABLE IF EXISTS opportunity CASCADE;
+DROP TABLE IF EXISTS assumption_interpretation CASCADE;
+DROP TABLE IF EXISTS assumption_claim CASCADE;
+DROP TABLE IF EXISTS assumption CASCADE;
+DROP TABLE IF EXISTS interpretation_claim CASCADE;
+DROP TABLE IF EXISTS interpretation CASCADE;
 DROP TABLE IF EXISTS claim_evidence CASCADE;
 DROP TABLE IF EXISTS observation CASCADE;
 DROP TABLE IF EXISTS claim CASCADE;
@@ -52,6 +65,7 @@ DROP TYPE IF EXISTS policy_decision_kind CASCADE;
 DROP FUNCTION IF EXISTS audit_event_immutable() CASCADE;
 DROP FUNCTION IF EXISTS append_only_guard() CASCADE;
 DROP FUNCTION IF EXISTS approval_terminal_guard() CASCADE;
+DROP FUNCTION IF EXISTS opportunity_content_immutable() CASCADE;
 """
 
 
@@ -107,3 +121,35 @@ def setup_action(
         required_autonomy=required_autonomy, requested_amount=amount, requested_currency=currency,
     ).action_id
     return vid, aid
+
+
+def research_claim(conn, vid, *, statement="claim", key="c", stance=None):
+    """Build source -> observation -> claim; optionally attach one stance. Returns (claim_id, observation_id)."""
+    from datetime import datetime, timezone
+
+    from aidan_core.research import claims, observations, sources
+    from aidan_core.research.adapters import AcquiredSource
+
+    src = sources.ingest(conn, vid, AcquiredSource(
+        locator="L", source_type="WEB_PAGE", content=f"body-{key}",
+        retrieved_at=datetime(2026, 1, 1, tzinfo=timezone.utc), retrieved_by="a", acquisition_key=f"src-{key}",
+    )).evidence_record_id
+    obs = observations.create_observation(
+        conn, vid, source_evidence_id=src, statement=f"obs-{key}", observation_key=f"obs-{key}"
+    ).evidence_record_id
+    cid = claims.create_claim(conn, vid, statement=statement, claim_key=key).evidence_record_id
+    if stance in ("SUPPORTS", "CONTRADICTS"):
+        claims.link_evidence(conn, claim_id=cid, observation_id=obs, stance=stance)
+    return cid, obs
+
+
+def full_kill_case(conn, opportunity_id, *, key="kc", assessment="MATERIAL_RISK"):
+    """Create a Kill Case and assess all required dimensions. Returns kill_case_id."""
+    from aidan_core.research import killcase
+
+    kc = killcase.create_kill_case(
+        conn, opportunity_id=opportunity_id, kill_case_key=key, disposition="PROCEED_WITH_RISKS"
+    ).kill_case_id
+    for dim in killcase.REQUIRED_DIMENSIONS:
+        killcase.add_dimension(conn, kill_case_id=kc, dimension=dim, assessment=assessment, rationale="r")
+    return kc

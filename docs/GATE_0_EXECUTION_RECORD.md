@@ -81,3 +81,42 @@ No manual code repair, deployment repair or outcome transcription occurred.
 ## Exit status
 
 The local portion may pass only after the replacement committed tree, Git object database, preservation bundle and recovery clone all pass the required checks. Gate 1 must not begin in this run.
+
+## Remote completion
+
+The preserved replacement canonical history was materialised into a live working repository and pushed to the canonical remote, resolving the previously deferred remote verification.
+
+### Remote canonicalisation
+
+- Canonical repository: `takaven/aidan-venture-os`.
+- Visibility: **PRIVATE**.
+- Default branch: `main`.
+- The preserved canonical history was successfully pushed. A disposable auto-initialised `Initial commit` (`f67432be7be4fe7116d614619639e8ecf2a77cdc`, containing only a stock `README.md`) was confirmed to hold no programme work and was replaced via `--force-with-lease` tied to that exact observed SHA; no unrestricted force push was used.
+- Remote canonical HEAD before this closeout commit: `cc4f69b9a2c068b1532a411a6a274f35d90f9847`.
+- Remote canonical tree: `7af936a279e36e19278eb2496dcd602db6c2d33d`.
+- Gate 0 Integrity workflow on that SHA: **SUCCESS** (`python3 tests/gate0_integrity.py` and `git diff --check` both passed).
+- No unintended branches exist; only `main` is present.
+- No Gate 1 implementation was started.
+
+### Accepted governance exception
+
+- GitHub branch protection and repository rulesets were inspected for `takaven/aidan-venture-os`.
+- Both are **unavailable** for this private repository under the current GitHub **Free** plan; GitHub returned `HTTP 403 — "Upgrade to GitHub Pro or make this repository public to enable this feature."`
+- The repository remains **private** by programme decision.
+- Upgrading GitHub solely to close Gate 0 is **not required**.
+- Making the canonical repository **public is rejected**.
+- Technical `main` protection is therefore classified as **DEFERRED GOVERNANCE CONTROL**.
+
+Current compensating controls:
+
+- the repository remains private;
+- owner/admin access is currently tightly limited;
+- canonical local and remote history is independently verified;
+- Gate 0 CI runs on pushes;
+- unrestricted force-push and history rewriting are prohibited by programme operating policy even though GitHub cannot currently enforce this technically.
+
+Trigger for revisiting technical protection:
+
+> Enable branch protection/rulesets when the GitHub plan/capability changes, or before broader collaborator/write access materially increases repository risk.
+
+**These compensating controls are not equivalent to enforced GitHub branch protection.**

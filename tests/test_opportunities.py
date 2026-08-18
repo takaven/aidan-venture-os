@@ -64,9 +64,20 @@ def test_mandatory_kill_case_before_candidate(migrated):
     killcase.add_dimension(migrated, kill_case_id=kc, dimension="REGULATION", assessment="LOW_RISK", rationale="r")
     with pytest.raises(OpportunityNotReadyError):
         opportunities.finalize_candidate(migrated, opp)
-    # Complete all dimensions -> finalize succeeds, and is idempotent.
-    for dim in killcase.REQUIRED_DIMENSIONS:
+    # Complete only the still-missing dimensions; the existing REGULATION=LOW_RISK
+    # is preserved unchanged (never reassessed).
+    for dim in killcase.missing_dimensions(migrated, kc):
         killcase.add_dimension(migrated, kill_case_id=kc, dimension=dim, assessment="MATERIAL_RISK", rationale="r")
+    assert killcase.missing_dimensions(migrated, kc) == set()
+    with migrated.cursor() as cur:
+        cur.execute(
+            "SELECT count(*), count(DISTINCT dimension) FROM kill_case_dimension WHERE kill_case_id = %s", (kc,)
+        )
+        total, distinct = cur.fetchone()
+        assert total == 11 and distinct == 11  # all 11 present exactly once
+        cur.execute("SELECT assessment FROM kill_case_dimension WHERE kill_case_id = %s AND dimension = 'REGULATION'", (kc,))
+        assert cur.fetchone()[0] == "LOW_RISK"  # original partial assessment preserved
+    # Now structurally complete -> candidate accepted (and idempotent on retry).
     assert opportunities.finalize_candidate(migrated, opp) == "CANDIDATE"
     assert opportunities.finalize_candidate(migrated, opp) == "CANDIDATE"
     assert opportunities.get_status(migrated, opp) == "CANDIDATE"

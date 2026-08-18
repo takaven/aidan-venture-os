@@ -86,14 +86,24 @@ def test_subtype_requires_source_parent(migrated):
 def test_venture_must_agree_with_parent(migrated):
     a = ventures.create_venture(migrated, slug="sr-va")
     b = ventures.create_venture(migrated, slug="sr-vb")
-    res = sources.ingest(migrated, a, _src())
-    # A source_receipt claiming venture b for a's SOURCE envelope -> composite FK violation.
+    # A FRESH SOURCE evidence_record for venture a, with no source_receipt yet, so
+    # the insert below reaches the composite venture-agreement FK rather than the
+    # source_receipt primary key.
+    with migrated.cursor() as cur:
+        cur.execute(
+            "INSERT INTO evidence_record (venture_id, kind, content_hash) "
+            "VALUES (%s, 'SOURCE', 'h') RETURNING id",
+            (a,),
+        )
+        er_id = cur.fetchone()[0]
+    # A source_receipt claiming venture b for a's SOURCE envelope -> composite FK
+    # (evidence_record_id, venture_id, SOURCE) has no matching evidence_record row.
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         with migrated.cursor() as cur:
             cur.execute(
                 "INSERT INTO source_receipt (evidence_record_id, venture_id, locator, source_type, "
                 "retrieved_at, retrieved_by, acquisition_key) VALUES (%s, %s, 'L', 'WEB_PAGE', now(), 'a', 'k2')",
-                (res.evidence_record_id, b),
+                (er_id, b),
             )
 
 

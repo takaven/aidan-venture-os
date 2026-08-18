@@ -9,7 +9,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from aidan_core import budget, db, execution, proof, ventures
+from aidan_core import db, execution, proof
 from aidan_core.errors import ExecutionBlockedError, InconsistentCanonicalStateError
 
 from conftest import setup_action
@@ -119,10 +119,13 @@ def test_verified_without_succeeded_is_inconsistent(migrated):
         _complete_ok(migrated, aid)
 
 
-def test_succeeded_without_verified_is_inconsistent(migrated):
+def test_forced_succeeded_without_verified_is_rejected_by_db(migrated):
+    # Migration 0012 makes the forced-SUCCEEDED corruption impossible at the DB
+    # level (stronger than the previous detect-after-the-fact guarantee): a raw
+    # UPDATE to SUCCEEDED without a VERIFIED proof is rejected by the trigger, so
+    # the inconsistent state can never arise.
     _vid, aid = _claimed(migrated, "pg-inc2")
-    # Force SUCCEEDED without a proof (test-only corruption).
-    with migrated.cursor() as cur:
-        cur.execute("UPDATE action_request SET status = 'SUCCEEDED' WHERE id = %s", (aid,))
-    with pytest.raises(InconsistentCanonicalStateError):
-        _complete_ok(migrated, aid)
+    with pytest.raises(psycopg.errors.RaiseException):
+        with migrated.cursor() as cur:
+            cur.execute("UPDATE action_request SET status = 'SUCCEEDED' WHERE id = %s", (aid,))
+    assert execution.get_status(migrated, aid) != "SUCCEEDED"

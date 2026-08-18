@@ -14,6 +14,7 @@ consequential success.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -99,7 +100,11 @@ class ArtifactHashVerifier:
         actual = None
         for a in request.artifacts:
             if a.get("artifact_key") == key:
-                actual = a.get("content_hash")
+                content = a.get("content")
+                # Independently RE-HASH the durable content — never trust a stored
+                # or worker-declared hash (a persisted hash cannot verify itself).
+                if isinstance(content, str):
+                    actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 break
         ok = actual is not None and expected is not None and actual == expected
         return VerificationResult(

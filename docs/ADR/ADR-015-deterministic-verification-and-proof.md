@@ -32,14 +32,19 @@ is introduced. The receipt gains an optional `execution_attempt_id` so a success
 can name the attempt whose machine verification produced it, and a proof may cite
 only an attempt of its own action (composite FK).
 
-### The verdict is derived, never caller-supplied
+### The verdict is derived from the immutable spec, never caller-supplied
 
-The completion API takes no `verified`/`verdict` parameter. `verify_and_complete`
-selects the verifier by the IMMUTABLE `execution_spec.verifier_kind` (the caller
-and worker cannot override it), runs it over canonical inputs, and feeds the
-derived verdict into the existing proof-gated `complete_execution`. `proof.py`
-was minimally generalized to accept an injected deterministic verifier while
-remaining the only receipt writer.
+No public completion API accepts a verifier, a verdict, or a verifier kind.
+`complete_execution` (public) is fixed to the built-in deterministic token
+verifier and takes no verifier parameter. `verify_and_complete` resolves the
+verifier solely from the IMMUTABLE `execution_spec.verifier_kind` via a trusted
+registry, runs it over canonical inputs, and records the derived verdict through
+`proof._write_receipt` — the single internal receipt writer — via the shared
+private completion core `execution._complete`. There is no public seam through
+which a caller or worker can inject verification code or a verdict. Moreover, an
+action that carries an `execution_spec` cannot be completed through the token
+path at all (the completion core rejects it), so the deterministic token cannot
+bypass a spec's chosen verifier.
 
 ### Verifiers are deterministic, provider-neutral, and pure
 
@@ -49,14 +54,20 @@ Verifiers receive canonical data and no database connection; they cannot mutate
 policy, approval, lifecycle, spec, or status. No LLM/subjective verifier
 participates in consequential success.
 
-### Artifacts are provenance; kernel computes their hashes
+### Artifacts are provenance; verification re-hashes durable content
 
 `execution_artifact` is append-only, venture-consistent, and bound to exactly one
-attempt (composite FKs). The content hash is computed by the kernel from the
-declared content — a worker-declared hash is never trusted or stored — so a worker
-cannot forge a matching hash. Artifact references are validated against path
-traversal; no filesystem dereference is performed (refs are opaque identifiers
-over in-memory content), so filesystem sandboxing is out of scope for this slice.
+attempt (composite FKs); its content hash is computed by the kernel (a
+worker-declared hash is never trusted or stored). Verification does not trust that
+stored hash — a persisted hash cannot verify itself. The actual artifact content
+survives durably in `execution_result.raw_payload`, so `verify_and_complete`
+reconstructs verification inputs from PostgreSQL alone and the artifact-hash
+verifier INDEPENDENTLY RE-HASHES the durable content against the immutable
+expected hash. A fresh process can therefore re-verify a persisted attempt without
+re-dispatching the worker — the persistence boundary Slice 3's recovery will rely
+on. Artifact references are validated against path traversal; no filesystem
+dereference is performed (refs are opaque identifiers over in-memory content), so
+filesystem sandboxing is out of scope for this slice.
 
 ### The DB SUCCESS guard remains
 

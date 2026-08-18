@@ -25,14 +25,19 @@ def test_structured_contract_verifier_pass_and_reject():
     assert bad.verdict == "REJECTED"
 
 
-def test_artifact_hash_verifier_uses_kernel_stored_hash():
+def test_artifact_hash_verifier_independently_rehashes_content():
     ver = v.ArtifactHashVerifier()
     h = artifacts_mod.content_hash("payload-bytes")
-    arts = ({"artifact_key": "out", "content_hash": h},)
+    # The verifier re-hashes the durable CONTENT; a worker-declared content_hash is ignored.
+    arts = ({"artifact_key": "out", "content": "payload-bytes", "content_hash": "worker-forged-hash"},)
     ok = ver.verify(_req(verifier_kind=ver.kind, contract={"artifact_key": "out", "expected_sha256": h}, arts=arts))
     assert ok.verdict == "VERIFIED" and ok.verification_type == v.ARTIFACT_HASH
     bad = ver.verify(_req(verifier_kind=ver.kind, contract={"artifact_key": "out", "expected_sha256": "deadbeef"}, arts=arts))
     assert bad.verdict == "REJECTED"
+    # Content that does not hash to the expected value is rejected even if the
+    # (ignored) declared hash matches the expected.
+    tampered = ({"artifact_key": "out", "content": "tampered", "content_hash": h},)
+    assert ver.verify(_req(verifier_kind=ver.kind, contract={"artifact_key": "out", "expected_sha256": h}, arts=tampered)).verdict == "REJECTED"
 
 
 def test_artifact_hash_verifier_rejects_missing_artifact():

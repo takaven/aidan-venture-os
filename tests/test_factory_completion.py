@@ -8,10 +8,12 @@ import inspect
 import psycopg
 import pytest
 
-from aidan_core import execution
+from aidan_core import execution, proof
+from aidan_core.errors import ExecutionBlockedError
 from aidan_core.factory import artifacts as artifacts_mod, runtime
 from aidan_core.factory.verifiers import ARTIFACT_HASH, STRUCTURED_CONTRACT, default_registry
 
+from conftest import setup_action
 from factory_fakes import FakeWorkerA, FakeWorkerB, registry_with, spec_action
 
 
@@ -176,3 +178,74 @@ def test_provider_replaceability_through_verifier(migrated):
         runtime.execute_action(migrated, aid, registry=registry_with(worker(structured_output={"status": "done"})))
         out = runtime.verify_and_complete(migrated, aid, verifier_registry=default_registry(), actual_cost=10)
         assert out.status == "SUCCEEDED" and out.verified is True
+
+
+# --------------------------------------------------------------------------
+# Verifier authority: no public completion API accepts a caller verifier/verdict,
+# and the token path cannot complete a spec action.
+# --------------------------------------------------------------------------
+def test_no_public_completion_api_accepts_a_verifier(migrated):
+    import inspect
+    assert "verifier" not in inspect.signature(execution.complete_execution).parameters
+    assert "verdict" not in inspect.signature(execution.complete_execution).parameters
+    assert "verifier_kind" not in inspect.signature(runtime.verify_and_complete).parameters
+
+
+def test_wrong_artifact_cannot_be_forced_verified_by_any_public_path(migrated):
+    # Immutable spec = artifact-hash; the artifact is objectively wrong.
+    aid = _artifact_action(migrated, "cp-nobypass", content="tampered", expected=artifacts_mod.content_hash("expected"))
+    # (a) the spec-selected verifier rejects it -> no SUCCESS.
+    out = runtime.verify_and_complete(migrated, aid, verifier_registry=default_registry(), actual_cost=10)
+    assert out.status != "SUCCEEDED" and _latest_proof(migrated, aid)[0] == "FAILED"
+    # (b) the token-match path cannot complete a spec action, even with a valid token.
+    with pytest.raises(ExecutionBlockedError):
+        execution.complete_execution(
+            migrated, aid, external_result_id="forge", reported_outcome="success",
+            raw_payload={"token": proof.expected_token(aid)}, actual_cost=10,
+        )
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s AND result = 'VERIFIED'", (aid,))
+        assert cur.fetchone()[0] == 0
+
+
+def test_gate1_token_path_still_works_for_non_spec_actions(migrated):
+    # Regression: an action WITHOUT a Gate 4 spec still completes via token-match.
+    vid, aid = setup_action(migrated, slug="cp-gate1", autonomy_level=1, amount=10, grant=100)
+    execution.authorize_and_claim(migrated, aid, safety_mode="IDEMPOTENT")
+    out = execution.complete_execution(
+        migrated, aid, external_result_id="e1", reported_outcome="success",
+        raw_payload={"token": proof.expected_token(aid)}, actual_cost=10,
+    )
+    assert out.status == "SUCCEEDED" and out.verified is True
+
+
+# --------------------------------------------------------------------------
+# Restart durability: a fresh process re-verifies from PostgreSQL alone.
+# --------------------------------------------------------------------------
+def test_fresh_runtime_verifies_from_durable_state_without_redispatch(migrated):
+    content = "durable-artifact-bytes"
+    vid, aid, _ = spec_action(
+        migrated, "cp-durable", verifier_kind="artifact-hash",
+        expected_output_contract={"artifact_key": "out", "expected_sha256": artifacts_mod.content_hash(content)},
+    )
+    worker = FakeWorkerA(artifacts=[{"artifact_key": "out", "artifact_type": "STRUCTURED_RESULT", "ref": "out", "content": content}])
+    runtime.execute_action(migrated, aid, registry=registry_with(worker))
+    assert worker.calls == 1
+
+    # A completely fresh verification: no worker, default trusted registry, only the
+    # action id + PostgreSQL. The content survives in execution_result and is re-hashed.
+    out = runtime.verify_and_complete(migrated, aid, actual_cost=10)
+    assert out.status == "SUCCEEDED" and out.verified is True
+    assert worker.calls == 1  # worker was NOT re-dispatched to reconstruct evidence
+
+
+def test_fresh_runtime_rejects_tampered_durable_content(migrated):
+    vid, aid, _ = spec_action(
+        migrated, "cp-durable-bad", verifier_kind="artifact-hash",
+        expected_output_contract={"artifact_key": "out", "expected_sha256": artifacts_mod.content_hash("expected")},
+    )
+    worker = FakeWorkerA(artifacts=[{"artifact_key": "out", "artifact_type": "STRUCTURED_RESULT", "ref": "out", "content": "tampered"}])
+    runtime.execute_action(migrated, aid, registry=registry_with(worker))
+    out = runtime.verify_and_complete(migrated, aid, actual_cost=10)  # default registry, no worker
+    assert out.status != "SUCCEEDED"
+    assert worker.calls == 1

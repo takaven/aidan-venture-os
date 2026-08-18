@@ -258,16 +258,40 @@ def complete_execution(
     attempt_id: Optional[str] = None,
     lifecycle_to: Optional[str] = None,
     actor: str = "executor",
-    verifier=None,
-    verifier_name: Optional[str] = None,
 ) -> CompletionOutcome:
-    """The canonical success transaction. Success only after VERIFIED proof, once.
+    """The canonical Gate 1 success transaction (deterministic token-match proof).
 
-    In one transaction: accept/dedup the raw result, verify deterministically,
-    record a Proof Receipt, transition status, reconcile budget, optionally
-    perform an authorized lifecycle transition, and audit. Any failure of a
-    required component rolls the whole thing back (no partial success). A raw
-    callback never directly sets canonical success.
+    Public completion accepts no verifier/verdict: the verification logic is fixed
+    (the built-in deterministic token verifier). An action that carries a Gate 4
+    ``execution_spec`` cannot be completed through this path — it must be verified
+    by its immutable spec verifier via ``factory.runtime.verify_and_complete`` — so
+    the token-match path cannot bypass a spec's chosen verifier.
+    """
+    return _complete(
+        conn, action_id, external_result_id=external_result_id, reported_outcome=reported_outcome,
+        raw_payload=raw_payload, actual_cost=actual_cost, attempt_id=attempt_id,
+        lifecycle_to=lifecycle_to, actor=actor, record_proof=None,
+    )
+
+
+def _complete(
+    conn,
+    action_id: str,
+    *,
+    external_result_id: str,
+    reported_outcome: str,
+    raw_payload: Optional[dict[str, Any]],
+    actual_cost,
+    attempt_id: Optional[str],
+    lifecycle_to: Optional[str],
+    actor: str,
+    record_proof=None,
+) -> CompletionOutcome:
+    """Shared completion core. ``record_proof(cur, action_id, result_id) -> (verdict,
+    proof_id)`` is an INTERNAL trusted hook: when None, the built-in deterministic
+    token verifier is used; the Gate 4 runtime supplies one that resolves the
+    verifier from the immutable spec. There is no public parameter through which a
+    caller can inject verification code or a verdict.
     """
     with db.transaction(conn) as cur:
         cur.execute(
@@ -277,6 +301,16 @@ def complete_execution(
         if row is None:
             raise NotFoundError(f"action_request {action_id} does not exist")
         venture_id, status = row
+
+        # An action with a Gate 4 execution spec must be completed through that
+        # spec's verifier (record_proof supplied); the default token path may not
+        # complete it. This closes the token-match bypass of a spec's verifier.
+        cur.execute("SELECT 1 FROM execution_spec WHERE action_request_id = %s", (action_id,))
+        if cur.fetchone() is not None and record_proof is None:
+            raise ExecutionBlockedError(
+                "action has an execution spec; complete it through its spec verifier "
+                "(factory.runtime.verify_and_complete), not the token path"
+            )
 
         # Duplicate completion: canonical success is inferred only when BOTH the
         # SUCCEEDED status AND a matching VERIFIED proof receipt agree. If exactly
@@ -298,12 +332,14 @@ def complete_execution(
         )
 
         # 2/3. deterministic verification + receipt (verdict derived internally,
-        # optionally by an injected deterministic verifier; never caller-supplied).
-        verdict, proof_id = proof._record_receipt(
-            cur, action_id, result_id, reported_outcome, raw_payload,
-            verifier=verifier, verifier_name=verifier_name or proof.VERIFIER,
-            execution_attempt_id=attempt_id,
-        )
+        # never caller-supplied). Gate 4 supplies a spec-resolved record_proof.
+        if record_proof is None:
+            verdict, proof_id = proof._record_receipt(
+                cur, action_id, result_id, reported_outcome, raw_payload,
+                execution_attempt_id=attempt_id,
+            )
+        else:
+            verdict, proof_id = record_proof(cur, action_id, result_id)
 
         if verdict != "VERIFIED":
             budget._release(cur, action_id)  # unblock reserved funds on failure

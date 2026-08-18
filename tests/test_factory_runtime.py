@@ -134,7 +134,7 @@ def test_worker_output_cannot_escalate_authority(migrated):
 # --------------------------------------------------------------------------
 # Direct-SQL SUCCEEDED guard + canonical success path still works.
 # --------------------------------------------------------------------------
-def test_direct_sql_succeeded_blocked_but_canonical_path_succeeds(migrated):
+def test_direct_sql_succeeded_blocked_and_token_path_cannot_complete_spec_action(migrated):
     _vid, aid, _sp = spec_action(migrated, "rt-guard", amount=10, grant=100)
     runtime.execute_action(migrated, aid, registry=registry_with(FakeWorkerA()))
 
@@ -144,14 +144,16 @@ def test_direct_sql_succeeded_blocked_but_canonical_path_succeeds(migrated):
             cur.execute("UPDATE action_request SET status = 'SUCCEEDED' WHERE id = %s", (aid,))
     assert execution.get_status(migrated, aid) == "RUNNING"
 
-    # The canonical proof-gated completion path still reaches SUCCEEDED exactly once.
-    out = execution.complete_execution(
-        migrated, aid, external_result_id="e-final", reported_outcome="success",
-        raw_payload={"token": proof.expected_token(aid)}, actual_cost=10,
-    )
-    assert out.status == "SUCCEEDED" and out.verified is True
-    assert execution.get_status(migrated, aid) == "SUCCEEDED"
-    assert _proof_count(migrated, aid) == 1
+    # The Gate 1 token-match completion path CANNOT complete an action that carries a
+    # Gate 4 execution spec — even with the (deterministic, forgeable) token — so it
+    # cannot bypass the spec's chosen verifier.
+    with pytest.raises(ExecutionBlockedError):
+        execution.complete_execution(
+            migrated, aid, external_result_id="e-final", reported_outcome="success",
+            raw_payload={"token": proof.expected_token(aid)}, actual_cost=10,
+        )
+    assert execution.get_status(migrated, aid) == "RUNNING"
+    assert _proof_count(migrated, aid) == 0
 
 
 # --------------------------------------------------------------------------

@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
-from .. import audit, db, execution, policy
+from .. import audit, db, execution, policy, proof
 from ..errors import ApprovalRequiredError, ExecutionBlockedError, NotFoundError
 from . import artifacts as artifacts_mod
 from . import spec as spec_mod
-from .verifiers import VerificationRequest, VerifierRegistry
+from .verifiers import VerificationRequest, VerifierRegistry, default_registry
 from .workers import WorkerRegistry, WorkerRequest
 
 
@@ -185,21 +185,24 @@ def verify_and_complete(
     conn,
     action_request_id: str,
     *,
-    verifier_registry: VerifierRegistry,
+    verifier_registry: Optional[VerifierRegistry] = None,
     actual_cost,
     actor: str = "factory",
 ):
     """Phase 2 — verify a captured attempt deterministically and, only if VERIFIED,
     complete it through the existing canonical proof-gated path.
 
-    The verifier is selected by the IMMUTABLE ``execution_spec.verifier_kind`` (the
-    caller cannot override it) and runs over canonical inputs (contract, captured
-    worker result, captured artifacts) with no DB access. Its verdict is derived —
-    never caller-supplied — and is converted into the one canonical Proof Receipt
-    by the existing proof authority. Deterministic verification outranks the
-    worker's self-report in both directions. Returns the canonical
-    ``CompletionOutcome`` (SUCCEEDED only when VERIFIED).
+    The verifier is resolved from the IMMUTABLE ``execution_spec.verifier_kind`` via
+    a trusted registry — there is no parameter through which a caller or worker can
+    choose a different verifier or a verdict. Verification inputs are reconstructed
+    entirely from DURABLE canonical state (``execution_result`` content + immutable
+    contract), so a fresh process re-verifies from PostgreSQL alone without
+    re-running the worker; the artifact-hash verifier independently RE-HASHES the
+    durable content rather than trusting any stored hash. Deterministic
+    verification outranks the worker's self-report in both directions. Returns the
+    canonical ``CompletionOutcome`` (SUCCEEDED only when VERIFIED).
     """
+    registry = verifier_registry if verifier_registry is not None else default_registry()
     row = spec_mod.get_execution_spec(conn, action_request_id)
     if row is None:
         raise NotFoundError(f"no execution spec for action {action_request_id}")
@@ -217,24 +220,31 @@ def verify_and_complete(
     if res is None:
         raise NotFoundError(f"no captured worker result to verify for action {action_request_id}")
     _res_id, attempt_id, external_result_id, raw_payload, reported_outcome = res
-    structured_output = dict((raw_payload or {}).get("structured_output", {}))
+    raw_payload = raw_payload or {}
+    structured_output = dict(raw_payload.get("structured_output", {}))
+    # Durable verification material: the actual artifact content survives in
+    # execution_result.raw_payload, so verification is reconstructable after
+    # process death from PostgreSQL alone (no worker rerun, no self-verifying hash).
+    durable_artifacts = tuple(dict(a) for a in raw_payload.get("artifacts", []))
 
-    # Pre-load canonical artifacts so the verifier receives DATA, never a connection.
-    captured = tuple(artifacts_mod.get_artifacts(conn, attempt_id))
-
-    def _verify(_cur, aid, _result_id):
+    def _record_proof(cur, aid, result_id):
         request = VerificationRequest(
             action_request_id=str(aid), execution_attempt_id=str(attempt_id),
             verifier_kind=verifier_kind, expected_output_contract=expected_output_contract,
-            worker_structured_output=structured_output, artifacts=captured, spec_hash=spec_hash,
+            worker_structured_output=structured_output, artifacts=durable_artifacts, spec_hash=spec_hash,
         )
-        verifier = verifier_registry.get(verifier_kind)  # KeyError -> deterministic failure, no receipt
-        vr = verifier.verify(request)
+        verifier = registry.get(verifier_kind)  # resolves the IMMUTABLE spec's kind; KeyError -> no receipt
+        vr = verifier.verify(request)            # deterministic; re-hashes durable content
         proof_verdict = "VERIFIED" if vr.verdict == "VERIFIED" else "FAILED"
-        return proof_verdict, vr.verification_type, vr.evidence_hash
+        proof_id = proof._write_receipt(
+            cur, aid, result_id, verdict=proof_verdict, verification_type=vr.verification_type,
+            verifier_name=f"gate4.{verifier_kind}", evidence_hash=vr.evidence_hash,
+            execution_attempt_id=attempt_id,
+        )
+        return proof_verdict, proof_id
 
-    return execution.complete_execution(
+    return execution._complete(
         conn, action_request_id, external_result_id=external_result_id,
         reported_outcome=reported_outcome, raw_payload=raw_payload, actual_cost=actual_cost,
-        attempt_id=attempt_id, verifier=_verify, verifier_name=f"gate4.{verifier_kind}", actor=actor,
+        attempt_id=attempt_id, lifecycle_to=None, actor=actor, record_proof=_record_proof,
     )

@@ -46,35 +46,25 @@ def verified_proof_id(cur, action_request_id: str):
     return row[0] if row else None
 
 
-def _record_receipt(
+def _write_receipt(
     cur,
     action_request_id: str,
     execution_result_id: str,
-    reported_outcome: str,
-    raw_payload,
     *,
-    verifier=None,
-    verifier_name: str = VERIFIER,
+    verdict: str,
+    verification_type: str,
+    verifier_name: str,
+    evidence_hash: str,
     execution_attempt_id=None,
-) -> tuple:
-    """Verify deterministically and persist the receipt (cursor-based).
+):
+    """The ONLY statement that writes a proof receipt (cursor-based).
 
-    Returns ``(verdict, proof_id)``. The verdict is ALWAYS derived here — either by
-    the built-in token-match verifier (default) or by an injected DETERMINISTIC
-    ``verifier(cur, action_request_id, execution_result_id) -> (verdict,
-    verification_type, evidence_hash)`` supplied by the trusted kernel. There is no
-    parameter through which a caller can supply ``VERIFIED`` directly. This remains
-    the ONLY path that writes a proof receipt; the receipt optionally records the
-    execution attempt whose machine verification produced it.
+    Internal/trusted: consumes an ALREADY-DERIVED deterministic verification
+    outcome. Callers must have produced the verdict by running a deterministic
+    verifier (the built-in token verifier, or a Gate 4 spec-resolved verifier);
+    there is no public API through which an untrusted caller reaches this. Returns
+    the proof id.
     """
-    if verifier is not None:
-        verdict, verification_type, evidence_hash = verifier(
-            cur, action_request_id, execution_result_id
-        )
-    else:
-        verdict, verification_type, evidence_hash = deterministic_verify(
-            action_request_id, reported_outcome, raw_payload
-        )
     cur.execute(
         """
         INSERT INTO proof_receipt
@@ -86,4 +76,29 @@ def _record_receipt(
         (action_request_id, execution_result_id, execution_attempt_id,
          verification_type, verifier_name, verdict, evidence_hash),
     )
-    return verdict, cur.fetchone()[0]
+    return cur.fetchone()[0]
+
+
+def _record_receipt(
+    cur,
+    action_request_id: str,
+    execution_result_id: str,
+    reported_outcome: str,
+    raw_payload,
+    *,
+    execution_attempt_id=None,
+) -> tuple:
+    """Verify with the built-in deterministic token verifier and persist the receipt.
+
+    Returns ``(verdict, proof_id)``. The verdict is ALWAYS derived here; there is no
+    parameter through which a caller can supply ``VERIFIED``.
+    """
+    verdict, verification_type, evidence_hash = deterministic_verify(
+        action_request_id, reported_outcome, raw_payload
+    )
+    proof_id = _write_receipt(
+        cur, action_request_id, execution_result_id, verdict=verdict,
+        verification_type=verification_type, verifier_name=VERIFIER,
+        evidence_hash=evidence_hash, execution_attempt_id=execution_attempt_id,
+    )
+    return verdict, proof_id

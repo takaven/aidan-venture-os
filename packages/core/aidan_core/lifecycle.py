@@ -36,6 +36,44 @@ def _as_value(state: Union[str, LifecycleState]) -> str:
     return state.value if isinstance(state, LifecycleState) else str(state)
 
 
+def transition_cur(
+    cur,
+    venture_id: str,
+    to_state: Union[str, LifecycleState],
+    *,
+    actor: str,
+    reason: Union[str, None] = None,
+) -> str:
+    """Cursor-based guarded transition (composes into a larger transaction)."""
+    target = _as_value(to_state)
+    cur.execute(
+        "SELECT lifecycle_state FROM venture WHERE id = %s FOR UPDATE",
+        (venture_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise NotFoundError(f"venture {venture_id} does not exist")
+    current = row[0]
+
+    if (current, target) not in PERMITTED_TRANSITIONS:
+        raise IllegalTransitionError(
+            f"transition {current} -> {target} is not permitted"
+        )
+
+    cur.execute(
+        "UPDATE venture SET lifecycle_state = %s, updated_at = now() WHERE id = %s",
+        (target, venture_id),
+    )
+    audit.record_event(
+        cur,
+        event_type="venture.lifecycle_transition",
+        actor=actor,
+        venture_id=venture_id,
+        payload={"from": current, "to": target, "reason": reason},
+    )
+    return target
+
+
 def transition(
     conn,
     venture_id: str,
@@ -50,31 +88,5 @@ def transition(
     state unchanged) if the transition is not in the permitted set, and
     :class:`NotFoundError` if the venture does not exist.
     """
-    target = _as_value(to_state)
     with db.transaction(conn) as cur:
-        cur.execute(
-            "SELECT lifecycle_state FROM venture WHERE id = %s FOR UPDATE",
-            (venture_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise NotFoundError(f"venture {venture_id} does not exist")
-        current = row[0]
-
-        if (current, target) not in PERMITTED_TRANSITIONS:
-            raise IllegalTransitionError(
-                f"transition {current} -> {target} is not permitted"
-            )
-
-        cur.execute(
-            "UPDATE venture SET lifecycle_state = %s, updated_at = now() WHERE id = %s",
-            (target, venture_id),
-        )
-        audit.record_event(
-            cur,
-            event_type="venture.lifecycle_transition",
-            actor=actor,
-            venture_id=venture_id,
-            payload={"from": current, "to": target, "reason": reason},
-        )
-    return target
+        return transition_cur(cur, venture_id, to_state, actor=actor, reason=reason)

@@ -132,6 +132,53 @@ def _load_policy_input(cur, action_request_id: str, approval_threshold: Decimal)
     )
 
 
+def current_evaluation(
+    cur, action_request_id: str, approval_threshold: Decimal = DEFAULT_APPROVAL_THRESHOLD
+) -> Tuple[PolicyResult, str, PolicyInput]:
+    """Evaluate current policy from canonical state WITHOUT persisting.
+
+    Used at execution-authorization time to recheck kill switch, budget and
+    autonomy against the live state. Returns ``(result, venture_id, inputs)``.
+    Identical inputs always yield the same ``inputs_hash`` — that hash is the
+    authorization-state identity an approval is bound to.
+    """
+    inp, venture_id = _load_policy_input(cur, action_request_id, approval_threshold)
+    return evaluate(inp), venture_id, inp
+
+
+def persist_decision(cur, action_request_id: str, venture_id: str, result: PolicyResult, inp: PolicyInput) -> str:
+    """Persist an immutable policy decision + audit within the caller's transaction."""
+    from psycopg.types.json import Json
+
+    cur.execute(
+        """
+        INSERT INTO policy_decision
+            (action_request_id, decision, rule_id, rule_version, inputs_hash, inputs, reason)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            action_request_id,
+            result.decision,
+            RULE_ID,
+            RULE_VERSION,
+            result.inputs_hash,
+            Json(_inputs_dict(inp)),
+            result.reason,
+        ),
+    )
+    decision_id = cur.fetchone()[0]
+    audit.record_event(
+        cur,
+        event_type="policy.evaluated",
+        actor="policy_engine",
+        venture_id=venture_id,
+        action_id=action_request_id,
+        payload={"decision": result.decision, "reason": result.reason},
+    )
+    return decision_id
+
+
 def evaluate_and_persist(
     conn,
     action_request_id: str,
@@ -146,35 +193,7 @@ def evaluate_and_persist(
     This is a governance decision only: it never mutates lifecycle, investment
     decisions or ActionRequest status.
     """
-    from psycopg.types.json import Json
-
     with db.transaction(conn) as cur:
-        inp, venture_id = _load_policy_input(cur, action_request_id, approval_threshold)
-        result = evaluate(inp)
-        cur.execute(
-            """
-            INSERT INTO policy_decision
-                (action_request_id, decision, rule_id, rule_version, inputs_hash, inputs, reason)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                action_request_id,
-                result.decision,
-                RULE_ID,
-                RULE_VERSION,
-                result.inputs_hash,
-                Json(_inputs_dict(inp)),
-                result.reason,
-            ),
-        )
-        decision_id = cur.fetchone()[0]
-        audit.record_event(
-            cur,
-            event_type="policy.evaluated",
-            actor=actor,
-            venture_id=venture_id,
-            action_id=action_request_id,
-            payload={"decision": result.decision, "reason": result.reason},
-        )
+        result, venture_id, inp = current_evaluation(cur, action_request_id, approval_threshold)
+        decision_id = persist_decision(cur, action_request_id, venture_id, result, inp)
     return result, decision_id

@@ -24,8 +24,13 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0003; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0004; dropped for a clean slate per test.
 _DROP_SQL = """
+DROP TABLE IF EXISTS proof_receipt CASCADE;
+DROP TABLE IF EXISTS execution_result CASCADE;
+DROP TABLE IF EXISTS execution_attempt CASCADE;
+DROP TABLE IF EXISTS evidence_record CASCADE;
+DROP TABLE IF EXISTS approval CASCADE;
 DROP TABLE IF EXISTS capital_entry CASCADE;
 DROP TABLE IF EXISTS budget_account CASCADE;
 DROP TABLE IF EXISTS policy_decision CASCADE;
@@ -42,6 +47,7 @@ DROP TYPE IF EXISTS investment_decision CASCADE;
 DROP TYPE IF EXISTS policy_decision_kind CASCADE;
 DROP FUNCTION IF EXISTS audit_event_immutable() CASCADE;
 DROP FUNCTION IF EXISTS append_only_guard() CASCADE;
+DROP FUNCTION IF EXISTS approval_terminal_guard() CASCADE;
 """
 
 
@@ -73,3 +79,27 @@ def migrated(clean_db):
 
     migrate.apply(clean_db, MIGRATIONS_DIR)
     return clean_db
+
+
+def setup_action(
+    conn,
+    *,
+    slug,
+    amount=10,
+    autonomy_level=1,
+    required_autonomy=0,
+    grant=100,
+    key="k",
+    currency="USD",
+):
+    """Create venture + grant + action; return (venture_id, action_id)."""
+    from aidan_core import actions, budget, ventures
+
+    vid = ventures.create_venture(conn, slug=slug, autonomy_level=autonomy_level)
+    if grant:
+        budget.grant_budget(conn, vid, amount=grant, currency=currency)
+    aid = actions.submit_action_request(
+        conn, venture_id=vid, action_type="spend", actor="a", idempotency_key=key,
+        required_autonomy=required_autonomy, requested_amount=amount, requested_currency=currency,
+    ).action_id
+    return vid, aid

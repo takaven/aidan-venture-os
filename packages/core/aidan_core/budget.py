@@ -92,6 +92,83 @@ def _capital_state(cur, action_request_id: str) -> dict:
     return {r[0]: r[1] for r in cur.fetchall()}
 
 
+def _reserve(cur, action_request_id: str, *, actor: str = "budget") -> bool:
+    """Cursor-based reservation (composes into a larger transaction)."""
+    venture_id, amount, currency = _action_context(cur, action_request_id)
+    amount = Decimal(amount)
+
+    account = _lock_account(cur, venture_id, currency)
+    if account is None:
+        raise InsufficientBudgetError(
+            f"no budget account for venture {venture_id} in {currency}"
+        )
+    account_id, granted, reserved, committed = account
+
+    state = _capital_state(cur, action_request_id)
+    if "RESERVE" in state:
+        return False  # already reserved -> idempotent, no double reservation
+
+    available = Decimal(granted) - Decimal(reserved) - Decimal(committed)
+    if available < amount:
+        raise InsufficientBudgetError(
+            f"insufficient budget: available {available} < requested {amount}"
+        )
+
+    cur.execute(
+        "UPDATE budget_account SET reserved_amount = reserved_amount + %s, "
+        "updated_at = now() WHERE id = %s",
+        (amount, account_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO capital_entry
+            (venture_id, budget_account_id, action_request_id, entry_type, amount, currency)
+        VALUES (%s, %s, %s, 'RESERVE', %s, %s)
+        """,
+        (venture_id, account_id, action_request_id, amount, currency),
+    )
+    audit.record_event(
+        cur, event_type="budget.reserved", actor=actor, venture_id=venture_id,
+        action_id=action_request_id, payload={"amount": str(amount), "currency": currency},
+    )
+    return True
+
+
+def _release(cur, action_request_id: str, *, actor: str = "budget") -> bool:
+    """Cursor-based release (composes into a larger transaction)."""
+    venture_id, _amount, currency = _action_context(cur, action_request_id)
+    account = _lock_account(cur, venture_id, currency)
+    if account is None:
+        return False
+    account_id = account[0]
+
+    state = _capital_state(cur, action_request_id)
+    if "COMMIT" in state:
+        raise IllegalCapitalTransitionError("cannot release a committed reservation")
+    if "RELEASE" in state or "RESERVE" not in state:
+        return False  # already released or never reserved -> idempotent no-op
+
+    amount = Decimal(state["RESERVE"])
+    cur.execute(
+        "UPDATE budget_account SET reserved_amount = reserved_amount - %s, "
+        "updated_at = now() WHERE id = %s",
+        (amount, account_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO capital_entry
+            (venture_id, budget_account_id, action_request_id, entry_type, amount, currency)
+        VALUES (%s, %s, %s, 'RELEASE', %s, %s)
+        """,
+        (venture_id, account_id, action_request_id, amount, currency),
+    )
+    audit.record_event(
+        cur, event_type="budget.released", actor=actor, venture_id=venture_id,
+        action_id=action_request_id, payload={"amount": str(amount), "currency": currency},
+    )
+    return True
+
+
 def reserve_budget(conn, action_request_id: str, *, actor: str = "budget") -> bool:
     """Reserve the action's requested amount. Idempotent per action.
 
@@ -99,88 +176,73 @@ def reserve_budget(conn, action_request_id: str, *, actor: str = "budget") -> bo
     Raises :class:`InsufficientBudgetError` when available funds are too low.
     """
     with db.transaction(conn) as cur:
-        venture_id, amount, currency = _action_context(cur, action_request_id)
-        amount = Decimal(amount)
-
-        account = _lock_account(cur, venture_id, currency)
-        if account is None:
-            raise InsufficientBudgetError(
-                f"no budget account for venture {venture_id} in {currency}"
-            )
-        account_id, granted, reserved, committed = account
-
-        state = _capital_state(cur, action_request_id)
-        if "RESERVE" in state:
-            return False  # already reserved -> idempotent, no double reservation
-
-        available = Decimal(granted) - Decimal(reserved) - Decimal(committed)
-        if available < amount:
-            raise InsufficientBudgetError(
-                f"insufficient budget: available {available} < requested {amount}"
-            )
-
-        cur.execute(
-            "UPDATE budget_account SET reserved_amount = reserved_amount + %s, "
-            "updated_at = now() WHERE id = %s",
-            (amount, account_id),
-        )
-        cur.execute(
-            """
-            INSERT INTO capital_entry
-                (venture_id, budget_account_id, action_request_id, entry_type, amount, currency)
-            VALUES (%s, %s, %s, 'RESERVE', %s, %s)
-            """,
-            (venture_id, account_id, action_request_id, amount, currency),
-        )
-        audit.record_event(
-            cur,
-            event_type="budget.reserved",
-            actor=actor,
-            venture_id=venture_id,
-            action_id=action_request_id,
-            payload={"amount": str(amount), "currency": currency},
-        )
-    return True
+        return _reserve(cur, action_request_id, actor=actor)
 
 
 def release_budget(conn, action_request_id: str, *, actor: str = "budget") -> bool:
     """Release the action's reservation exactly once. Idempotent and safe."""
     with db.transaction(conn) as cur:
-        venture_id, _amount, currency = _action_context(cur, action_request_id)
-        account = _lock_account(cur, venture_id, currency)
-        if account is None:
-            return False
-        account_id = account[0]
+        return _release(cur, action_request_id, actor=actor)
 
-        state = _capital_state(cur, action_request_id)
-        if "COMMIT" in state:
-            raise IllegalCapitalTransitionError("cannot release a committed reservation")
-        if "RELEASE" in state or "RESERVE" not in state:
-            return False  # already released or never reserved -> idempotent no-op
 
-        amount = Decimal(state["RESERVE"])
-        cur.execute(
-            "UPDATE budget_account SET reserved_amount = reserved_amount - %s, "
-            "updated_at = now() WHERE id = %s",
-            (amount, account_id),
+def reconcile_completion(cur, action_request_id: str, actual_cost, *, actor: str = "budget") -> None:
+    """Reconcile a reservation into actual committed spend (completion path).
+
+    Commits the actual cost and releases any unused reservation, in the caller's
+    transaction. Actual cost above the reservation consumes additional available
+    budget only if it fits; otherwise raises rather than overspend. Idempotent:
+    a second call after a COMMIT exists is a no-op.
+    """
+    actual = Decimal(actual_cost)
+    if actual < 0:
+        raise ValueError("actual_cost must be non-negative")
+    venture_id, _amt, currency = _action_context(cur, action_request_id)
+    account = _lock_account(cur, venture_id, currency)
+    if account is None:
+        raise IllegalCapitalTransitionError("no budget account to reconcile against")
+    account_id, granted, reserved, committed = account
+
+    state = _capital_state(cur, action_request_id)
+    if "COMMIT" in state:
+        return  # already reconciled -> idempotent
+    if "RESERVE" not in state:
+        raise IllegalCapitalTransitionError("cannot reconcile without a reservation")
+    reserved_amt = Decimal(state["RESERVE"])
+
+    available_excl = Decimal(granted) - Decimal(reserved) - Decimal(committed)
+    delta = actual - reserved_amt
+    if delta > available_excl:
+        raise InsufficientBudgetError(
+            f"actual cost {actual} exceeds available budget (delta {delta} > {available_excl})"
         )
+
+    cur.execute(
+        "UPDATE budget_account SET reserved_amount = reserved_amount - %s, "
+        "committed_amount = committed_amount + %s, updated_at = now() WHERE id = %s",
+        (reserved_amt, actual, account_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO capital_entry
+            (venture_id, budget_account_id, action_request_id, entry_type, amount, currency, reference)
+        VALUES (%s, %s, %s, 'COMMIT', %s, %s, 'actual')
+        """,
+        (venture_id, account_id, action_request_id, actual, currency),
+    )
+    if reserved_amt > actual:
         cur.execute(
             """
             INSERT INTO capital_entry
-                (venture_id, budget_account_id, action_request_id, entry_type, amount, currency)
-            VALUES (%s, %s, %s, 'RELEASE', %s, %s)
+                (venture_id, budget_account_id, action_request_id, entry_type, amount, currency, reference)
+            VALUES (%s, %s, %s, 'RELEASE', %s, %s, 'unused')
             """,
-            (venture_id, account_id, action_request_id, amount, currency),
+            (venture_id, account_id, action_request_id, reserved_amt - actual, currency),
         )
-        audit.record_event(
-            cur,
-            event_type="budget.released",
-            actor=actor,
-            venture_id=venture_id,
-            action_id=action_request_id,
-            payload={"amount": str(amount), "currency": currency},
-        )
-    return True
+    audit.record_event(
+        cur, event_type="budget.reconciled", actor=actor, venture_id=venture_id,
+        action_id=action_request_id,
+        payload={"actual": str(actual), "reserved": str(reserved_amt), "currency": currency},
+    )
 
 
 def commit_budget(conn, action_request_id: str, *, actor: str = "budget") -> bool:

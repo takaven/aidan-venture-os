@@ -44,3 +44,15 @@ class InsufficientBudgetError(AidanCoreError):
 
 class IllegalCapitalTransitionError(AidanCoreError):
     """An invalid capital transition (e.g. commit after release) was attempted."""
+
+
+class ExecutionBlockedError(AidanCoreError):
+    """Execution is prohibited by current policy (e.g. DENY / kill switch)."""
+
+
+class ApprovalRequiredError(AidanCoreError):
+    """No valid, non-expired approval exists for the current policy state."""
+
+
+class ApprovalStateError(AidanCoreError):
+    """An approval state change is invalid (e.g. approving a terminal approval)."""

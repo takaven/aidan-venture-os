@@ -22,9 +22,20 @@ from ..errors import IdempotencyConflictError
 from .adapters import AcquiredSource
 
 
+def normalize(content: str) -> str:
+    """The canonical normalized representation of acquired content.
+
+    Currently the identity function: the exact acquired text is the canonical
+    representation used BOTH for content hashing and for Observation excerpt
+    verification, so the two never diverge. Kept as a single shared helper so any
+    future normalization stays consistent across hashing and verification.
+    """
+    return content
+
+
 def content_hash(content: str) -> str:
-    """Deterministic SHA-256 of the exact acquired content. Proves identity, not truth."""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    """Deterministic SHA-256 of the normalized acquired content. Identity, not truth."""
+    return hashlib.sha256(normalize(content).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

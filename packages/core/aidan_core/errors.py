@@ -84,3 +84,11 @@ class OpportunityNotReadyError(AidanCoreError):
     (hypotheses, linked claim(s)/assumption(s), critical unknown, and a complete
     adversarial Kill Case) is not yet satisfied.
     """
+
+
+class MandateMismatchError(AidanCoreError):
+    """Supplied Mandate content does not match the canonical mandate version hash.
+
+    Research must execute against an exact Board-authored canonical Mandate
+    version; a mismatch is rejected rather than proceeding or mutating it.
+    """

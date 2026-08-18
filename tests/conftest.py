@@ -24,8 +24,10 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0007; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0008; dropped for a clean slate per test.
 _DROP_SQL = """
+DROP TABLE IF EXISTS research_question CASCADE;
+DROP TABLE IF EXISTS research_run CASCADE;
 DROP TABLE IF EXISTS research_result CASCADE;
 DROP TABLE IF EXISTS kill_case_dimension_claim CASCADE;
 DROP TABLE IF EXISTS kill_case_dimension CASCADE;
@@ -66,6 +68,7 @@ DROP FUNCTION IF EXISTS audit_event_immutable() CASCADE;
 DROP FUNCTION IF EXISTS append_only_guard() CASCADE;
 DROP FUNCTION IF EXISTS approval_terminal_guard() CASCADE;
 DROP FUNCTION IF EXISTS opportunity_content_immutable() CASCADE;
+DROP FUNCTION IF EXISTS research_run_guard() CASCADE;
 """
 
 

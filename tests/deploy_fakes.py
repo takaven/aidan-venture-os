@@ -11,9 +11,40 @@ from collections import namedtuple
 
 from aidan_core.factory.workers import WorkerResult
 
-from build_fakes import GOOD_PRODUCT_MANIFEST, full_eval
+from build_fakes import (
+    GOOD_PRODUCT_MANIFEST,
+    BuilderWorker,
+    build_authority_for,
+    freeze_default_build_spec,
+    full_eval,
+    make_substrate,
+)
+from factory_fakes import registry_with
 
 DeploySetup = namedtuple("DeploySetup", "venture_id build_manifest_id target_id deploy_action_id eval")
+
+_CAPS2 = ["READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "PRODUCE_PATCH"]
+_TECH = {"required_files": ["app/main.py"], "forbidden_files": [], "required_commands": ["pytest"]}
+
+
+def second_qualified_manifest(conn, venture_id, *, key, candidate_files, product_manifest=None):
+    """Build a SECOND, independently Gate-5-quality-qualified build_manifest in the SAME
+    venture through the real governed chain. Reuses the venture's existing repository."""
+    from aidan_core.build import runtime as build_runtime
+
+    auth = build_authority_for(conn, venture_id, key=key)
+    freeze_default_build_spec(conn, auth, expected_output_contract={
+        "require": {"status": "done"}, "technical": _TECH})
+    rel = make_substrate(conn, key=f"rel-{key}")
+    worker = BuilderWorker(structured_output={
+        "status": "done", "candidate_files": candidate_files,
+        "product_manifest": product_manifest or GOOD_PRODUCT_MANIFEST})
+    build_runtime.execute_build(
+        conn, auth.action_id, registry=registry_with(worker), worker_kind=worker.kind,
+        verifier_kind="structured-contract", capability_scope=_CAPS2, timeout_seconds=60, max_attempts=1)
+    cap = build_runtime.capture_and_check_build(conn, auth.action_id, substrate_release_id=rel.substrate_release_id)
+    build_runtime.assess_build_quality(conn, auth.action_id)
+    return cap["manifest"].build_manifest_id
 
 
 class DeployWorker:

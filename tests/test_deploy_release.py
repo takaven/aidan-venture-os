@@ -26,7 +26,13 @@ from aidan_core.factory import runtime as factory_runtime
 from aidan_core.factory import spec as spec_mod
 
 from build_fakes import GOOD_PRODUCT_MANIFEST, full_eval
-from deploy_fakes import DeployWorker, DeployWorkerB, deploy_action, setup_deploy
+from deploy_fakes import (
+    DeployWorker,
+    DeployWorkerB,
+    deploy_action,
+    second_qualified_manifest,
+    setup_deploy,
+)
 from factory_fakes import FakeWorkerA, registry_with, spec_action
 
 _MF = GOOD_PRODUCT_MANIFEST
@@ -135,12 +141,30 @@ def test_13_release_exact_replay_converges(migrated):
 
 
 def test_14_changed_candidate_conflicts(migrated):
+    # Same deploy action + same venture + same target + same contract, but a DIFFERENT
+    # quality-qualified candidate -> changed release intent -> IdempotencyConflictError
+    # (not the cross-venture guard).
     s = setup_deploy(migrated, "d14")
-    _release(migrated, s)
-    other = full_eval(migrated, "d14b", key="d14b", product_manifest=GOOD_PRODUCT_MANIFEST)
+    first = _release(migrated, s)
+    manifest2 = second_qualified_manifest(
+        migrated, s.venture_id, key="d14two",
+        candidate_files=[{"path": "app/main.py", "content": "def run():\n    return 'v2-clinic'\n"}])
+    # target-reach: second manifest is same-venture, distinct, and fully qualified
+    from aidan_core.build import quality as quality_mod
+    assert manifest2 != s.build_manifest_id
+    assert quality_mod.overall_verdict(migrated, manifest2) == "PASS"
+    with migrated.cursor() as cur:
+        cur.execute("SELECT venture_id FROM build_manifest WHERE id = %s", (manifest2,))
+        assert str(cur.fetchone()[0]) == str(s.venture_id)
     with pytest.raises(IdempotencyConflictError):
         release_mod.create_release_candidate(
-            migrated, s.deploy_action_id, build_manifest_id=other.manifest_id, deployment_target_id=s.target_id)
+            migrated, s.deploy_action_id, build_manifest_id=manifest2, deployment_target_id=s.target_id)
+    # post-conflict: original release_candidate unchanged; no second release written
+    row = release_mod.get_release_candidate(migrated, s.deploy_action_id)
+    assert row[8] == first.release_hash and str(row[3]) == str(s.build_manifest_id)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM release_candidate WHERE action_request_id = %s", (s.deploy_action_id,))
+        assert cur.fetchone()[0] == 1
 
 
 def test_15_changed_target_conflicts(migrated):

@@ -94,6 +94,33 @@ def build_authority(
     return BuildAuthority(vid, aid, did, rec_id, opp_id)
 
 
+def build_authority_for(conn, venture_id, *, key, decision="BUILD", amount=0, required_autonomy=0) -> BuildAuthority:
+    """Create a genuine canonical BUILD authority chain for an EXISTING venture."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO opportunity (venture_id, opportunity_key, buyer_hypothesis, problem_hypothesis, "
+            "payload_hash, status) VALUES (%s, %s, %s, %s, %s, 'CANDIDATE') RETURNING id",
+            (venture_id, f"opp-{key}", "buyer-h", "problem-h", "h"))
+        opp_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO next_action_recommendation (venture_id, recommendation_key, opportunity_id, "
+            "action_type, dominant_reason_code, input_hash) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (venture_id, f"rec-{key}", opp_id, decision, _REASON[decision], "h"))
+        rec_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO action_request (venture_id, action_type, actor, payload, payload_hash, "
+            "idempotency_key, required_autonomy, requested_amount, requested_currency) "
+            "VALUES (%s, %s, 'a', '{}'::jsonb, 'h', %s, %s, %s, 'USD') RETURNING id",
+            (venture_id, decision.lower(), f"commit:{key}", required_autonomy, amount))
+        aid = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO investment_decision_record (venture_id, decision, rationale_ref, "
+            "resulting_action_id, source_recommendation_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (venture_id, decision, f"next_action_recommendation:{rec_id}", aid, rec_id))
+        did = cur.fetchone()[0]
+    return BuildAuthority(venture_id, aid, did, rec_id, opp_id)
+
+
 # Sensible venture-specific default product intent for a build_spec.
 DEFAULT_INTENT = dict(
     buyer="independent physiotherapy clinics",

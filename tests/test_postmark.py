@@ -324,7 +324,19 @@ def test_53_send_outreach_remains_sole_capability(migrated):
     assert not any(c for c in CAPABILITIES if "POSTMARK" in c.upper() or c in ("RECEIVE_REPLY", "RECORD_OUTCOME"))
 
 
-def test_55_no_new_migration(migrated):
+def test_55_postmark_adapter_needs_no_dedicated_schema(migrated):
+    # Slice-2 invariant: the Postmark adapter introduced NO migration — it is adapter-only and
+    # runs entirely through the pre-existing generic market/execution schema. Asserted as a
+    # forward-stable architectural fact (no provider-dedicated canonical table, no provider
+    # capability), NOT by pinning the repository's current migration ceiling (later slices add
+    # migrations legitimately).
     with migrated.cursor() as cur:
-        cur.execute("SELECT max(version) FROM schema_migrations")
-        assert cur.fetchone()[0] == "0022"
+        cur.execute("SELECT to_regclass('public.postmark_message'), to_regclass('public.postmark_event'), "
+                    "to_regclass('public.provider_account'), to_regclass('public.webhook_config')")
+        assert cur.fetchone() == (None, None, None, None)   # no provider-dedicated canonical table
+    # no provider-specific capability: SEND_OUTREACH remains the sole market capability
+    from aidan_core.factory.spec import CAPABILITIES
+    assert "SEND_OUTREACH" in CAPABILITIES
+    assert not any(c for c in CAPABILITIES if "POSTMARK" in c.upper() or c in ("RECEIVE_REPLY", "RECORD_OUTCOME"))
+    # the adapter binds only canonical, pre-0022 market/execution fields (channel + source instance)
+    assert pm.POSTMARK_CHANNEL and pm.POSTMARK_VERIFIER_KIND

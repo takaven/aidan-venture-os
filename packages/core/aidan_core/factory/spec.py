@@ -17,11 +17,18 @@ from psycopg.types.json import Json
 
 from .. import audit, db
 from ..actions import canonical_payload_hash
-from ..errors import BuildAuthorityError, IdempotencyConflictError, NotFoundError
+from ..errors import (
+    BuildAuthorityError,
+    DeployAuthorityError,
+    IdempotencyConflictError,
+    NotFoundError,
+)
 
-# Finite capability vocabulary for Gate 4 Alpha (mirrors the DB CHECK).
+# Finite capability vocabulary (mirrors the DB CHECK). DEPLOY_CANDIDATE (Gate 6/0018)
+# authorizes a bounded deployment of an already-frozen release candidate.
 CAPABILITIES = frozenset(
-    {"READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "RUN_TESTS", "PRODUCE_PATCH", "READ_DECLARED_INPUTS"}
+    {"READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "RUN_TESTS", "PRODUCE_PATCH",
+     "READ_DECLARED_INPUTS", "DEPLOY_CANDIDATE"}
 )
 
 
@@ -81,6 +88,41 @@ def _assert_build_action_binding(cur, action_request_id, venture_id, task_payloa
         raise BuildAuthorityError(
             "execution spec for a BUILD action must bind the venture's registered repository"
         )
+
+
+def _assert_deploy_action_binding(cur, action_request_id, venture_id, action_type, task_payload):
+    """Single authoritative Gate 6 deploy-authority boundary at spec creation.
+
+    A canonical deploy action (``action_type = 'deploy'`` OR an action that already owns
+    a ``release_candidate``) may only get an execution spec when its task payload binds
+    the exact immutable, quality-qualified ``release_candidate`` (id + release_hash) and
+    its venture-owned ``deployment_target`` — regardless of which trusted Factory caller
+    creates the spec. So a deploy action can never be executed from free-form intent, and
+    the worker can never choose what/where to deploy. Non-deploy actions are unaffected.
+    """
+    cur.execute(
+        "SELECT id, release_hash, deployment_target_id, venture_id "
+        "FROM release_candidate WHERE action_request_id = %s",
+        (action_request_id,),
+    )
+    rc = cur.fetchone()
+    if action_type != "deploy" and rc is None:
+        return  # not a canonical deploy action — generic path, no release binding required
+    if rc is None:
+        raise DeployAuthorityError(
+            f"action {action_request_id} is a canonical deploy action but has no frozen "
+            "release_candidate; a deploy execution spec cannot be created from free-form intent"
+        )
+    rc_id, rc_hash, rc_target, rc_venture = rc
+    if str(rc_venture) != str(venture_id):
+        raise DeployAuthorityError("release_candidate belongs to a different venture than the action")
+    block = dict((task_payload or {}).get("deploy", {}))
+    if str(block.get("release_candidate_id")) != str(rc_id):
+        raise DeployAuthorityError("execution spec for a deploy action must bind the canonical release_candidate id")
+    if block.get("release_hash") != rc_hash:
+        raise DeployAuthorityError("execution spec release_hash does not match the canonical release_candidate")
+    if str(block.get("deployment_target_id")) != str(rc_target):
+        raise DeployAuthorityError("execution spec must bind the release_candidate's deployment target")
 
 
 def compute_spec_hash(
@@ -145,15 +187,18 @@ def create_execution_spec(
     )
 
     with db.transaction(conn) as cur:
-        cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_request_id,))
+        cur.execute("SELECT venture_id, action_type FROM action_request WHERE id = %s", (action_request_id,))
         arow = cur.fetchone()
         if arow is None:
             raise NotFoundError(f"action_request {action_request_id} does not exist")
-        venture_id = arow[0]
+        venture_id, action_type = arow
 
         # Authoritative Gate 5 boundary: a canonical BUILD action's spec must be
         # bound to its immutable build_spec + venture repository (any caller).
         _assert_build_action_binding(cur, action_request_id, venture_id, task_payload)
+        # Authoritative Gate 6 boundary: a canonical deploy action's spec must be
+        # bound to its immutable quality-qualified release_candidate + target (any caller).
+        _assert_deploy_action_binding(cur, action_request_id, venture_id, action_type, task_payload)
 
         cur.execute(
             "SELECT id, spec_hash FROM execution_spec WHERE action_request_id = %s",

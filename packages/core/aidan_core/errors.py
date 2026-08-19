@@ -142,3 +142,14 @@ class BuildAuthorityError(AidanCoreError):
     isolated venture repository), when the bound build identity does not match the
     canonical rows, or when a builder would target the canonical OS repository.
     """
+
+
+class DeployAuthorityError(AidanCoreError):
+    """A Gate 6 deploy-authority boundary was violated.
+
+    Raised when deployment dispatch is attempted without the required frozen deploy
+    authority (a quality-qualified release_candidate bound into the immutable
+    execution spec, a registered venture-owned deployment target), when the bound
+    release identity/hash/target does not match the canonical rows, or when a
+    release candidate is created without a passing Gate-5 overall quality verdict.
+    """

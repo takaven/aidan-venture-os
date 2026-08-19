@@ -47,6 +47,9 @@ def database_url() -> str | None:
 # 0013 adds execution_artifact and ALTERs execution_attempt/proof_receipt (dropped
 # with their tables CASCADE below).
 _DROP_SQL = """
+DROP TABLE IF EXISTS recommendation_market_window_completion CASCADE;
+DROP TABLE IF EXISTS market_window_completion CASCADE;
+DROP TABLE IF EXISTS alpha_intervention CASCADE;
 DROP TABLE IF EXISTS recommendation_market_observation CASCADE;
 DROP TABLE IF EXISTS market_interpretation_source CASCADE;
 DROP TABLE IF EXISTS market_interpretation CASCADE;

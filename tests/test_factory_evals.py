@@ -365,7 +365,9 @@ def test_AD_worker_authority_escalation_is_inert(migrated):
 
 
 def test_AE_cross_venture_spec_rejected(migrated):
-    vidA, aid, sp = _sc(migrated, "e-AE")
+    # No prior spec on this action, so the raw insert's only violation is the
+    # composite venture-integrity FK (not the 1:1 uniqueness constraint).
+    vidA, aid = setup_action(migrated, slug="e-AE", autonomy_level=1)
     vidB = ventures.create_venture(migrated, slug="e-AE-b")
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         with migrated.cursor() as cur:
@@ -374,6 +376,9 @@ def test_AE_cross_venture_spec_rejected(migrated):
                 "expected_output_contract, verifier_kind, timeout_seconds, max_attempts, spec_hash) "
                 "VALUES (%s, %s, 'w', 'h', '{}'::jsonb, 'v', 60, 3, 's')",
                 (aid, vidB))
+    with migrated.cursor() as cur:  # nothing was persisted by the rejected insert
+        cur.execute("SELECT count(*) FROM execution_spec WHERE action_request_id = %s", (aid,))
+        assert cur.fetchone()[0] == 0
 
 
 def test_AF_raw_sql_forced_succeeded_blocked(migrated):

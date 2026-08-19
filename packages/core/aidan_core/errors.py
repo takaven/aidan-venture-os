@@ -153,3 +153,15 @@ class DeployAuthorityError(AidanCoreError):
     release identity/hash/target does not match the canonical rows, or when a
     release candidate is created without a passing Gate-5 overall quality verdict.
     """
+
+
+class MarketAuthorityError(AidanCoreError):
+    """A Gate 7 market-action-authority boundary was violated.
+
+    Raised when a market action is attempted without the required frozen market
+    authority (an immutable market_action_spec bound into the immutable execution
+    spec) for an OPERATING venture, when the bound market identity/hash/audience/
+    channel does not match the canonical rows, when commercial provenance
+    (opportunity/validation_test) is missing or inconsistent, or when the authorized
+    spend exceeds the referenced validation test's limit or canonical budget.
+    """

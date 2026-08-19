@@ -21,6 +21,7 @@ from ..errors import (
     BuildAuthorityError,
     DeployAuthorityError,
     IdempotencyConflictError,
+    MarketAuthorityError,
     NotFoundError,
 )
 
@@ -28,7 +29,7 @@ from ..errors import (
 # authorizes a bounded deployment of an already-frozen release candidate.
 CAPABILITIES = frozenset(
     {"READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "RUN_TESTS", "PRODUCE_PATCH",
-     "READ_DECLARED_INPUTS", "DEPLOY_CANDIDATE"}
+     "READ_DECLARED_INPUTS", "DEPLOY_CANDIDATE", "SEND_OUTREACH"}
 )
 
 
@@ -88,6 +89,38 @@ def _assert_build_action_binding(cur, action_request_id, venture_id, task_payloa
         raise BuildAuthorityError(
             "execution spec for a BUILD action must bind the venture's registered repository"
         )
+
+
+def _assert_market_action_binding(cur, action_request_id, venture_id, action_type, task_payload):
+    """Single authoritative Gate 7 market-action boundary at spec creation.
+
+    A canonical market action (``action_type = 'send_outreach'`` OR an action that
+    already owns a ``market_action_spec``) may only get an execution spec when its task
+    payload binds the exact immutable ``market_action_spec`` (id + action_spec_hash) and
+    its frozen channel + audience — regardless of which trusted Factory caller creates
+    the spec. So a market action can never be executed from free-form prose, and the
+    worker cannot substitute channel/audience/content. Non-market actions are unaffected.
+    """
+    cur.execute(
+        "SELECT id, action_spec_hash, channel_kind, audience_ref FROM market_action_spec "
+        "WHERE action_request_id = %s", (action_request_id,))
+    ms = cur.fetchone()
+    if action_type != "send_outreach" and ms is None:
+        return  # not a canonical market action — generic path, no market binding required
+    if ms is None:
+        raise MarketAuthorityError(
+            f"action {action_request_id} is a canonical market action but has no frozen "
+            "market_action_spec; a market execution spec cannot be created from free-form intent")
+    ms_id, ms_hash, ms_channel, ms_audience = ms
+    block = dict((task_payload or {}).get("market", {}))
+    if str(block.get("market_action_spec_id")) != str(ms_id):
+        raise MarketAuthorityError("execution spec for a market action must bind the canonical market_action_spec id")
+    if block.get("action_spec_hash") != ms_hash:
+        raise MarketAuthorityError("execution spec action_spec_hash does not match the canonical market_action_spec")
+    if str(block.get("channel_kind")) != str(ms_channel):
+        raise MarketAuthorityError("execution spec must bind the frozen market channel")
+    if str(block.get("audience_ref")) != str(ms_audience):
+        raise MarketAuthorityError("execution spec must bind the frozen market audience")
 
 
 def _assert_deploy_action_binding(cur, action_request_id, venture_id, action_type, task_payload):
@@ -199,6 +232,9 @@ def create_execution_spec(
         # Authoritative Gate 6 boundary: a canonical deploy action's spec must be
         # bound to its immutable quality-qualified release_candidate + target (any caller).
         _assert_deploy_action_binding(cur, action_request_id, venture_id, action_type, task_payload)
+        # Authoritative Gate 7 boundary: a canonical market action's spec must be
+        # bound to its immutable market_action_spec (channel/audience/content) (any caller).
+        _assert_market_action_binding(cur, action_request_id, venture_id, action_type, task_payload)
 
         cur.execute(
             "SELECT id, spec_hash FROM execution_spec WHERE action_request_id = %s",

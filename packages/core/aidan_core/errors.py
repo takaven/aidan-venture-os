@@ -132,3 +132,13 @@ class ConsequentialSpendError(AidanCoreError):
     validation test's precommitted ``max_spend``. A consequential amount with no
     precommitted bound, or one exceeding it, is rejected.
     """
+
+
+class BuildAuthorityError(AidanCoreError):
+    """A Gate 5 build-authority boundary was violated.
+
+    Raised when builder dispatch is attempted without the required frozen build
+    authority (a build_spec bound into the immutable execution spec, a registered
+    isolated venture repository), when the bound build identity does not match the
+    canonical rows, or when a builder would target the canonical OS repository.
+    """

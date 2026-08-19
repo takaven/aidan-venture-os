@@ -24,7 +24,9 @@ def database_url() -> str | None:
     return os.environ.get("DATABASE_URL")
 
 
-# Objects owned by migrations 0001–0014; dropped for a clean slate per test.
+# Objects owned by migrations 0001–0015; dropped for a clean slate per test.
+# 0015 adds build_spec + venture_repository and an additive UNIQUE(id, venture_id)
+# on investment_decision_record (that constraint drops with the table CASCADE).
 # 0014 only ALTERs execution_attempt (adds failure_class/failure_detail/finished_at);
 # the columns drop with the table CASCADE below.
 # 0011 only ALTERs investment_decision_record (adds a column, two composite FKs
@@ -34,6 +36,8 @@ def database_url() -> str | None:
 # 0013 adds execution_artifact and ALTERs execution_attempt/proof_receipt (dropped
 # with their tables CASCADE below).
 _DROP_SQL = """
+DROP TABLE IF EXISTS build_spec CASCADE;
+DROP TABLE IF EXISTS venture_repository CASCADE;
 DROP TABLE IF EXISTS execution_artifact CASCADE;
 DROP TABLE IF EXISTS execution_spec CASCADE;
 DROP TABLE IF EXISTS recommendation_validation_result CASCADE;

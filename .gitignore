@@ -19,6 +19,11 @@ dist/
 build/
 coverage/
 
+# ...but the Gate 5 source package is named build/ and is NOT an artifact.
+# Re-include the directory and its Python sources only; __pycache__/*.pyc stay ignored.
+!packages/core/aidan_core/build/
+!packages/core/aidan_core/build/*.py
+
 # Local databases
 *.sqlite
 *.sqlite3

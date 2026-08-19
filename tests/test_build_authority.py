@@ -33,9 +33,10 @@ from build_fakes import (
     build_authority,
     freeze_default_build_spec,
 )
-from factory_fakes import registry_with
+from factory_fakes import FakeWorkerA, registry_with, spec_action
 
 _CAPS = ["READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "PRODUCE_PATCH"]
+_FAKE_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def _register_repo(conn, vid, ref="venture://repo/default"):
@@ -359,3 +360,163 @@ def test_26_32_substrate_deferred_no_fake_provenance(migrated):
 
     params = inspect.signature(build_spec_mod.compute_build_spec_hash).parameters
     assert not any("substrate" in p for p in params)
+
+
+# ==========================================================================
+# HARDENING — Finding A: generic-Factory build-authority bypass is closed at the
+# canonical execution-spec creation boundary, regardless of caller.
+# ==========================================================================
+def _create_spec(conn, aid, task_payload):
+    return spec_mod.create_execution_spec(
+        conn, aid, worker_kind="builder-a", verifier_kind="structured-contract",
+        timeout_seconds=60, max_attempts=1, capability_scope=["READ_REPOSITORY"],
+        task_payload=task_payload,
+    )
+
+
+def test_A1_generic_factory_without_build_spec_rejected(migrated):
+    # The described bypass: BUILD action -> skip build_spec/repo -> generic
+    # create_execution_spec with free-form prose. Must be rejected, and no spec must
+    # become dispatchable.
+    auth = build_authority(migrated, slug="byp-1")
+    with pytest.raises(BuildAuthorityError):
+        _create_spec(migrated, auth.action_id, {"free_form": "make me an app"})
+    assert spec_mod.get_execution_spec(migrated, auth.action_id) is None
+
+
+def test_A2_fabricated_build_binding_rejected(migrated):
+    auth = build_authority(migrated, slug="byp-2")
+    with pytest.raises(BuildAuthorityError):
+        _create_spec(migrated, auth.action_id, {"build": {
+            "build_spec_id": _FAKE_UUID, "build_spec_hash": "deadbeef",
+            "venture_repository_id": _FAKE_UUID}})
+    assert spec_mod.get_execution_spec(migrated, auth.action_id) is None
+
+
+def test_A3_build_spec_without_repository_rejected(migrated):
+    auth = build_authority(migrated, slug="byp-3")
+    bs = freeze_default_build_spec(migrated, auth)
+    with pytest.raises(BuildAuthorityError):
+        _create_spec(migrated, auth.action_id, {"build": {
+            "build_spec_id": str(bs.build_spec_id), "build_spec_hash": bs.spec_hash,
+            "venture_repository_id": _FAKE_UUID}})
+
+
+def test_A4_wrong_build_spec_hash_rejected(migrated):
+    auth = build_authority(migrated, slug="byp-4")
+    bs = freeze_default_build_spec(migrated, auth)
+    repo = _register_repo(migrated, auth.venture_id, "venture://byp-4/app")
+    with pytest.raises(BuildAuthorityError):
+        _create_spec(migrated, auth.action_id, {"build": {
+            "build_spec_id": str(bs.build_spec_id), "build_spec_hash": "wrong-hash",
+            "venture_repository_id": str(repo.venture_repository_id)}})
+
+
+def test_A5_cross_venture_repository_binding_rejected(migrated):
+    a = build_authority(migrated, slug="byp-5a", key="A")
+    bs = freeze_default_build_spec(migrated, a)
+    _register_repo(migrated, a.venture_id, "venture://byp-5a/app")
+    b = build_authority(migrated, slug="byp-5b", key="B")
+    repo_b = _register_repo(migrated, b.venture_id, "venture://byp-5b/app")
+    # A's correctly-hashed build binding but pointing at venture B's repository.
+    with pytest.raises(BuildAuthorityError):
+        _create_spec(migrated, a.action_id, {"build": {
+            "build_spec_id": str(bs.build_spec_id), "build_spec_hash": bs.spec_hash,
+            "venture_repository_id": str(repo_b.venture_repository_id)}})
+
+
+def test_A6_correctly_bound_spec_dispatches_via_generic_runtime(migrated):
+    # The goal is not to force all callers through one helper: a correctly-bound
+    # canonical spec is safe under the GENERIC Gate 4 runtime too.
+    auth = build_authority(migrated, slug="byp-6")
+    freeze_default_build_spec(migrated, auth)
+    _register_repo(migrated, auth.venture_id, "venture://byp-6/app")
+    build_runtime.prepare_build_execution(
+        migrated, auth.action_id, worker_kind="builder-a", verifier_kind="structured-contract",
+        capability_scope=_CAPS, timeout_seconds=60, max_attempts=1,
+    )
+    worker = BuilderWorker()
+    result = factory_runtime.execute_action(
+        migrated, auth.action_id, registry=registry_with(worker), workspace_ref="venture://byp-6/app",
+    )
+    assert result.dispatched is True and worker.calls == 1
+
+
+def test_A7_non_build_generic_factory_unaffected(migrated):
+    # An ordinary Gate 4 action (no BUILD investment decision) still uses the generic
+    # execution_spec + runtime with no Gate 5 binding required.
+    vid, aid, sp = spec_action(
+        migrated, "byp-7", verifier_kind="structured-contract",
+        expected_output_contract={"require": {"status": "done"}},
+    )
+    worker = FakeWorkerA(structured_output={"status": "done"})
+    result = factory_runtime.execute_action(migrated, aid, registry=registry_with(worker))
+    assert result.dispatched is True and worker.calls == 1
+
+
+# ==========================================================================
+# HARDENING — Finding B: venture_repository idempotency over ALL immutable fields.
+# ==========================================================================
+def test_B1_repo_exact_replay_all_fields_converges(migrated):
+    auth = build_authority(migrated, slug="repo-b1")
+    first = repo_mod.register_venture_repository(
+        migrated, auth.venture_id, repository_ref="venture://repo-b1/app",
+        repository_scheme="git", provenance={"source": "A"},
+    )
+    again = repo_mod.register_venture_repository(
+        migrated, auth.venture_id, repository_ref="venture://repo-b1/app",
+        repository_scheme="git", provenance={"source": "A"},
+    )
+    assert again.created is False and again.venture_repository_id == first.venture_repository_id
+
+
+def test_B2_changed_scheme_conflicts(migrated):
+    auth = build_authority(migrated, slug="repo-b2")
+    repo_mod.register_venture_repository(
+        migrated, auth.venture_id, repository_ref="venture://repo-b2/app", repository_scheme="mock")
+    with pytest.raises(IdempotencyConflictError):
+        repo_mod.register_venture_repository(
+            migrated, auth.venture_id, repository_ref="venture://repo-b2/app", repository_scheme="git")
+
+
+def test_B3_changed_provenance_conflicts(migrated):
+    auth = build_authority(migrated, slug="repo-b3")
+    repo_mod.register_venture_repository(
+        migrated, auth.venture_id, repository_ref="venture://repo-b3/app", provenance={"source": "A"})
+    with pytest.raises(IdempotencyConflictError):
+        repo_mod.register_venture_repository(
+            migrated, auth.venture_id, repository_ref="venture://repo-b3/app", provenance={"source": "B"})
+
+
+# ==========================================================================
+# HARDENING — Finding C: canonical OS repository identity normalization.
+# Pure identity logic (no DB) — protects the OS repo, not unrelated fork names.
+# ==========================================================================
+@pytest.mark.parametrize("os_ref", [
+    "takaven/aidan-venture-os",
+    "aidan-venture-os",
+    "AIDAN-VENTURE-OS",
+    "/home/x/aidan-venture-os",
+    "/home/x/aidan-venture-os/",
+    "https://github.com/takaven/aidan-venture-os",
+    "https://github.com/takaven/aidan-venture-os.git",
+    "git@github.com:takaven/aidan-venture-os.git",
+    "ssh://git@github.com/takaven/aidan-venture-os.git",
+    "C:/Users/isuda/Dev/aidan-venture-os/.git",
+    "C:\\Users\\isuda\\Dev\\aidan-venture-os",
+    "/srv/aidan-venture-os-gate0-source",
+])
+def test_C_os_ref_forms_rejected(os_ref):
+    with pytest.raises(BuildAuthorityError):
+        repo_mod.assert_isolated_repository_ref(os_ref)
+
+
+@pytest.mark.parametrize("ok_ref", [
+    "venture://acme/app",
+    "https://github.com/acme/clinic-preauth",
+    "git@github.com:acme/clinic-preauth.git",
+    "my-aidan-venture-os-fork",
+    "https://github.com/acme/my-aidan-venture-os-fork.git",
+])
+def test_C_non_os_refs_allowed(ok_ref):
+    repo_mod.assert_isolated_repository_ref(ok_ref)  # must not raise

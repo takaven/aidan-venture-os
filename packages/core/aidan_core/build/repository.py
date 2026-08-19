@@ -37,22 +37,47 @@ CANONICAL_OS_REPOSITORY_MARKERS = frozenset({
 
 
 def _normalize_ref(ref: str) -> str:
-    return ref.strip().replace("\\", "/").rstrip("/").lower()
+    """Reduce common Git/path representations of a repository to a comparable identity.
+
+    Handles (case-insensitively): backslashes, trailing slashes, a URL scheme
+    (``https://``, ``ssh://``, ``git://``), scp-style ``git@host:owner/repo``, a
+    trailing ``.git`` file or ``/.git`` directory. Identity comparison only — NOT a
+    claim of filesystem-level sandboxing.
+    """
+    norm = ref.strip().replace("\\", "/").lower()
+    if "://" in norm:                       # strip a URL scheme (https://, ssh://, git://)
+        norm = norm.split("://", 1)[1]
+    elif "@" in norm and ":" in norm:       # scp-style git@host:owner/repo
+        after_user = norm.split("@", 1)[1]
+        host, _, path = after_user.partition(":")
+        norm = f"{host}/{path}"
+    norm = norm.rstrip("/")
+    if norm.endswith("/.git"):              # a bare/checkout .git directory
+        norm = norm[:-len("/.git")]
+    elif norm.endswith(".git"):             # repo.git
+        norm = norm[:-len(".git")]
+    return norm.rstrip("/")
 
 
 def assert_isolated_repository_ref(repository_ref: str) -> None:
     """Reject an empty ref or one that resolves to the canonical OS repository.
 
-    Kernel-level protection: raises :class:`ValidationError` if the ref names the
-    OS monorepo by any known identifier (exact, or as the final path segment).
+    Kernel-level identity protection: raises :class:`BuildAuthorityError` if the
+    ref names the OS monorepo by any known identifier under common Git/path
+    representations (exact, final path segment, or ``owner/repo`` tail). It rejects
+    the OS repo itself, not unrelated names that merely contain it (e.g. a
+    ``my-aidan-venture-os-fork`` is allowed). This is identity normalization, NOT
+    filesystem sandboxing.
     """
     if not repository_ref or not repository_ref.strip():
         raise ValueError("repository_ref is required")
     norm = _normalize_ref(repository_ref)
-    last = norm.rsplit("/", 1)[-1]
+    segments = norm.split("/")
+    last1 = segments[-1] if segments else norm
+    last2 = "/".join(segments[-2:]) if len(segments) >= 2 else norm
     for marker in CANONICAL_OS_REPOSITORY_MARKERS:
         m = marker.lower()
-        if norm == m or last == m or norm.endswith("/" + m):
+        if norm == m or last1 == m or last2 == m:
             raise BuildAuthorityError(
                 "a builder may not target the canonical OS repository "
                 f"({repository_ref!r} resolves to {marker!r})"
@@ -91,15 +116,21 @@ def register_venture_repository(
             raise NotFoundError(f"venture {venture_id} does not exist")
 
         cur.execute(
-            "SELECT id, repository_ref FROM venture_repository WHERE venture_id = %s",
+            "SELECT id, repository_ref, repository_scheme, provenance "
+            "FROM venture_repository WHERE venture_id = %s",
             (venture_id,),
         )
         existing = cur.fetchone()
         if existing is not None:
-            if existing[1] != repository_ref:
+            # Exact replay converges; ANY materially changed immutable field conflicts
+            # (a repository identity is never silently reassigned or re-annotated).
+            if (existing[1], existing[2], existing[3] or {}) != (
+                repository_ref, repository_scheme, provenance
+            ):
                 raise IdempotencyConflictError(
-                    f"venture {venture_id} already has repository {existing[1]!r}; "
-                    f"cannot reassign to {repository_ref!r}"
+                    f"venture {venture_id} already has repository {existing[1]!r} "
+                    f"(scheme={existing[2]!r}); cannot change registration to "
+                    f"{repository_ref!r} (scheme={repository_scheme!r})"
                 )
             return RepositoryResult(existing[0], existing[1], created=False)
 

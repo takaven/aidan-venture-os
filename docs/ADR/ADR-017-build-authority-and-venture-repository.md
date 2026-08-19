@@ -111,6 +111,27 @@ provenance theater. `build_spec` therefore carries NO substrate field and the
 (with a real source SHA) and its binding into build_spec/execution_spec are
 deferred to Slice 2, when the substrate actually exists.
 
+## Correction (Slice 1 hardening)
+
+Independent review found that the authority above initially lived only in the
+`build.runtime` composition helper, while the generic Gate 4
+`factory.spec.create_execution_spec` still accepted any ActionRequest with an
+arbitrary task payload — so a trusted caller could create and dispatch a BUILD
+spec from free-form prose, bypassing the helper. The authoritative boundary was
+therefore moved to the canonical execution-spec creation point: if an
+ActionRequest is a canonical BUILD action (the resulting action of a BUILD
+`investment_decision_record`), `create_execution_spec` now REQUIRES the task
+payload to bind the exact immutable `build_spec` id + hash and a venture-owned
+`venture_repository`, regardless of caller. Because `execute_action` only
+dispatches an already-created spec, guarding creation makes dispatch safe for
+every caller; non-BUILD actions are unaffected. Two smaller repository defects
+were corrected in the same pass: registration idempotency now compares all
+immutable fields (`repository_ref`, `repository_scheme`, `provenance`) so a
+changed registration conflicts rather than silently converging; and OS-repository
+identity normalization now folds common Git/URL/`.git` forms before comparison
+(rejecting the OS repo, not unrelated fork names). No migration was required — the
+guard is kernel-level; `0015` is unchanged.
+
 ## Consequences
 
 - Migration `0015` adds `build_spec`, `venture_repository`, and the single

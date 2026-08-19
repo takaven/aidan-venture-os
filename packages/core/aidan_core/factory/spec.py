@@ -17,7 +17,7 @@ from psycopg.types.json import Json
 
 from .. import audit, db
 from ..actions import canonical_payload_hash
-from ..errors import IdempotencyConflictError, NotFoundError
+from ..errors import BuildAuthorityError, IdempotencyConflictError, NotFoundError
 
 # Finite capability vocabulary for Gate 4 Alpha (mirrors the DB CHECK).
 CAPABILITIES = frozenset(
@@ -30,6 +30,57 @@ class SpecResult:
     spec_id: str
     spec_hash: str
     created: bool
+
+
+def _assert_build_action_binding(cur, action_request_id, venture_id, task_payload):
+    """Single authoritative Gate 5 build-authority boundary at spec creation.
+
+    If the ActionRequest is a CANONICAL BUILD action (it is the resulting action of
+    a BUILD ``investment_decision_record``), its execution spec may only be created
+    when it is bound to the immutable Gate 5 ``build_spec`` and the venture's
+    registered ``venture_repository`` — the task payload must carry the exact
+    build_spec id + hash and a venture-owned repository. This holds regardless of
+    which trusted Factory caller creates the spec (the ``build.runtime`` helper is
+    convenience, not the boundary), so a BUILD action can never be executed from
+    free-form prose. Non-BUILD actions are unaffected: the generic Gate 4 path is
+    unchanged. Because ``execute_action`` only ever dispatches an already-created
+    spec, guarding creation makes dispatch safe for every caller too.
+    """
+    cur.execute(
+        "SELECT 1 FROM investment_decision_record "
+        "WHERE resulting_action_id = %s AND decision = 'BUILD' LIMIT 1",
+        (action_request_id,),
+    )
+    if cur.fetchone() is None:
+        return  # not a canonical BUILD action — generic Gate 4, no build binding required
+
+    cur.execute(
+        "SELECT id, spec_hash FROM build_spec WHERE action_request_id = %s",
+        (action_request_id,),
+    )
+    bs = cur.fetchone()
+    if bs is None:
+        raise BuildAuthorityError(
+            f"action {action_request_id} is a canonical BUILD action but has no frozen "
+            "build_spec; a BUILD execution spec cannot be created from free-form intent"
+        )
+    build_spec_id, build_spec_hash = bs
+    block = dict((task_payload or {}).get("build", {}))
+    if str(block.get("build_spec_id")) != str(build_spec_id):
+        raise BuildAuthorityError(
+            "execution spec for a BUILD action must bind the canonical build_spec id"
+        )
+    if block.get("build_spec_hash") != build_spec_hash:
+        raise BuildAuthorityError(
+            "execution spec build_spec_hash does not match the canonical build_spec"
+        )
+    # The bound repository must be the venture's own registered repository.
+    cur.execute("SELECT id FROM venture_repository WHERE venture_id = %s", (venture_id,))
+    repo = cur.fetchone()
+    if repo is None or str(repo[0]) != str(block.get("venture_repository_id")):
+        raise BuildAuthorityError(
+            "execution spec for a BUILD action must bind the venture's registered repository"
+        )
 
 
 def compute_spec_hash(
@@ -99,6 +150,10 @@ def create_execution_spec(
         if arow is None:
             raise NotFoundError(f"action_request {action_request_id} does not exist")
         venture_id = arow[0]
+
+        # Authoritative Gate 5 boundary: a canonical BUILD action's spec must be
+        # bound to its immutable build_spec + venture repository (any caller).
+        _assert_build_action_binding(cur, action_request_id, venture_id, task_payload)
 
         cur.execute(
             "SELECT id, spec_hash FROM execution_spec WHERE action_request_id = %s",

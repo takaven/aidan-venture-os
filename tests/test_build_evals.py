@@ -225,17 +225,26 @@ def test_U_cross_venture_quality_evidence_rejected(migrated):
 
 
 def test_V_cross_attempt_manifest_rejected(migrated):
+    # Venture B's attempt must have NO manifest yet, so the intended composite FK
+    # (execution_attempt_id, action_request_id) is the FIRST failing invariant — not
+    # the immutable-manifest idempotency guard (which fires only if a manifest exists).
+    from build_fakes import dispatched_build
     a = full_eval(migrated, "evVa", key="Va", product_manifest=GOOD_PRODUCT_MANIFEST)
-    b = full_eval(migrated, "evVb", key="Vb", product_manifest=GOOD_PRODUCT_MANIFEST)
+    b_auth, _w, _d, b_result = dispatched_build(migrated, "evVb", key="Vb")  # dispatched, NOT captured
     with migrated.cursor() as cur:
-        cur.execute("SELECT execution_attempt_id FROM build_manifest WHERE id = %s", (b.manifest_id,))
-        b_attempt = cur.fetchone()[0]
-    # venture A's action + venture B's attempt -> composite FK (attempt,action) has no row
+        cur.execute("SELECT count(*) FROM build_manifest WHERE execution_attempt_id = %s", (b_result.attempt_id,))
+        assert cur.fetchone()[0] == 0                                   # B's attempt owns no manifest
+        cur.execute("SELECT action_request_id FROM execution_attempt WHERE id = %s", (b_result.attempt_id,))
+        assert str(cur.fetchone()[0]) != str(a.auth.action_id)         # B's attempt belongs to a different action
+    # A's action identity + B's attempt -> composite FK has no matching execution_attempt row
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         manifest_mod.capture_build_manifest(
-            migrated, a.auth.action_id, execution_attempt_id=b_attempt,
+            migrated, a.auth.action_id, execution_attempt_id=b_result.attempt_id,
             substrate_release_id=a.rel.substrate_release_id, candidate_files=GOOD_CANDIDATE,
             workspace_root=_fresh_ws())
+    with migrated.cursor() as cur:  # no invalid manifest persisted for that combination
+        cur.execute("SELECT count(*) FROM build_manifest WHERE execution_attempt_id = %s", (b_result.attempt_id,))
+        assert cur.fetchone()[0] == 0
 
 
 def _fresh_ws():

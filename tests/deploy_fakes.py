@@ -137,6 +137,30 @@ def to_building(conn, venture_id):
     lifecycle.transition(conn, venture_id, "BUILDING", actor="op")
 
 
+DeployRun = namedtuple("DeployRun", "s worker verify")
+
+
+def run_deploy(conn, slug, *, mode="compliant", release_contract=None, key=None, provider="fake-a",
+               worker_cls=None, structured_output=None, max_attempts=1, building=True, environment="staging"):
+    """End-to-end Gate-6 chain: release_candidate -> execute_deploy -> verify_deploy.
+    Returns (setup, worker, verify_outcome). Promotion is left to the caller."""
+    from aidan_core.deploy import release as release_mod
+    from aidan_core.deploy import runtime as deploy_runtime
+
+    s = setup_deploy(conn, slug, key=key or slug, provider_kind=provider, environment=environment,
+                     target_ref=f"deploy://{slug}/{environment}")
+    release_mod.create_release_candidate(
+        conn, s.deploy_action_id, build_manifest_id=s.build_manifest_id,
+        deployment_target_id=s.target_id, release_contract=release_contract)
+    if building:
+        to_building(conn, s.venture_id)
+    worker = (worker_cls or DeployBundleWorker)(mode=mode, structured_output=structured_output)
+    deploy_runtime.execute_deploy(conn, s.deploy_action_id, registry=registry_with(worker),
+                                  worker_kind=worker.kind, max_attempts=max_attempts)
+    out = deploy_runtime.verify_deploy(conn, s.deploy_action_id, actual_cost=0)
+    return DeployRun(s, worker, out)
+
+
 def setup_deploy(conn, slug, *, key=None, product_manifest=None, environment="staging",
                  provider_kind="fake-a", target_ref=None):
     """Full Gate-5 chain + deployment target + deploy ActionRequest (no release yet)."""

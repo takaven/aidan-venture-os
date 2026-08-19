@@ -224,11 +224,15 @@ def test_17_20_each_dimension_fail_blocks_overall(migrated, dim, descriptor):
 
 
 def test_21_no_weighted_compensation(migrated):
-    # three dimensions PASS cannot outweigh one FAIL
+    # exactly one required dimension fails (Experience, via a dead end); the other
+    # three passing cannot outweigh it — overall must be FAIL. No averaging/weighting.
     auth, mid = captured_manifest(migrated, "q21")
-    out = _assess(migrated, mid, _mf(features=["approval_tracking"]))  # only Product fails
-    passes = sum(1 for v in out["dimensions"].values() if v == "PASS")
-    assert passes == 3 and out["overall"] == "FAIL"
+    out = _assess(migrated, mid, _mf(dead_ends=["draft pre-auth"]))
+    from aidan_core.build import technical as technical_mod
+    assert out["dimensions"] == {"PRODUCT": "PASS", "EXPERIENCE": "FAIL",
+                                 "COMMERCIAL": "PASS", "ANTIGENERIC": "PASS"}
+    assert technical_mod.technical_verdict(migrated, mid) == "PASS"
+    assert out["overall"] == "FAIL"
 
 
 # ==========================================================================

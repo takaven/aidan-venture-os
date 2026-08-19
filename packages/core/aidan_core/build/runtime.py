@@ -292,7 +292,7 @@ def assess_build_quality(
                     "SELECT raw_payload FROM execution_result WHERE action_request_id = %s "
                     "ORDER BY received_at DESC, id DESC LIMIT 1", (action_request_id,))
             row = cur.fetchone()
-        structured = dict((row[1] or {}).get("structured_output", {})) if row else {}
+        structured = dict((row[0] or {}).get("structured_output", {})) if row else {}
         product_descriptor = dict(structured.get("product_manifest", {}))
 
     return quality_mod.run_quality_assessment(

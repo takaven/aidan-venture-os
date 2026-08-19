@@ -328,34 +328,40 @@ def test_24_31_provider_neutral_same_runtime(migrated):
 
 
 def test_25_no_quality_manifest_deploy_lifecycle_side_effects(migrated):
+    # The Slice-1 build-authority execution path itself must create NO build manifest,
+    # quality, deployment or lifecycle side effect. (Slice 2 adds the build_manifest
+    # table, but only the separate Slice-2 capture path writes to it — never dispatch.)
     auth = build_authority(migrated, slug="g5-25")
     freeze_default_build_spec(migrated, auth)
     _register_repo(migrated, auth.venture_id, "venture://g5-25/app")
-    _dispatch(migrated, auth.action_id, BuilderWorker())
+    _, result = _dispatch(migrated, auth.action_id, BuilderWorker())
     assert _proof_count(migrated, auth.action_id) == 0
     assert _lifecycle(migrated, auth.venture_id) == "DISCOVERED"
-    # no Slice-2+ tables exist yet
     with migrated.cursor() as cur:
-        cur.execute("SELECT to_regclass('public.build_manifest'), to_regclass('public.quality_assessment')")
-        assert cur.fetchone() == (None, None)
-
-
-# ==========================================================================
-# Substrate deferred (Option B) — no fake provenance (matrix 26, 32)
-# ==========================================================================
-def test_26_32_substrate_deferred_no_fake_provenance(migrated):
-    # No substrate_release table/entity exists, and build_spec carries no substrate
-    # version field: substrate identity is deferred to Slice 2 (Option B).
-    with migrated.cursor() as cur:
-        cur.execute("SELECT to_regclass('public.substrate_release')")
+        # this exact action/attempt produced NO build manifest via the dispatch path
+        cur.execute(
+            "SELECT count(*) FROM build_manifest WHERE action_request_id = %s OR execution_attempt_id = %s",
+            (auth.action_id, result.attempt_id))
+        assert cur.fetchone()[0] == 0
+        # and the Slice-3 multi-dimension quality store is still intentionally absent
+        cur.execute("SELECT to_regclass('public.quality_assessment')")
         assert cur.fetchone()[0] is None
+
+
+# ==========================================================================
+# build_spec owns no fake/free-form substrate provenance (matrix 26, 32)
+# ==========================================================================
+def test_26_32_build_spec_owns_no_fake_substrate_provenance(migrated):
+    # Canonical substrate provenance lives in the Slice-2 chain
+    # (substrate_release -> build_manifest), NEVER as a free-form field on build_spec:
+    # build_spec has no substrate column and the build-spec hash takes no substrate param.
+    with migrated.cursor() as cur:
         cur.execute(
             "SELECT count(*) FROM information_schema.columns "
             "WHERE table_name = 'build_spec' AND column_name LIKE '%substrate%'"
         )
         assert cur.fetchone()[0] == 0
     assert not hasattr(build_spec_mod, "substrate_version")
-    # the hash function takes no substrate parameter
     import inspect
 
     params = inspect.signature(build_spec_mod.compute_build_spec_hash).parameters

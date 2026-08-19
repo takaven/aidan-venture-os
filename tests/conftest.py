@@ -30,6 +30,8 @@ def database_url() -> str | None:
 # 0020 adds market_observation.
 # 0021 adds market_interpretation + market_interpretation_source and an additive
 # UNIQUE(id, venture_id) on market_observation (that constraint drops with the table CASCADE).
+# 0022 adds recommendation_market_observation and extends the next_action_recommendation
+# action_type CHECK (that constraint drops with the table CASCADE).
 # 0018 adds deployment_target + release_candidate and ALTERs the execution_spec
 # capability CHECK (that constraint drops with execution_spec CASCADE).
 # 0017 adds build_quality_evidence + build_quality_assessment.
@@ -45,6 +47,7 @@ def database_url() -> str | None:
 # 0013 adds execution_artifact and ALTERs execution_attempt/proof_receipt (dropped
 # with their tables CASCADE below).
 _DROP_SQL = """
+DROP TABLE IF EXISTS recommendation_market_observation CASCADE;
 DROP TABLE IF EXISTS market_interpretation_source CASCADE;
 DROP TABLE IF EXISTS market_interpretation CASCADE;
 DROP TABLE IF EXISTS market_observation CASCADE;

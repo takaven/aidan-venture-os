@@ -24,7 +24,7 @@ from . import audit, db
 from .actions import canonical_payload_hash
 from .errors import IdempotencyConflictError, NotFoundError
 
-_ACTIONS = {"RESEARCH_MORE", "VALIDATE", "BUILD", "HOLD", "KILL"}
+_ACTIONS = {"RESEARCH_MORE", "VALIDATE", "BUILD", "HOLD", "KILL", "MARKET"}
 
 
 @dataclass(frozen=True)
@@ -91,19 +91,60 @@ def _cheapest_discriminating_test(cur, venture_id, assumption_id):
 _IMPORTANCE_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
 
-def _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results):
+def _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results,
+                   considered_observations=()):
     """The exact canonical basis a recommendation's input_hash digests.
 
     Shared by recommend() (to persist the hash) and current_basis() (to detect
-    staleness) so the two can never drift apart.
+    staleness) so the two can never drift apart. Market observations considered are
+    included (sorted, canonical) so a NEW market observation changes the input identity
+    and a stale market-aware recommendation cannot be silently replayed/committed.
     """
     return {
         "opportunity": str(opportunity_id),
         "assumptions": sorted(str(a) for a in considered_assumptions),
         "results": sorted(str(r) for r in considered_results),
+        "observations": sorted(str(o) for o in considered_observations),
         "action": action,
         "reason": reason,
     }
+
+
+def _market_basis(cur, venture_id, opportunity_id):
+    """Deterministic market-aware basis, or None.
+
+    Only for an OPERATING venture whose opportunity has executed market action(s) whose
+    precommitted validation test(s) remain UNRESOLVED (no validation_result yet) AND for
+    which canonical market observations exist: the raw observations do NOT by themselves
+    resolve the precommitted criterion (that remains Gate-3's arbiter — no event-type→
+    decision heuristic), so the highest-value next action is another bounded market test.
+    Returns the exact considered observation ids for provenance. Returns None (deferring to
+    the classic allocator) when the venture is not OPERATING, no market action exists, no
+    market evidence exists, or the precommitted test is already resolved.
+    """
+    cur.execute("SELECT lifecycle_state FROM venture WHERE id = %s", (venture_id,))
+    row = cur.fetchone()
+    if row is None or row[0] != "OPERATING":
+        return None
+    cur.execute(
+        "SELECT id, validation_test_id FROM market_action_spec "
+        "WHERE opportunity_id = %s AND venture_id = %s ORDER BY id",
+        (opportunity_id, venture_id))
+    specs = cur.fetchall()
+    if not specs:
+        return None
+    spec_ids = [s[0] for s in specs]
+    test_ids = sorted({s[1] for s in specs})
+    cur.execute(
+        "SELECT id FROM market_observation WHERE market_action_spec_id = ANY(%s) ORDER BY id",
+        (spec_ids,))
+    observation_ids = [r[0] for r in cur.fetchall()]
+    if not observation_ids:
+        return None  # no canonical market evidence -> no evidence-driven market recommendation
+    cur.execute("SELECT count(*) FROM validation_result WHERE validation_test_id = ANY(%s)", (test_ids,))
+    if cur.fetchone()[0] > 0:
+        return None  # precommitted test already resolved -> defer to the classic (validation) path
+    return {"reason": "ACQUISITION_UNRESOLVED", "observation_ids": observation_ids}
 
 
 def _decide(cur, venture_id, opportunity_id):
@@ -115,7 +156,7 @@ def _decide(cur, venture_id, opportunity_id):
     # 1. Decisive precommitted kill criterion (a FAIL) outranks everything.
     for aid, s in state.items():
         if s["has_fail"]:
-            return ("KILL", "KILL_CRITERION_TRIGGERED", None, considered_assumptions, considered_tests, all_result_ids)
+            return ("KILL", "KILL_CRITERION_TRIGGERED", None, considered_assumptions, considered_tests, all_result_ids, [])
 
     # 2. Unresolved CRITICAL/HIGH assumption (resolved == has PASS and no INCONCLUSIVE).
     unresolved = [
@@ -128,8 +169,8 @@ def _decide(cur, venture_id, opportunity_id):
         test = _cheapest_discriminating_test(cur, venture_id, aid)
         if test is not None:
             considered_tests.append(test)
-            return ("VALIDATE", "CRITICAL_ASSUMPTION_UNRESOLVED", test, considered_assumptions, considered_tests, all_result_ids)
-        return ("RESEARCH_MORE", "INSUFFICIENT_EVIDENCE", None, considered_assumptions, considered_tests, all_result_ids)
+            return ("VALIDATE", "CRITICAL_ASSUMPTION_UNRESOLVED", test, considered_assumptions, considered_tests, all_result_ids, [])
+        return ("RESEARCH_MORE", "INSUFFICIENT_EVIDENCE", None, considered_assumptions, considered_tests, all_result_ids, [])
 
     # 3. Material contradiction without decisive kill (PASS + INCONCLUSIVE) on any assumption.
     for aid, s in state.items():
@@ -137,8 +178,8 @@ def _decide(cur, venture_id, opportunity_id):
             test = _cheapest_discriminating_test(cur, venture_id, aid)
             if test is not None:
                 considered_tests.append(test)
-                return ("VALIDATE", "VALIDATION_CONTRADICTORY", test, considered_assumptions, considered_tests, all_result_ids)
-            return ("HOLD", "VALIDATION_CONTRADICTORY", None, considered_assumptions, considered_tests, all_result_ids)
+                return ("VALIDATE", "VALIDATION_CONTRADICTORY", test, considered_assumptions, considered_tests, all_result_ids, [])
+            return ("HOLD", "VALIDATION_CONTRADICTORY", None, considered_assumptions, considered_tests, all_result_ids, [])
 
     # 4. BUILD consideration (structurally complete + positive evidence + all key assumptions resolved).
     cur.execute("SELECT status FROM opportunity WHERE id = %s", (opportunity_id,))
@@ -152,10 +193,16 @@ def _decide(cur, venture_id, opportunity_id):
         for aid, s in state.items() if s["importance"] in ("CRITICAL", "HIGH")
     )
     if status == "CANDIDATE" and any_pass and key_resolved and state:
-        return ("BUILD", "BUILD_CONSIDERATION_READY", None, considered_assumptions, considered_tests, all_result_ids)
+        return ("BUILD", "BUILD_CONSIDERATION_READY", None, considered_assumptions, considered_tests, all_result_ids, [])
 
-    # 5. Otherwise no high-value action now.
-    return ("HOLD", "NO_HIGH_VALUE_ACTION_NOW", None, considered_assumptions, considered_tests, all_result_ids)
+    # 5. No classic high-value action. For an OPERATING venture with unresolved, market-tested
+    #    commercial criteria and canonical market evidence, the next bounded action is another
+    #    market test (MARKET). Raw observations never resolve the precommitted test themselves.
+    market = _market_basis(cur, venture_id, opportunity_id)
+    if market is not None:
+        return ("MARKET", market["reason"], None, considered_assumptions, considered_tests,
+                all_result_ids, market["observation_ids"])
+    return ("HOLD", "NO_HIGH_VALUE_ACTION_NOW", None, considered_assumptions, considered_tests, all_result_ids, [])
 
 
 def current_basis(cur, venture_id: str, opportunity_id: str) -> dict:
@@ -166,11 +213,12 @@ def current_basis(cur, venture_id: str, opportunity_id: str) -> dict:
     Read-only. Uses the caller's cursor so the check shares one transaction
     snapshot with the conversion it guards.
     """
-    action, reason, selected_test, considered_assumptions, considered_tests, considered_results = _decide(
+    action, reason, selected_test, considered_assumptions, considered_tests, considered_results, considered_observations = _decide(
         cur, venture_id, opportunity_id
     )
     input_hash = canonical_payload_hash(
-        _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results)
+        _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results,
+                       considered_observations)
     )
     return {
         "action": action,
@@ -179,6 +227,7 @@ def current_basis(cur, venture_id: str, opportunity_id: str) -> dict:
         "considered_assumptions": considered_assumptions,
         "considered_tests": considered_tests,
         "considered_results": considered_results,
+        "considered_observations": considered_observations,
         "input_hash": input_hash,
     }
 
@@ -190,11 +239,12 @@ def recommend(
     if not recommendation_key:
         raise ValueError("recommendation_key is required")
     with db.transaction(conn) as cur:
-        action, reason, selected_test, considered_assumptions, considered_tests, considered_results = _decide(
+        action, reason, selected_test, considered_assumptions, considered_tests, considered_results, considered_observations = _decide(
             cur, venture_id, opportunity_id
         )
         input_hash = canonical_payload_hash(
-            _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results)
+            _basis_payload(opportunity_id, action, reason, considered_assumptions, considered_results,
+                           considered_observations)
         )
 
         cur.execute(
@@ -225,6 +275,8 @@ def recommend(
             cur.execute("INSERT INTO recommendation_validation_test (recommendation_id, validation_test_id, venture_id) VALUES (%s, %s, %s)", (rec_id, tid, venture_id))
         for rid in considered_results:
             cur.execute("INSERT INTO recommendation_validation_result (recommendation_id, validation_result_id, venture_id) VALUES (%s, %s, %s)", (rec_id, rid, venture_id))
+        for oid in considered_observations:
+            cur.execute("INSERT INTO recommendation_market_observation (recommendation_id, observation_id, venture_id) VALUES (%s, %s, %s)", (rec_id, oid, venture_id))
         audit.record_event(
             cur, event_type="nextaction.recommended", actor=actor, venture_id=venture_id,
             payload={"recommendation_id": str(rec_id), "opportunity_id": str(opportunity_id), "action_type": action, "reason": reason},
@@ -262,10 +314,16 @@ def provenance(conn, recommendation_id: str) -> dict:
             (recommendation_id,),
         )
         results = [{"result_id": r[0], "outcome": r[1], "wtp_modality": r[2], "measurement_kind": r[3]} for r in cur.fetchall()]
+        cur.execute(
+            "SELECT observation_id FROM recommendation_market_observation WHERE recommendation_id = %s ORDER BY observation_id",
+            (recommendation_id,),
+        )
+        observations = [r[0] for r in cur.fetchall()]
     return {
         "recommendation_id": rec[0], "opportunity_id": rec[2], "action_type": rec[3],
         "reason_code": rec[4], "selected_validation_test_id": rec[6],
         "considered_assumptions": assumptions, "considered_tests": tests, "considered_results": results,
+        "considered_observations": observations,
     }
 
 

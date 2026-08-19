@@ -68,10 +68,13 @@ _RECOMMENDATION_TO_DECISION = {
     "BUILD": "BUILD",
     "HOLD": "HOLD",
     "KILL": "KILL",
+    "MARKET": "MARKET",
 }
 
-# Default ActionRequest action_type for a consequential request, per decision.
-_DEFAULT_ACTION_TYPE = {"VALIDATE": "validation_spend", "BUILD": "build"}
+# Default ActionRequest action_type for a consequential request, per decision. A MARKET
+# decision results in the canonical Gate-7 market action (send_outreach); the exact
+# content/audience/offer/spend is frozen later by market_action_spec, not invented here.
+_DEFAULT_ACTION_TYPE = {"VALIDATE": "validation_spend", "BUILD": "build", "MARKET": "send_outreach"}
 
 # Validation measurement kinds that represent acquisition/channel evidence.
 _ACQUISITION_KINDS = ("OUTREACH_RESPONSE", "LANDING_CONVERSION", "ACQUISITION_COST")
@@ -361,11 +364,14 @@ def commit_recommendation(
         if decision_value == "VALIDATE" and consequential:
             _validate_spend_bound(cur, venture_id, selected_test, amount)
 
-        # Optionally intake the consequential ActionRequest (VALIDATE spend or a
-        # BUILD with an honestly supplied bounded amount). It is submitted to the
-        # Gate 1 policy boundary below; nothing is approved or executed here.
+        # Optionally intake the resulting ActionRequest: a consequential VALIDATE spend or
+        # bounded BUILD, or — always — a MARKET decision's canonical send_outreach action
+        # (a market action is externally consequential even at zero monetary spend, and the
+        # loop must be reconstructable through resulting_action_id). It is submitted to the
+        # Gate 1 policy boundary below; nothing is approved or executed here, and the exact
+        # market content/audience/offer/spend is frozen later by market_action_spec.
         resulting_action_id = None
-        if consequential and decision_value in ("VALIDATE", "BUILD"):
+        if (consequential and decision_value in ("VALIDATE", "BUILD")) or decision_value == "MARKET":
             payload = {
                 "recommendation_id": str(rec_id),
                 "opportunity_id": str(opportunity_id),

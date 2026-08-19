@@ -130,6 +130,13 @@ class DeployBundleWorkerB(DeployBundleWorker):
     kind = "deploy-b"
 
 
+def to_building(conn, venture_id):
+    """Move a venture DISCOVERED -> VALIDATING -> BUILDING via the sole lifecycle authority."""
+    from aidan_core import lifecycle
+    lifecycle.transition(conn, venture_id, "VALIDATING", actor="op")
+    lifecycle.transition(conn, venture_id, "BUILDING", actor="op")
+
+
 def setup_deploy(conn, slug, *, key=None, product_manifest=None, environment="staging",
                  provider_kind="fake-a", target_ref=None):
     """Full Gate-5 chain + deployment target + deploy ActionRequest (no release yet)."""

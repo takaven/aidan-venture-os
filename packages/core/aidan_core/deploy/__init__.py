@@ -20,6 +20,11 @@ from .runtime import (
     prepare_deploy_execution,
     verify_deploy,
 )
+from .state import (
+    latest_verified_deployment,
+    promote_verified_deployment,
+    verified_deployment,
+)
 from .target import TargetResult, get_deployment_target, register_deployment_target
 from .verifiers import DeploymentReleaseVerifier, deploy_verifier_registry
 
@@ -38,4 +43,7 @@ __all__ = [
     "deploy_target_path",
     "DeploymentReleaseVerifier",
     "deploy_verifier_registry",
+    "verified_deployment",
+    "latest_verified_deployment",
+    "promote_verified_deployment",
 ]

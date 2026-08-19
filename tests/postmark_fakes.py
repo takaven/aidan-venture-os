@@ -45,6 +45,7 @@ class FakePostmarkTransport:
     verifier reads it via find_outbound_by_correlation / get_outbound_message."""
 
     network_calls = 0  # stays 0 forever — a guard the suite asserts
+    origin_kind = "SIMULATED"  # a fixture-backed evidence path; can never be REAL_PROVIDER
 
     def __init__(self):
         self.outbound: dict[str, dict] = {}

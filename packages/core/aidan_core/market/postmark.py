@@ -41,6 +41,7 @@ from ..factory.verifiers import VerificationRequest, VerificationResult, Verifie
 from ..factory.workers import WorkerRegistry, WorkerResult
 from . import action as action_mod
 from . import channels as channels_mod
+from . import origin as origin_mod
 from .observation import record_market_observation
 
 POSTMARK_CHANNEL = "postmark-email"
@@ -273,10 +274,21 @@ def execute_postmark_action(conn, action_request_id: str, *, registry: WorkerReg
 def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkTransport,
                            resolver: RecipientResolver, source: PostmarkSource, actual_cost=0, actor: str = "market"):
     """Deterministically verify the exact email occurred in Postmark and, only if VERIFIED,
-    complete via the canonical proof-gated path (the ONE MARKET_ACTION proof_receipt)."""
-    return factory_runtime.verify_and_complete(
+    complete via the canonical proof-gated path (the ONE MARKET_ACTION proof_receipt) AND bind a
+    durable evidence origin taken from the transport's OWN declared origin (never a caller flag)."""
+    outcome = factory_runtime.verify_and_complete(
         conn, action_request_id, verifier_registry=postmark_verifier_registry(transport, resolver, source),
         actual_cost=actual_cost, actor=actor)
+    if getattr(outcome, "verified", False):
+        with conn.cursor() as cur:
+            cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_request_id,))
+            venture_id = cur.fetchone()[0]
+        origin_mod.record_evidence_origin(
+            conn, action_request_id,
+            origin_kind=getattr(transport, "origin_kind", origin_mod.SIMULATED),
+            provider_kind="postmark",
+            source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), actor=actor)
+    return outcome
 
 
 # --------------------------------------------------------------------------
@@ -351,6 +363,7 @@ class PostmarkHttpTransport:
     server token is supplied at construction from a trusted runtime source, never from canonical
     action state."""
 
+    origin_kind = origin_mod.REAL_PROVIDER   # a real provider-backed evidence path
     _API = "https://api.postmarkapp.com"
 
     def __init__(self, server_token: str):

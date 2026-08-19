@@ -192,6 +192,51 @@ def captured_manifest(conn, slug, *, key="q", extra_contract=None, candidate_fil
     return auth, out["manifest"].build_manifest_id
 
 
+EvalResult = namedtuple("EvalResult", "auth manifest_id worker technical dimensions overall rel")
+
+
+def full_eval(conn, slug, *, key=None, spec_overrides=None, product_manifest=None,
+              candidate_files=None, status="done", worker_claims=None, contract_extra=None,
+              reviewer_observations=(), substrate_components=None):
+    """Drive the ENTIRE Gate 5 chain (authority -> build_spec -> repo -> execution_spec
+    -> WorkerAdapter -> attempt/result -> substrate/manifest capture -> Technical ->
+    four quality dimensions) and return verdicts read back from CANONICAL state.
+
+    The worker DECLARES a candidate product_manifest (a fact); the kernel derives all
+    verdicts. Fixtures vary declared structure only — never expected-outcome flags.
+    """
+    from aidan_core.build import quality as quality_mod
+    from aidan_core.build import repository as repo_mod
+    from aidan_core.build import runtime as build_runtime
+    from aidan_core.build import technical as technical_mod
+
+    key = key or slug
+    rel = make_substrate(conn, key=f"rel-{key}", components=substrate_components)
+    auth = build_authority(conn, slug=slug, key=key)
+    contract = {"require": {"status": "done"}, "technical": dict(_TECH_CONTRACT)}
+    if contract_extra:
+        contract.update(contract_extra)
+    freeze_default_build_spec(conn, auth, expected_output_contract=contract, **(spec_overrides or {}))
+    repo_mod.register_venture_repository(conn, auth.venture_id, repository_ref=f"venture://{slug}/app")
+
+    so = {"status": status, "candidate_files": candidate_files if candidate_files is not None else GOOD_CANDIDATE}
+    if product_manifest is not None:
+        so["product_manifest"] = product_manifest
+    if worker_claims:
+        so.update(worker_claims)
+    worker = BuilderWorker(structured_output=so)
+    build_runtime.execute_build(
+        conn, auth.action_id, registry=registry_with(worker), worker_kind=worker.kind,
+        verifier_kind="structured-contract", capability_scope=_CAPS2, timeout_seconds=60, max_attempts=1)
+    cap = build_runtime.capture_and_check_build(conn, auth.action_id, substrate_release_id=rel.substrate_release_id)
+    mid = cap["manifest"].build_manifest_id
+    build_runtime.assess_build_quality(conn, auth.action_id, review_observations=reviewer_observations)
+    dims = {d: quality_mod.dimension_verdict(conn, mid, d) for d in
+            ("PRODUCT", "EXPERIENCE", "COMMERCIAL", "ANTIGENERIC")}
+    return EvalResult(auth, mid, worker, technical_mod.technical_verdict(conn, mid), dims,
+                      quality_mod.overall_verdict(conn, mid), rel)
+
+
 def dispatched_build(conn, slug, *, candidate_files=None, key="b", technical="default",
                      status="done", worker=None, max_attempts=1, register_repo=True):
     """Full Slice-1 authority + dispatch a builder that declares candidate files."""

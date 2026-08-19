@@ -1,0 +1,7 @@
+{
+  "component": "TEST_HARNESS",
+  "purpose": "deterministic test-command convention shared across ventures; infrastructure only",
+  "test_command": "pytest",
+  "success_rule": "exit_code_zero",
+  "notes": "Declares the venture's test entrypoint and the machine success rule. Carries no product concept, workflow, or UI."
+}

@@ -12,6 +12,8 @@ from collections import namedtuple
 
 from aidan_core.factory.workers import WorkerResult
 
+from factory_fakes import registry_with
+
 BuildAuthority = namedtuple(
     "BuildAuthority", "venture_id action_id decision_id recommendation_id opportunity_id"
 )
@@ -120,3 +122,60 @@ def freeze_default_build_spec(conn, auth: BuildAuthority, **overrides):
         opportunity_id=auth.opportunity_id,
         **fields,
     )
+
+
+# ---- Slice 2 helpers ---------------------------------------------------------------
+_TECH_CONTRACT = {"required_files": ["app/main.py"], "forbidden_files": [], "required_commands": ["pytest"]}
+_CAPS2 = ["READ_REPOSITORY", "WRITE_ISOLATED_WORKSPACE", "PRODUCE_PATCH"]
+GOOD_CANDIDATE = [{"path": "app/main.py", "content": "def run():\n    return 'clinic-preauth'\n"}]
+
+
+class ScriptedBuilderWorker(BuilderWorker):
+    """Returns a different structured_output per attempt (drives retry-then-correct)."""
+
+    def __init__(self, outputs):
+        super().__init__()
+        self._outputs = list(outputs)
+
+    def execute(self, request):
+        self.calls += 1
+        self.last_request = request
+        out = self._outputs[min(self.calls - 1, len(self._outputs) - 1)]
+        return WorkerResult(
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.action_request_id}:{self.calls}",
+            reported_outcome="success", worker_version="test", structured_output=out,
+        )
+
+
+def make_substrate(conn, *, key="rel", sha="sha-0016", components=None):
+    from aidan_core.build import substrate as S
+
+    return S.create_substrate_release(
+        conn, release_key=key, source_sha=sha,
+        components=components or ["CONFIG_BOUNDARY", "TEST_HARNESS"],
+    )
+
+
+def dispatched_build(conn, slug, *, candidate_files=None, key="b", technical="default",
+                     status="done", worker=None, max_attempts=1, register_repo=True):
+    """Full Slice-1 authority + dispatch a builder that declares candidate files."""
+    from aidan_core.build import repository as repo_mod
+    from aidan_core.build import runtime as build_runtime
+
+    auth = build_authority(conn, slug=slug, key=key)
+    tech = _TECH_CONTRACT if technical == "default" else technical
+    contract = {"require": {"status": "done"}}
+    if tech is not None:
+        contract["technical"] = tech
+    freeze_default_build_spec(conn, auth, expected_output_contract=contract)
+    if register_repo:
+        repo_mod.register_venture_repository(conn, auth.venture_id, repository_ref=f"venture://{slug}/app")
+    if worker is None:
+        so = {"status": status, "candidate_files": candidate_files if candidate_files is not None else GOOD_CANDIDATE}
+        worker = BuilderWorker(structured_output=so)
+    dispatch, result = build_runtime.execute_build(
+        conn, auth.action_id, registry=registry_with(worker), worker_kind=worker.kind,
+        verifier_kind="structured-contract", capability_scope=_CAPS2,
+        timeout_seconds=60, max_attempts=max_attempts,
+    )
+    return auth, worker, dispatch, result

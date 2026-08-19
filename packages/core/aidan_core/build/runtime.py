@@ -27,12 +27,15 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from .. import policy
-from ..errors import BuildAuthorityError
+from ..errors import BuildAuthorityError, NotFoundError
 from ..factory import runtime as factory_runtime
 from ..factory import spec as spec_mod
 from ..factory.workers import WorkerRegistry
+from . import manifest as manifest_mod
 from . import repository as repo_mod
 from . import spec as build_spec_mod
+from . import technical as technical_mod
+from . import workspace as ws
 
 
 @dataclass(frozen=True)
@@ -199,3 +202,46 @@ def execute_build(
         lease_seconds=lease_seconds, clock=clock, actor=actor,
     )
     return dispatch, result
+
+
+def capture_and_check_build(
+    conn,
+    action_request_id: str,
+    *,
+    substrate_release_id: str,
+    execution_attempt_id: Optional[str] = None,
+    workspace_root: Optional[str] = None,
+    source_root=None,
+    actor: str = "factory",
+) -> dict:
+    """Slice 2 composition: materialize the attempt's candidate output into a
+    root-contained venture workspace, freeze the immutable kernel-hashed
+    ``build_manifest``, and record deterministic Technical evidence.
+
+    Evidence only — this creates NO proof, NO lifecycle transition, and NO canonical
+    BUILD success. Technical PASS/FAIL is independent of the Gate 4 execution status.
+    Candidate files are read from the DURABLE execution_result (worker claim); the
+    kernel owns the bytes and hashes, so a worker cannot forge file identity.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT execution_attempt_id, raw_payload FROM execution_result "
+            "WHERE action_request_id = %s ORDER BY received_at DESC, id DESC LIMIT 1",
+            (action_request_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise NotFoundError(f"no captured worker result for action {action_request_id}")
+    attempt_id = execution_attempt_id or row[0]
+    structured = dict((row[1] or {}).get("structured_output", {}))
+    candidate_files = list(structured.get("candidate_files", []))
+
+    workspace_root = workspace_root or ws.create_workspace()
+    m = manifest_mod.capture_build_manifest(
+        conn, action_request_id, execution_attempt_id=attempt_id,
+        substrate_release_id=substrate_release_id, candidate_files=candidate_files,
+        workspace_root=workspace_root, source_root=source_root, actor=actor,
+    )
+    checks = technical_mod.run_technical_checks(conn, m.build_manifest_id, workspace_root, actor=actor)
+    return {"manifest": m, "workspace_root": workspace_root,
+            "verdict": checks["verdict"], "checks": checks["checks"]}

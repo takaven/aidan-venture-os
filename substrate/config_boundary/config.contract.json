@@ -1,0 +1,8 @@
+{
+  "component": "CONFIG_BOUNDARY",
+  "purpose": "environment-configuration convention shared across ventures; infrastructure only",
+  "required_env": ["APP_ENV"],
+  "optional_env": ["LOG_LEVEL"],
+  "secret_files_forbidden": [".env", ".env.*"],
+  "notes": "Declares how a venture reads configuration and which files must never be committed. Carries no product concept, workflow, or UI."
+}

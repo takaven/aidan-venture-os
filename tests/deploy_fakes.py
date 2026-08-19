@@ -85,6 +85,49 @@ def deploy_action(conn, venture_id, *, key, amount=0, required_autonomy=0):
         return cur.fetchone()[0]
 
 
+class DeployBundleWorker:
+    """A deploy worker that MATERIALIZES the release bundle + health marker into the real
+    venture-isolated target. ``mode`` produces compliant or adversarial deployments; the
+    worker's self-report is inert (only the deterministic verifier decides)."""
+
+    kind = "deploy-a"
+
+    def __init__(self, *, mode="compliant", structured_output=None):
+        self.mode = mode
+        self._out = structured_output or {"deployed": True}
+        self.calls = 0
+        self.last_request = None
+
+    def execute(self, request):  # no DB access
+        import shutil
+        from pathlib import Path
+
+        self.calls += 1
+        self.last_request = request
+        block = dict((request.task_payload or {}).get("deploy", {}))
+        tp = Path(block["target_path"])
+        shutil.rmtree(tp, ignore_errors=True)  # deterministic fresh deploy
+        if self.mode != "nothing":
+            for f in block.get("deploy_bundle", []):
+                content = f["content"]                       # lossless latin-1 of exact bytes
+                if self.mode == "wrong_bytes" and f["path"].endswith("main.py"):
+                    content = content + "TAMPERED"
+                dest = tp / "release" / f["path"]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content.encode("latin-1"))
+            if self.mode not in ("no_health",):
+                hf = tp / ".deploy" / "health"
+                hf.parent.mkdir(parents=True, exist_ok=True)
+                hf.write_bytes(b"ok")
+        return WorkerResult(
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.action_request_id}:{self.calls}",
+            reported_outcome="success", worker_version="test", structured_output=self._out)
+
+
+class DeployBundleWorkerB(DeployBundleWorker):
+    kind = "deploy-b"
+
+
 def setup_deploy(conn, slug, *, key=None, product_manifest=None, environment="staging",
                  provider_kind="fake-a", target_ref=None):
     """Full Gate-5 chain + deployment target + deploy ActionRequest (no release yet)."""

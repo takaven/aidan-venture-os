@@ -285,8 +285,7 @@ def test_26_A6_valid_binding_creates_spec(migrated):
     s = setup_deploy(migrated, "d26")
     _release(migrated, s)
     dispatch = deploy_runtime.prepare_deploy_execution(
-        migrated, s.deploy_action_id, worker_kind="deploy-a", verifier_kind="structured-contract",
-        timeout_seconds=60, max_attempts=1)
+        migrated, s.deploy_action_id, worker_kind="deploy-a", timeout_seconds=60, max_attempts=1)
     row = spec_mod.get_execution_spec(migrated, s.deploy_action_id)
     block = row[4]["deploy"]
     assert block["release_hash"] == dispatch.release_hash
@@ -317,12 +316,12 @@ def test_29_30_pre_release_authorization_insufficient(migrated):
     worker = DeployWorker()
     with pytest.raises(ApprovalRequiredError):
         deploy_runtime.execute_deploy(migrated, aid, registry=registry_with(worker),
-                                      worker_kind="deploy-a", verifier_kind="structured-contract")
+                                      worker_kind="deploy-a")
     assert worker.calls == 0
     fresh = factory_runtime.request_dispatch_authorization(migrated, aid)  # post-spec
     approvals.approve(migrated, fresh.approval_id, decided_by="board")
     _, res = deploy_runtime.execute_deploy(migrated, aid, registry=registry_with(worker),
-                                           worker_kind="deploy-a", verifier_kind="structured-contract")
+                                           worker_kind="deploy-a")
     assert res.dispatched is True and worker.calls == 1
 
 
@@ -332,7 +331,7 @@ def test_29_30_pre_release_authorization_insufficient(migrated):
 def _dispatch(conn, s, worker):
     _release(conn, s)
     return deploy_runtime.execute_deploy(conn, s.deploy_action_id, registry=registry_with(worker),
-                                         worker_kind=worker.kind, verifier_kind="structured-contract")
+                                         worker_kind=worker.kind)
 
 
 def test_31_deploy_worker_uses_workeradapter(migrated):

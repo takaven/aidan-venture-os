@@ -12,8 +12,16 @@ transition, and no deployment_record live in Slice 1.
 from __future__ import annotations
 
 from .release import ReleaseResult, create_release_candidate, get_release_candidate
-from .runtime import DeployDispatch, DeployInput, execute_deploy, prepare_deploy_execution
+from .runtime import (
+    DeployDispatch,
+    DeployInput,
+    deploy_target_path,
+    execute_deploy,
+    prepare_deploy_execution,
+    verify_deploy,
+)
 from .target import TargetResult, get_deployment_target, register_deployment_target
+from .verifiers import DeploymentReleaseVerifier, deploy_verifier_registry
 
 __all__ = [
     "TargetResult",
@@ -26,4 +34,8 @@ __all__ = [
     "DeployDispatch",
     "prepare_deploy_execution",
     "execute_deploy",
+    "verify_deploy",
+    "deploy_target_path",
+    "DeploymentReleaseVerifier",
+    "deploy_verifier_registry",
 ]

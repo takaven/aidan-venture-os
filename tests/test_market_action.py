@@ -277,9 +277,10 @@ def test_36_38_40_44_worker_claims_inert_no_market_truth(migrated):
         # (market_observation exists as of Slice 2, but is written only by ingestion)
         cur.execute("SELECT count(*) FROM market_observation WHERE action_request_id = %s", (a,))
         assert cur.fetchone()[0] == 0
-        # interpretation remains a Slice-3 concern -> table still absent
-        cur.execute("SELECT to_regclass('public.market_interpretation')")
-        assert cur.fetchone()[0] is None
+        # interpretation exists as of Slice 3, but the dispatch path creates none for this action
+        cur.execute("SELECT count(*) FROM market_interpretation mi JOIN market_action_spec ms "
+                    "ON ms.id = mi.market_action_spec_id WHERE ms.action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0
         cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s", (a,))
         assert cur.fetchone()[0] == 0                                 # no market proof semantics
 

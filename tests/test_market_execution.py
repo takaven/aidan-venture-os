@@ -204,10 +204,17 @@ def test_36_37_external_content_has_no_authority(migrated):
     assert _lifecycle(migrated, r.setup.venture_id) == "OPERATING"
 
 
-def test_39_no_interpretation_table(migrated):
+def test_39_observation_ingestion_creates_no_interpretation(migrated):
+    # Slice 3 adds market_interpretation, but Slice-2 ingestion still performs NO interpretation:
+    # recording an external observation creates zero interpretation rows for the action.
+    r = _spec_of(migrated, "o39")
+    _obs(migrated, r.setup, r.spec, external_event_id="e", observation_type="REPLIED")
     with migrated.cursor() as cur:
-        cur.execute("SELECT to_regclass('public.market_interpretation'), to_regclass('public.market_metric')")
-        assert cur.fetchone() == (None, None)
+        cur.execute("SELECT count(*) FROM market_interpretation WHERE market_action_spec_id = %s",
+                    (r.spec.market_action_spec_id,))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT to_regclass('public.market_metric')")  # no metrics table exists
+        assert cur.fetchone()[0] is None
 
 
 def test_40_no_response_not_ingestible(migrated):

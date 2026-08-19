@@ -241,14 +241,30 @@ def test_28_retry_same_release_new_attempt(migrated):
     s = setup_deploy(migrated, "x28")
     rc = _release(migrated, s)
     _deploy(migrated, s, worker=DeployBundleWorker(mode="wrong_bytes"), max_attempts=2)
+    a1, e1 = _latest_attempt_and_result(migrated, s.deploy_action_id)
     assert _verify(migrated, s).verified is False           # attempt 1 rejected, retryable
     _deploy(migrated, s, worker=DeployBundleWorker(mode="compliant"), max_attempts=2)
+    a2, e2 = _latest_attempt_and_result(migrated, s.deploy_action_id)
     out = _verify(migrated, s)
     assert out.status == "SUCCEEDED" and out.verified is True
+    # same immutable release; new distinct attempt; distinct external result identity
+    assert release_mod.get_release_candidate(migrated, s.deploy_action_id)[8] == rc.release_hash
+    assert a1 != a2 and e1 != e2
     with migrated.cursor() as cur:
         cur.execute("SELECT count(*) FROM execution_attempt WHERE action_request_id = %s", (s.deploy_action_id,))
-        assert cur.fetchone()[0] == 2                       # two attempts, same release_candidate
-    assert release_mod.get_release_candidate(migrated, s.deploy_action_id)[8] == rc.release_hash
+        assert cur.fetchone()[0] == 2                       # attempt-1 history retained
+        # the VERIFIED proof is bound to the successful (second) attempt
+        cur.execute("SELECT execution_attempt_id FROM proof_receipt WHERE action_request_id = %s "
+                    "AND result = 'VERIFIED'", (s.deploy_action_id,))
+        assert str(cur.fetchone()[0]) == str(a2)
+
+
+def _latest_attempt_and_result(conn, aid):
+    with conn.cursor() as cur:
+        cur.execute("SELECT execution_attempt_id, external_result_id FROM execution_result "
+                    "WHERE action_request_id = %s ORDER BY received_at DESC, id DESC LIMIT 1", (aid,))
+        row = cur.fetchone()
+        return (str(row[0]), row[1]) if row else (None, None)
 
 
 def test_30_lifecycle_unchanged_after_verified_deploy(migrated):

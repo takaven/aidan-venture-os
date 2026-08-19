@@ -120,7 +120,9 @@ class DeployBundleWorker:
                 hf.parent.mkdir(parents=True, exist_ok=True)
                 hf.write_bytes(b"ok")
         return WorkerResult(
-            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.action_request_id}:{self.calls}",
+            # attempt-scoped identity: a retry is a new attempt, so its external result
+            # id must differ (Gate-4 forbids one external_result_id across attempts).
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.attempt_id}",
             reported_outcome="success", worker_version="test", structured_output=self._out)
 
 

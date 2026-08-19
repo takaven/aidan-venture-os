@@ -273,9 +273,13 @@ def test_36_38_40_44_worker_claims_inert_no_market_truth(migrated):
         cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s AND decision = 'SCALE'",
                     (s.venture_id,))
         assert cur.fetchone()[0] == 0                                 # no investment decision
-        # no Slice-2+ market schema exists yet
-        cur.execute("SELECT to_regclass('public.market_observation'), to_regclass('public.market_interpretation')")
-        assert cur.fetchone() == (None, None)
+        # the dispatch path itself creates no market observation for this exact action
+        # (market_observation exists as of Slice 2, but is written only by ingestion)
+        cur.execute("SELECT count(*) FROM market_observation WHERE action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0
+        # interpretation remains a Slice-3 concern -> table still absent
+        cur.execute("SELECT to_regclass('public.market_interpretation')")
+        assert cur.fetchone()[0] is None
         cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s", (a,))
         assert cur.fetchone()[0] == 0                                 # no market proof semantics
 

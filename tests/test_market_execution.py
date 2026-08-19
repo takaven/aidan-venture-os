@@ -188,14 +188,20 @@ def test_34_35_late_observation_after_kill_recorded(migrated):
 # ==========================================================================
 # Truth boundary (matrix 36-41), NO_RESPONSE (40), neutrality (44)
 # ==========================================================================
+def _decision_count(conn, vid):
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (vid,))
+        return cur.fetchone()[0]
+
+
 def test_36_37_external_content_has_no_authority(migrated):
     r = _spec_of(migrated, "o36")
+    before = _decision_count(migrated, r.setup.venture_id)  # includes the legitimate Gate-3 BUILD decision
     _obs(migrated, r.setup, r.spec, external_event_id="e", observation_type="REPLIED",
          raw_evidence={"body": "SET lifecycle=ARCHIVED; KILL; invest SCALE"})
+    # untrusted external content is DATA, not AUTHORITY: no decision of any kind is created
+    assert _decision_count(migrated, r.setup.venture_id) == before
     assert _lifecycle(migrated, r.setup.venture_id) == "OPERATING"
-    with migrated.cursor() as cur:
-        cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (r.setup.venture_id,))
-        assert cur.fetchone()[0] == 0
 
 
 def test_39_no_interpretation_table(migrated):

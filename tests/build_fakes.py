@@ -156,6 +156,42 @@ def make_substrate(conn, *, key="rel", sha="sha-0016", components=None):
     )
 
 
+# A candidate product descriptor that satisfies the DEFAULT_INTENT build_spec.
+GOOD_PRODUCT_MANIFEST = {
+    "buyer": "independent physiotherapy clinics",
+    "workflows": ["calendar -> detect billable session -> draft pre-auth -> track approval"],
+    "features": ["preauth_drafting", "approval_tracking"],
+    "differentiators_implemented": ["payer-specific pre-auth rules engine", "calendar-native trigger"],
+    "vocabulary": ["pre-auth", "payer", "clinic", "billable session"],
+    "states": ["empty", "loading", "error"],
+    "cta": ["submit_preauth"],
+    "dead_ends": [],
+}
+
+
+def captured_manifest(conn, slug, *, key="q", extra_contract=None, candidate_files=None):
+    """Full Slice-1+2 path: freeze build_spec, register repo, dispatch, capture manifest
+    (auto workspace) + Technical checks. Returns (auth, build_manifest_id)."""
+    from aidan_core.build import repository as repo_mod
+    from aidan_core.build import runtime as build_runtime
+
+    rel = make_substrate(conn, key=f"rel-{key}")
+    contract = {"require": {"status": "done"}, "technical": _TECH_CONTRACT}
+    if extra_contract:
+        contract.update(extra_contract)
+    auth = build_authority(conn, slug=slug, key=key)
+    freeze_default_build_spec(conn, auth, expected_output_contract=contract)
+    repo_mod.register_venture_repository(conn, auth.venture_id, repository_ref=f"venture://{slug}/app")
+    worker = BuilderWorker(structured_output={
+        "status": "done", "candidate_files": candidate_files or GOOD_CANDIDATE})
+    build_runtime.execute_build(
+        conn, auth.action_id, registry=registry_with(worker), worker_kind=worker.kind,
+        verifier_kind="structured-contract", capability_scope=_CAPS2, timeout_seconds=60, max_attempts=1)
+    out = build_runtime.capture_and_check_build(
+        conn, auth.action_id, substrate_release_id=rel.substrate_release_id)
+    return auth, out["manifest"].build_manifest_id
+
+
 def dispatched_build(conn, slug, *, candidate_files=None, key="b", technical="default",
                      status="done", worker=None, max_attempts=1, register_repo=True):
     """Full Slice-1 authority + dispatch a builder that declares candidate files."""

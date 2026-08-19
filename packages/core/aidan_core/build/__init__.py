@@ -13,9 +13,15 @@ deployment, and no lifecycle transition live in Slice 1.
 from __future__ import annotations
 
 from .manifest import ManifestResult, capture_build_manifest, get_build_manifest
+from .quality import (
+    dimension_verdict,
+    overall_verdict,
+    run_quality_assessment,
+)
 from .repository import RepositoryResult, register_venture_repository
 from .runtime import (
     BuildInput,
+    assess_build_quality,
     capture_and_check_build,
     execute_build,
     prepare_build_execution,
@@ -43,4 +49,8 @@ __all__ = [
     "run_technical_checks",
     "technical_verdict",
     "capture_and_check_build",
+    "run_quality_assessment",
+    "dimension_verdict",
+    "overall_verdict",
+    "assess_build_quality",
 ]

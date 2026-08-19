@@ -32,6 +32,7 @@ from ..factory import runtime as factory_runtime
 from ..factory import spec as spec_mod
 from ..factory.workers import WorkerRegistry
 from . import manifest as manifest_mod
+from . import quality as quality_mod
 from . import repository as repo_mod
 from . import spec as build_spec_mod
 from . import technical as technical_mod
@@ -245,3 +246,55 @@ def capture_and_check_build(
     checks = technical_mod.run_technical_checks(conn, m.build_manifest_id, workspace_root, actor=actor)
     return {"manifest": m, "workspace_root": workspace_root,
             "verdict": checks["verdict"], "checks": checks["checks"]}
+
+
+def assess_build_quality(
+    conn,
+    action_request_id: str,
+    *,
+    build_manifest_id: Optional[str] = None,
+    execution_attempt_id: Optional[str] = None,
+    product_descriptor: Optional[dict] = None,
+    review_observations=(),
+    actor: str = "factory",
+) -> dict:
+    """Slice 3 composition: evaluate Product/Experience/Commercial/AntiGeneric for a
+    captured manifest and return per-dimension + overall verdicts.
+
+    The candidate's declared product structure is read from the durable
+    execution_result (worker claim) unless supplied. Verdicts are kernel-derived;
+    worker/reviewer self-reports never set them. No proof, no lifecycle, no deploy.
+    """
+    if build_manifest_id is None:
+        attempt_id = execution_attempt_id
+        if attempt_id is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT execution_attempt_id FROM execution_result WHERE action_request_id = %s "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1", (action_request_id,))
+                row = cur.fetchone()
+            if row is None:
+                raise NotFoundError(f"no captured worker result for action {action_request_id}")
+            attempt_id = row[0]
+        m = manifest_mod.get_build_manifest(conn, attempt_id)
+        if m is None:
+            raise NotFoundError(f"no build_manifest for attempt {attempt_id}")
+        build_manifest_id = m[0]
+
+    if product_descriptor is None:
+        with conn.cursor() as cur:
+            if execution_attempt_id is not None:
+                cur.execute(
+                    "SELECT raw_payload FROM execution_result WHERE execution_attempt_id = %s "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1", (execution_attempt_id,))
+            else:
+                cur.execute(
+                    "SELECT raw_payload FROM execution_result WHERE action_request_id = %s "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1", (action_request_id,))
+            row = cur.fetchone()
+        structured = dict((row[1] or {}).get("structured_output", {})) if row else {}
+        product_descriptor = dict(structured.get("product_manifest", {}))
+
+    return quality_mod.run_quality_assessment(
+        conn, build_manifest_id, product_descriptor=product_descriptor,
+        review_observations=review_observations, actor=actor)

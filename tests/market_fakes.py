@@ -41,6 +41,62 @@ class OutreachWorkerB(OutreachWorker):
     kind = "outreach-b"
 
 
+class ChannelWorker:
+    """A channel worker that MATERIALIZES the exact authorized outbound envelope + a
+    deterministic acceptance into the controlled outbox. ``mode`` produces compliant or
+    adversarial sends; the worker's self-report is inert (only the verifier decides)."""
+
+    kind = "outreach-a"
+
+    def __init__(self, *, mode="compliant", structured_output=None):
+        self.mode = mode
+        self._out = structured_output or {"status": "queued"}
+        self.calls = 0
+        self.last_request = None
+
+    def execute(self, request):
+        from aidan_core.market import channels as ch
+
+        self.calls += 1
+        self.last_request = request
+        m = dict((request.task_payload or {}).get("market", {}))
+        if self.mode != "nothing":
+            content, audience = m["content"], m["audience_ref"]
+            if self.mode == "wrong_content":
+                content = content + " TAMPERED"
+            if self.mode == "wrong_audience":
+                audience = "aud://WRONG"
+            env = {"content": content, "audience_ref": audience, "channel_kind": m["channel_kind"],
+                   "source_instance_ref": m["source_instance_ref"], "action_spec_hash": m["action_spec_hash"],
+                   "market_action_spec_id": m["market_action_spec_id"]}
+            ch.write_envelope(m["outbox_path"], env, ch.acceptance_id(m["source_instance_ref"], request.attempt_id))
+        return WorkerResult(
+            worker_kind=self.kind, external_result_id=f"{self.kind}:{request.attempt_id}",
+            reported_outcome="success", worker_version="test", structured_output=self._out)
+
+
+class ChannelWorkerB(ChannelWorker):
+    kind = "outreach-b"
+
+
+MarketRun = namedtuple("MarketRun", "setup action_id spec worker verify")
+
+
+def market_run(conn, slug, *, mode="compliant", key=None):
+    """OPERATING venture -> freeze market_action_spec -> dispatch channel worker -> verify."""
+    from aidan_core.market import runtime as market_runtime
+    from factory_fakes import registry_with
+
+    key = key or slug
+    s = operating_setup(conn, slug, key=key)
+    a = market_action(conn, s.venture_id, key=key)
+    ms = freeze_outreach(conn, s, a)
+    w = ChannelWorker(mode=mode)
+    market_runtime.execute_market_action(conn, a, registry=registry_with(w), worker_kind=w.kind)
+    out = market_runtime.verify_market_action(conn, a, actual_cost=0)
+    return MarketRun(s, a, ms, w, out)
+
+
 def operating_setup(conn, slug, *, key=None, max_spend="100") -> MarketSetup:
     """OPERATING venture (via the real Gate-6 chain) + a Gate-3 OUTREACH validation_test."""
     from aidan_core.deploy import state as deploy_state

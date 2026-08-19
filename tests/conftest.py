@@ -27,6 +27,7 @@ def database_url() -> str | None:
 # Objects owned by migrations 0001–0019; dropped for a clean slate per test.
 # 0019 adds market_action_spec and ALTERs the execution_spec capability CHECK
 # (that constraint drops with execution_spec CASCADE).
+# 0020 adds market_observation.
 # 0018 adds deployment_target + release_candidate and ALTERs the execution_spec
 # capability CHECK (that constraint drops with execution_spec CASCADE).
 # 0017 adds build_quality_evidence + build_quality_assessment.
@@ -42,6 +43,7 @@ def database_url() -> str | None:
 # 0013 adds execution_artifact and ALTERs execution_attempt/proof_receipt (dropped
 # with their tables CASCADE below).
 _DROP_SQL = """
+DROP TABLE IF EXISTS market_observation CASCADE;
 DROP TABLE IF EXISTS market_action_spec CASCADE;
 DROP TABLE IF EXISTS release_candidate CASCADE;
 DROP TABLE IF EXISTS deployment_target CASCADE;

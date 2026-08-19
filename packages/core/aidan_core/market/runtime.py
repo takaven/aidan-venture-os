@@ -24,8 +24,13 @@ from ..factory import runtime as factory_runtime
 from ..factory import spec as spec_mod
 from ..factory.workers import WorkerRegistry
 from . import action as action_mod
+from . import channels as channels_mod
+from .verifiers import market_verifier_registry
 
 MARKET_CAPABILITIES = ("SEND_OUTREACH",)
+# The market verifier is forced: a market action can only be completed by the deterministic
+# market-action verifier, never by a worker-self-report verifier.
+MARKET_VERIFIER_KIND = "market-action"
 
 
 @dataclass(frozen=True)
@@ -72,26 +77,34 @@ class MarketDispatch:
     execution_spec_created: bool
 
 
-def _market_task_payload(ms_row) -> dict:
-    (_id, _v, _arid, _opp, _vt, channel_kind, audience_ref, _prov, content, content_hash,
+def _market_payload_and_contract(ms_row) -> tuple:
+    (_id, venture_id, _arid, _opp, _vt, channel_kind, audience_ref, _prov, content, content_hash,
      offer_ref, price_amount, price_currency, offer_terms, authorized_spend, spend_currency,
      action_spec_hash, _created) = ms_row
-    return {
-        "market": {
-            "market_action_spec_id": str(_id),
-            "action_spec_hash": action_spec_hash,
-            "channel_kind": channel_kind,
-            "audience_ref": audience_ref,
-            "content": content,
-            "content_hash": content_hash,
-            "offer_ref": offer_ref,
-            "price_amount": None if price_amount is None else str(price_amount),
-            "price_currency": price_currency,
-            "offer_terms": offer_terms,
-            "authorized_spend_amount": str(authorized_spend),
-            "spend_currency": spend_currency,
-        }
+    source_instance = channels_mod.source_instance_ref(venture_id, channel_kind)
+    outbox = channels_mod.outbox_path(venture_id, channel_kind, _arid)
+    market = {
+        "market_action_spec_id": str(_id),
+        "action_spec_hash": action_spec_hash,
+        "channel_kind": channel_kind,
+        "audience_ref": audience_ref,
+        "content": content,
+        "content_hash": content_hash,
+        "offer_ref": offer_ref,
+        "price_amount": None if price_amount is None else str(price_amount),
+        "price_currency": price_currency,
+        "offer_terms": offer_terms,
+        "authorized_spend_amount": str(authorized_spend),
+        "spend_currency": spend_currency,
+        "source_instance_ref": source_instance,
+        "outbox_path": outbox,
     }
+    contract = {"market": {
+        "outbox_path": outbox, "content_hash": content_hash, "audience_ref": audience_ref,
+        "channel_kind": channel_kind, "source_instance_ref": source_instance,
+        "market_action_spec_id": str(_id), "action_spec_hash": action_spec_hash,
+    }}
+    return {"market": market}, contract
 
 
 def prepare_market_execution(
@@ -99,25 +112,29 @@ def prepare_market_execution(
     action_request_id: str,
     *,
     worker_kind: str,
-    verifier_kind: str,
     timeout_seconds: int = 60,
     max_attempts: int = 1,
     capability_scope=MARKET_CAPABILITIES,
     actor: str = "market",
 ) -> MarketDispatch:
     """Bind the frozen market_action_spec into an immutable Gate-4 execution spec.
-    Idempotent; does not dispatch."""
+
+    Forces the deterministic market-action verifier, embeds the exact outbound intent +
+    venture/source-scoped outbox for the channel worker, and freezes the market
+    verification contract for the verifier. Idempotent; the generic ``create_execution_spec``
+    market guard independently rejects any mismatch.
+    """
     ms_row = action_mod.get_market_action_spec(conn, action_request_id)
     if ms_row is None:
         raise MarketAuthorityError(
             f"no frozen market_action_spec for action {action_request_id}; "
             "a market execution cannot be prepared from free-form intent")
-    task_payload = _market_task_payload(ms_row)
+    task_payload, contract = _market_payload_and_contract(ms_row)
     spec = spec_mod.create_execution_spec(
-        conn, action_request_id, worker_kind=worker_kind, verifier_kind=verifier_kind,
+        conn, action_request_id, worker_kind=worker_kind, verifier_kind=MARKET_VERIFIER_KIND,
         timeout_seconds=timeout_seconds, max_attempts=max_attempts,
         capability_scope=list(capability_scope), task_payload=task_payload,
-        expected_output_contract={"market": {"content_hash": ms_row[9]}}, actor=actor)
+        expected_output_contract=contract, actor=actor)
     return MarketDispatch(
         action_request_id=str(action_request_id), market_action_spec_id=str(ms_row[0]),
         action_spec_hash=ms_row[16], channel_kind=ms_row[5],
@@ -130,7 +147,6 @@ def execute_market_action(
     *,
     registry: WorkerRegistry,
     worker_kind: str,
-    verifier_kind: str = "structured-contract",
     timeout_seconds: int = 60,
     max_attempts: int = 1,
     capability_scope=MARKET_CAPABILITIES,
@@ -142,16 +158,25 @@ def execute_market_action(
 ):
     """Bind market authority and dispatch the channel worker through the Gate 4 runtime.
 
-    Slice 1 stops at result capture: NO external send, NO observation, NO market proof.
-    The worker result is a CLAIM only. Fresh post-spec authorization is obtained by the
-    Gate 4 runtime.
+    Dispatch captures the worker result as a CLAIM only; canonical market-action SUCCESS
+    comes solely from ``verify_market_action`` (the deterministic verifier + proof). Fresh
+    post-spec authorization is obtained by the Gate 4 runtime.
     """
     dispatch = prepare_market_execution(
-        conn, action_request_id, worker_kind=worker_kind, verifier_kind=verifier_kind,
-        timeout_seconds=timeout_seconds, max_attempts=max_attempts,
-        capability_scope=capability_scope, actor=actor)
+        conn, action_request_id, worker_kind=worker_kind, timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts, capability_scope=capability_scope, actor=actor)
     result = factory_runtime.execute_action(
         conn, action_request_id, registry=registry, workspace_ref=f"market://{dispatch.channel_kind}",
         approval_threshold=approval_threshold, safety_mode=safety_mode,
         lease_seconds=lease_seconds, clock=clock, actor=actor)
     return dispatch, result
+
+
+def verify_market_action(conn, action_request_id: str, *, actual_cost=0, actor: str = "market"):
+    """Deterministically verify that the exact authorized action occurred in the controlled
+    channel and, only if VERIFIED, complete via the canonical proof-gated path — the ONE
+    proof_receipt (verification_type MARKET_ACTION). Proves the ACTION, not any outcome.
+    """
+    return factory_runtime.verify_and_complete(
+        conn, action_request_id, verifier_registry=market_verifier_registry(),
+        actual_cost=actual_cost, actor=actor)

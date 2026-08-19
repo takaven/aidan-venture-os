@@ -201,8 +201,7 @@ def test_29_M7_exact_binding_accepted(migrated):
     s = operating_setup(migrated, "m29")
     a = market_action(migrated, s.venture_id, key="m29")
     freeze_outreach(migrated, s, a)
-    dispatch = market_runtime.prepare_market_execution(
-        migrated, a, worker_kind="outreach-a", verifier_kind="structured-contract")
+    dispatch = market_runtime.prepare_market_execution(migrated, a, worker_kind="outreach-a")
     block = spec_mod.get_execution_spec(migrated, a)[4]["market"]
     assert block["action_spec_hash"] == dispatch.action_spec_hash
 

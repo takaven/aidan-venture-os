@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -547,10 +548,16 @@ def reconcile_postmark_recovery(conn, action_request_id: str, *, transport: Post
 # --------------------------------------------------------------------------
 # provider-event normalization -> existing market_observation
 # --------------------------------------------------------------------------
+class WebhookAuthError(MarketAuthorityError):
+    """Webhook Basic-Auth failed — a DISTINCT authentication failure (the ingress maps it to HTTP
+    401), separate from a provenance/reconciliation rejection."""
+
+
 def _authenticate(source: PostmarkSource, auth_header: str) -> None:
     expected = "Basic " + base64.b64encode(f"{source.webhook_user}:{source.webhook_secret}".encode()).decode()
-    if not auth_header or auth_header != expected:
-        raise MarketAuthorityError("Postmark webhook authentication failed (Basic-Auth mismatch)")
+    # constant-time comparison (avoid a timing side-channel on the shared webhook secret)
+    if not auth_header or not hmac.compare_digest(str(auth_header), expected):
+        raise WebhookAuthError("Postmark webhook authentication failed (Basic-Auth mismatch)")
 
 
 def _spec_for_message(conn, message_id: str, transport: PostmarkTransport):

@@ -81,8 +81,11 @@ def _record_ambiguous_recovery_required(conn, action_id, attempt_id, detail):
     guard), and the budget reservation is HELD (the spend may have occurred). No ordinary retry may
     dispatch again; only explicit recovery may reconcile the exact provider result later."""
     with db.transaction(conn) as cur:
+        # failure_class uses the existing canonical RECOVERY_REQUIRED (migration-0014 CHECK set); the
+        # more specific AMBIGUOUS_EXTERNAL_EFFECT cause is preserved in the audit event + RuntimeResult,
+        # never duplicated into a constrained column (no schema/migration change).
         cur.execute(
-            "UPDATE execution_attempt SET status = 'FAILED', failure_class = 'AMBIGUOUS_EXTERNAL_EFFECT', "
+            "UPDATE execution_attempt SET status = 'FAILED', failure_class = 'RECOVERY_REQUIRED', "
             "updated_at = now() WHERE id = %s",
             (attempt_id,),
         )

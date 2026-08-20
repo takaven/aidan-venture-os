@@ -65,27 +65,35 @@ class FakePostmarkTransport:
         return self.outbound.get(message_id)
 
 
-class StubRealPostmarkTransport(pm.PostmarkHttpTransport):
-    """A test stand-in that IS a genuine ``PostmarkHttpTransport`` (so the trusted origin
-    derivation classifies it REAL_PROVIDER) but overrides only the network I/O with an in-memory
-    store — proving the trust boundary without a live network call (Slice-4 discipline §25)."""
+def stub_postmark_http(store):
+    """A drop-in for ``postmark._http_request`` backed by an in-memory Postmark HTTP API. Tests
+    patch the LOW-LEVEL network boundary beneath the GENUINE production PostmarkHttpTransport —
+    they never subclass/replace the transport object (Slice-4 §4/§5). No network."""
+    import json
 
-    def __init__(self):
-        super().__init__("STUB-REAL-TOKEN-not-used")
-        self.outbound: dict[str, dict] = {}
-        self._n = 0
+    def _req(method, url, *, headers, body=None):
+        if method == "POST" and url.endswith("/email"):
+            data = json.loads(body)
+            store["_n"] = store.get("_n", 0) + 1
+            mid = f"pmhttp-{data['Metadata']['market_action_spec']}-{store['_n']}"
+            store[mid] = {"MessageID": mid, "MessageStream": data["MessageStream"], "From": data["From"],
+                          "To": [{"Email": data["To"]}], "Subject": data["Subject"],
+                          "TextBody": data["TextBody"], "Metadata": data["Metadata"], "Status": "Sent"}
+            return 200, {"MessageID": mid}
+        if method == "GET" and "/messages/outbound/" in url:
+            mid = url.split("/messages/outbound/")[1].split("/details")[0]
+            rec = store.get(mid)
+            return (200, rec) if rec is not None else (404, None)
+        return 400, None
 
-    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:
-        self._n += 1
-        message_id = f"pmreal-{metadata.get('market_action_spec')}-{self._n}"
-        self.outbound[message_id] = {
-            "MessageID": message_id, "ServerID": server_id, "From": sender, "To": to,
-            "Subject": subject, "TextBody": text_body, "ReplyTo": reply_to,
-            "Metadata": dict(metadata), "Status": "Sent"}
-        return message_id
+    return _req
 
-    def get_outbound_message(self, message_id):   # no network — in-memory provider state
-        return self.outbound.get(message_id)
+
+def install_real_postmark(monkeypatch):
+    """Return a GENUINE production PostmarkHttpTransport whose HTTP boundary is stubbed in-memory."""
+    store: dict = {}
+    monkeypatch.setattr(pm, "_http_request", stub_postmark_http(store))
+    return pm.PostmarkHttpTransport("STUB-TOKEN-not-used"), store
 
 
 PostmarkRun = namedtuple("PostmarkRun", "setup action_id spec worker verify transport resolver source")

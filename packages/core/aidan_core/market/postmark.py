@@ -289,8 +289,17 @@ def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkT
         with conn.cursor() as cur:
             cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_request_id,))
             venture_id = cur.fetchone()[0]
+            cur.execute("SELECT er.external_result_id FROM execution_result er "
+                        "JOIN proof_receipt pr ON pr.execution_result_id = er.id "
+                        "WHERE pr.action_request_id = %s AND pr.verification_type = 'MARKET_ACTION' "
+                        "AND pr.result = 'VERIFIED' ORDER BY pr.created_at DESC, pr.id DESC LIMIT 1",
+                        (action_request_id,))
+            row = cur.fetchone()
+        message_id = row[0] if row else None
+        # attest via the real reconciliation path (None for a fake/subclass transport -> SIMULATED)
+        provider_state = _trusted_provider_state(transport, message_id) if message_id else None
         origin_mod.record_evidence_origin(
-            conn, action_request_id, transport=transport, provider_kind="postmark",
+            conn, action_request_id, provider_state=provider_state, provider_kind="postmark",
             source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), actor=actor)
     return outcome
 
@@ -335,9 +344,10 @@ def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth
     res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type=otype,
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_event), actor=actor)
-    # bind trusted provider provenance (REAL_PROVIDER only for a real transport + real action proof)
+    # attest via the real reconciliation of the event's MessageID (None for fake/subclass)
+    provider_state = _trusted_provider_state(transport, message_id)
     origin_mod.record_observation_origin(
-        conn, res.market_observation_id, transport=transport, provider_kind="postmark",
+        conn, res.market_observation_id, provider_state=provider_state, provider_kind="postmark",
         source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
         provider_event_ref=external_event_id, actor=actor)
     return res
@@ -362,8 +372,18 @@ def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, au
     res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type="REPLIED",
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_inbound), actor=actor)
+    # attest by reconciling the OUTBOUND action's provider message (the inbound reply correlates
+    # to it via MailboxHash); None for a fake/subclass transport -> SIMULATED.
+    with conn.cursor() as cur:
+        cur.execute("SELECT er.external_result_id FROM execution_result er "
+                    "JOIN proof_receipt pr ON pr.execution_result_id = er.id "
+                    "JOIN market_action_spec ms ON ms.action_request_id = pr.action_request_id "
+                    "WHERE ms.id = %s AND pr.verification_type = 'MARKET_ACTION' AND pr.result = 'VERIFIED' "
+                    "ORDER BY pr.created_at DESC, pr.id DESC LIMIT 1", (spec_id,))
+        orow = cur.fetchone()
+    provider_state = _trusted_provider_state(transport, orow[0]) if orow else None
     origin_mod.record_observation_origin(
-        conn, res.market_observation_id, transport=transport, provider_kind="postmark",
+        conn, res.market_observation_id, provider_state=provider_state, provider_kind="postmark",
         source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
         provider_event_ref=external_event_id, actor=actor)
     return res
@@ -372,54 +392,89 @@ def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, au
 # --------------------------------------------------------------------------
 # production HTTP transport (stdlib only; NOT exercised in the Slice-2 suite)
 # --------------------------------------------------------------------------
-class PostmarkHttpTransport:
-    """Real Postmark transport over stdlib urllib (no third-party dependency). Never invoked by
-    the test suite — live token/network/recipient are Slice-5 operational dependencies. The
-    server token is supplied at construction from a trusted runtime source, never from canonical
-    action state."""
+# --------------------------------------------------------------------------
+# real-provider attestation (kernel-private) + the low-level HTTP boundary
+# --------------------------------------------------------------------------
+_ATTEST_KEY = object()   # module-private; only this module can construct a real attestation
 
-    origin_kind = origin_mod.REAL_PROVIDER   # a real provider-backed evidence path
+
+class _PostmarkVerifiedProviderState:
+    """Kernel-private proof that the genuine production Postmark HTTP path actually retrieved and
+    reconciled provider state for a MessageID. It is NOT a caller/worker value and cannot be
+    constructed outside this module (guarded by a private key), so REAL_PROVIDER provenance can
+    never be forged from a runtime type, a subclass, or a fabricated object."""
+
+    __slots__ = ("message_id", "server_id")
+
+    def __init__(self, _key, *, message_id, server_id):
+        if _key is not _ATTEST_KEY:
+            raise RuntimeError("_PostmarkVerifiedProviderState is kernel-private and cannot be constructed directly")
+        self.message_id = message_id
+        self.server_id = server_id
+
+
+def _http_request(method: str, url: str, *, headers: dict, body: bytes = None):  # pragma: no cover - network
+    """The SOLE network boundary. Returns (status_code, parsed_json). Tests stub THIS function
+    beneath the genuine production path — they never subclass/replace the transport object."""
+    import json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+
+
+class PostmarkHttpTransport:
+    """Real Postmark transport over stdlib urllib (no third-party dependency). All network I/O
+    goes through the module-level ``_http_request`` (the only place tests stub); the token is a
+    trusted runtime injection, never persisted in canonical state. Its ``reconcile`` produces the
+    kernel-private attestation that the origin kernel treats as REAL_PROVIDER evidence."""
+
     _API = "https://api.postmarkapp.com"
 
     def __init__(self, server_token: str):
-        self._token = server_token  # trusted runtime injection; never persisted in canon
+        self._token = server_token
 
     def _headers(self) -> dict:
         return {"X-Postmark-Server-Token": self._token, "Accept": "application/json",
                 "Content-Type": "application/json"}
 
-    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:  # pragma: no cover
+    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:
         import json
-        import urllib.request
         body = json.dumps({"From": sender, "To": to, "Subject": subject, "TextBody": text_body,
                            "ReplyTo": reply_to, "Metadata": metadata, "MessageStream": server_id}).encode()
-        req = urllib.request.Request(f"{self._API}/email", data=body, headers=self._headers(), method="POST")
-        with urllib.request.urlopen(req) as resp:  # network — Slice-5 only
-            return json.loads(resp.read()).get("MessageID")
+        _status, data = _http_request("POST", f"{self._API}/email", headers=self._headers(), body=body)
+        return (data or {}).get("MessageID")
 
-    def get_outbound_message(self, message_id):  # pragma: no cover - real network, Slice-5 only
-        # Live independent reconciliation: GET /messages/outbound/{id}/details returns the
-        # provider's own To/From/Subject/TextBody/Metadata/Status. The verifier compares this
-        # provider state against the canonical correlation — no metadata-search endpoint needed.
-        import json
-        import urllib.request
-        req = urllib.request.Request(f"{self._API}/messages/outbound/{message_id}/details",
-                                     headers=self._headers(), method="GET")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None                    # unknown MessageID -> no reconcilable record
-            raise
-        # normalize the provider payload to the shape the verifier reads
+    def get_outbound_message(self, message_id):
+        status, data = _http_request("GET", f"{self._API}/messages/outbound/{message_id}/details",
+                                     headers=self._headers())
+        if status == 404 or data is None:
+            return None                        # unknown MessageID -> no reconcilable record
         recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
         return {
-            "MessageID": data.get("MessageID"), "ServerID": self._server_id_of(data),
+            "MessageID": data.get("MessageID"), "ServerID": data.get("MessageStream") or data.get("ServerID"),
             "From": data.get("From"), "To": recipients[0] if recipients else data.get("To"),
             "Subject": data.get("Subject"), "TextBody": data.get("TextBody"),
             "Metadata": data.get("Metadata", {}), "Status": data.get("Status")}
 
-    @staticmethod
-    def _server_id_of(data):  # pragma: no cover - real network, Slice-5 only
-        return data.get("MessageStream") or data.get("ServerID")
+    def reconcile(self, message_id: str):
+        """Independently retrieve provider state (real HTTP) and, on success, attest it. Returns a
+        kernel-private ``_PostmarkVerifiedProviderState`` or None. Only THIS module holds the key."""
+        msg = self.get_outbound_message(message_id)
+        if msg is None or not msg.get("MessageID"):
+            return None
+        return _PostmarkVerifiedProviderState(_ATTEST_KEY, message_id=str(msg.get("MessageID")),
+                                              server_id=str(msg.get("ServerID")))
+
+
+def _trusted_provider_state(transport, message_id):
+    """Produce a REAL attestation ONLY when the transport is EXACTLY the production
+    ``PostmarkHttpTransport`` (a subclass is not trusted) AND its real reconciliation succeeds.
+    A fake/subclass/forged transport yields None -> SIMULATED."""
+    if type(transport) is not PostmarkHttpTransport:
+        return None
+    return transport.reconcile(message_id)

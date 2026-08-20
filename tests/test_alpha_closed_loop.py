@@ -167,7 +167,7 @@ def test_E_outcome_without_verified_action_rejected(migrated):
     freeze_outreach(migrated, setup, a)   # frozen but never executed/verified / not postmark-verified
     from aidan_core.errors import MarketAuthorityError
     with pytest.raises(MarketAuthorityError):   # not a postmark-verified action; origin cannot bind
-        origin_mod.record_evidence_origin(migrated, a, transport=FakePostmarkTransport(),
+        origin_mod.record_evidence_origin(migrated, a, provider_state=None,
                                           provider_kind="local", source_instance_ref="x")
 
 
@@ -437,7 +437,7 @@ def test_finding_A_local_action_cannot_bind_origin(migrated):
     setup = _setup(migrated, "fA2")
     a, _spec = _local_market_action(migrated, setup, key="fA2")   # verifier_kind = market-action
     with pytest.raises(MarketAuthorityError):
-        origin_mod.record_evidence_origin(migrated, a, transport=FakePostmarkTransport(),
+        origin_mod.record_evidence_origin(migrated, a, provider_state=None,
                                           provider_kind="postmark", source_instance_ref="x")
 
 
@@ -445,7 +445,7 @@ def test_finding_7_origin_conflict_on_material_change(migrated):
     from aidan_core.errors import IdempotencyConflictError
     r = postmark_run(migrated, "f7")   # verify already bound a SIMULATED origin (provider 'postmark')
     with pytest.raises(IdempotencyConflictError):   # different provenance for the same proof conflicts
-        origin_mod.record_evidence_origin(migrated, r.action_id, transport=FakePostmarkTransport(),
+        origin_mod.record_evidence_origin(migrated, r.action_id, provider_state=None,
                                           provider_kind="DIFFERENT", source_instance_ref="y")
 
 
@@ -529,24 +529,26 @@ def test_finding_D_worker_claiming_foreign_message_rejected(migrated):
 # ==========================================================================
 # REAL provider loops (trusted stub transport — proves the trust boundary, no network)
 # ==========================================================================
-def real_loop(conn, slug, *, outcome="REPLIED"):
-    """A closed loop whose consequential action executes through a genuine (stub, no-network)
-    PostmarkHttpTransport and whose outcome is a trusted, reconciled provider observation."""
-    from postmark_fakes import StubRealPostmarkTransport, FakeRecipientResolver, default_source, basic_auth
+def real_loop(conn, slug, monkeypatch, *, outcome="REPLIED"):
+    """A closed loop whose consequential action executes through the GENUINE production
+    PostmarkHttpTransport with its HTTP boundary stubbed (no network, no subclass); its outcome is
+    a trusted, reconciled provider observation."""
+    from postmark_fakes import install_real_postmark, FakeRecipientResolver, default_source, basic_auth
     from aidan_core.market import postmark as pm
+    transport, store = install_real_postmark(monkeypatch)
+    resolver, source = FakeRecipientResolver(), default_source()
     setup = _setup(conn, slug)
     _sa, seed_spec = _local_market_action(conn, setup, key=f"{slug}-seed")
     record_market_observation(conn, seed_spec.market_action_spec_id, external_event_id="seed",
                               observation_type="DELIVERED", channel_kind="fake-local")
     r1 = nextaction.recommend(conn, setup.venture_id, setup.opportunity_id, recommendation_key=f"{slug}-k1")
     loop_action = commitment.commit_recommendation(conn, r1.recommendation_id).resulting_action_id
-    transport, resolver, source = StubRealPostmarkTransport(), FakeRecipientResolver(), default_source()
     loop_spec = freeze_outreach(conn, setup, loop_action, channel_kind=pm.POSTMARK_CHANNEL)
     pm.execute_postmark_action(conn, loop_action, registry=registry_with(
         pm.PostmarkEmailWorker(transport, resolver, source)), source=source)
     assert pm.verify_postmark_action(conn, loop_action, transport=transport, resolver=resolver, source=source).verified
-    mid = next(m for m, rec in transport.outbound.items()
-               if str(rec["Metadata"].get("market_action_spec")) == str(loop_spec.market_action_spec_id))
+    mid = next(k for k, v in store.items() if k != "_n"
+               and str(v["Metadata"].get("market_action_spec")) == str(loop_spec.market_action_spec_id))
     if outcome == "REPLIED":
         pm.ingest_postmark_reply(conn, {"RecordType": "Inbound",
                                         "MailboxHash": pm.reply_mailbox_hash(setup.venture_id, loop_spec.market_action_spec_id),
@@ -559,29 +561,28 @@ def real_loop(conn, slug, *, outcome="REPLIED"):
     return _Ctx(setup=setup, r1=r1, r2=r2, loop_action=loop_action, loop_spec=loop_spec)
 
 
-def test_real_reply_loop_is_real_and_eligible(migrated):
-    c = real_loop(migrated, "RL", outcome="REPLIED")
+def test_real_reply_loop_is_real_and_eligible(migrated, monkeypatch):
+    c = real_loop(migrated, "RL", monkeypatch, outcome="REPLIED")
     r = _classify(migrated, c)
     assert r["reality_class"] == "REAL" and r["completeness"] == "COMPLETE"
     assert r["assistance_class"] == autonomy.CLEAN and r["eligible_clean_real_alpha"] is True
 
 
-def test_real_bounce_loop_is_real(migrated):
-    c = real_loop(migrated, "RLb", outcome="BOUNCED")
-    # a real negative outcome is still REAL market evidence
-    assert _classify(migrated, c)["reality_class"] == "REAL"
+def test_real_bounce_loop_is_real(migrated, monkeypatch):
+    c = real_loop(migrated, "RLb", monkeypatch, outcome="BOUNCED")
+    assert _classify(migrated, c)["reality_class"] == "REAL"   # a real negative outcome is still REAL
 
 
-def test_real_loop_with_intervention_is_human_assisted(migrated):
-    c = real_loop(migrated, "RLi", outcome="REPLIED")
-    _intervene(migrated, c.setup.venture_id, at=c.r1_at if hasattr(c, "r1_at") else _rec_time(migrated, c.r1.recommendation_id))
+def test_real_loop_with_intervention_is_human_assisted(migrated, monkeypatch):
+    c = real_loop(migrated, "RLi", monkeypatch, outcome="REPLIED")
+    _intervene(migrated, c.setup.venture_id, at=_rec_time(migrated, c.r1.recommendation_id))
     r = _classify(migrated, c)
     assert r["reality_class"] == "REAL" and r["assistance_class"] == autonomy.HUMAN_ASSISTED
     assert r["eligible_clean_real_alpha"] is False   # REAL but not CLEAN
 
 
-def test_unrelated_real_observation_cannot_upgrade_loop(migrated):
-    # a SIMULATED loop is not upgraded to REAL by a REAL observation elsewhere in the venture
+def test_unrelated_real_observation_cannot_upgrade_loop(migrated, monkeypatch):
+    # a SIMULATED loop is not upgraded to REAL by a REAL observation elsewhere
     c = sim_loop(migrated, "URO", outcome="REPLIED")
-    other = real_loop(migrated, "UROreal", outcome="REPLIED")   # different venture, REAL
+    real_loop(migrated, "UROreal", monkeypatch, outcome="REPLIED")   # different venture, REAL
     assert _classify(migrated, c)["reality_class"] == "SIMULATED"

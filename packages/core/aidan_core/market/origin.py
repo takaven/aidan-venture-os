@@ -40,21 +40,23 @@ def _verified_proof(cur, action_request_id):
     return cur.fetchone()
 
 
-def _derive_origin_kind(transport) -> str:
-    """REAL_PROVIDER only for a genuine production Postmark transport; else SIMULATED. Derived
-    from the actual type, never a caller flag — a fixture declaring ``origin_kind=REAL_PROVIDER``
-    is not a ``PostmarkHttpTransport`` and stays SIMULATED."""
-    from .postmark import PostmarkHttpTransport  # lazy import to avoid a cycle
-    return REAL_PROVIDER if isinstance(transport, PostmarkHttpTransport) else SIMULATED
+def _is_real_attestation(provider_state) -> bool:
+    """REAL only for the kernel-private ``_PostmarkVerifiedProviderState`` produced by the genuine
+    production Postmark HTTP/reconciliation path — never a runtime type, subclass, or caller flag.
+    That object cannot be constructed outside the postmark module (private-key guarded)."""
+    from .postmark import _PostmarkVerifiedProviderState  # lazy import to avoid a cycle
+    # exact type (not isinstance) so a subclass that skips the key-guarded __init__ cannot forge it
+    return type(provider_state) is _PostmarkVerifiedProviderState
 
 
-def record_evidence_origin(conn, action_request_id: str, *, transport, provider_kind: str,
+def record_evidence_origin(conn, action_request_id: str, *, provider_state, provider_kind: str,
                            source_instance_ref: str, actor: str = "market") -> OriginResult:
-    """Bind the action's VERIFIED MARKET_ACTION proof to a trusted origin derived from the
-    transport. Only a Postmark-verified action may be bound (a REAL origin cannot attach to a
-    local/generic action). Idempotent per proof; conflicting provenance is rejected."""
+    """Bind the action's VERIFIED MARKET_ACTION proof to a trusted origin. REAL_PROVIDER requires
+    the kernel-private provider attestation (produced only by the real HTTP reconciliation path);
+    otherwise SIMULATED. Only a Postmark-verified action may be bound (a REAL origin cannot attach
+    to a local/generic action). Idempotent per proof; conflicting provenance is rejected."""
     from .postmark import POSTMARK_VERIFIER_KIND  # lazy import to avoid a cycle
-    origin_kind = _derive_origin_kind(transport)
+    origin_kind = REAL_PROVIDER if _is_real_attestation(provider_state) else SIMULATED
     with db.transaction(conn) as cur:
         cur.execute("SELECT verifier_kind FROM execution_spec WHERE action_request_id = %s", (action_request_id,))
         vk = cur.fetchone()
@@ -117,14 +119,14 @@ def has_real_no_response(conn, market_action_spec_id: str, action_request_id: st
         return cur.fetchone() is not None
 
 
-def record_observation_origin(conn, market_observation_id: str, *, transport, provider_kind: str,
+def record_observation_origin(conn, market_observation_id: str, *, provider_state, provider_kind: str,
                               source_instance_ref: str, provider_event_ref: str, actor: str = "market"):
     """Bind a market_observation to trusted REAL_PROVIDER provenance — ONLY from the trusted
-    Postmark ingestion path. REAL_PROVIDER requires BOTH a genuine PostmarkHttpTransport AND that
-    the observation's action already carries a REAL_PROVIDER action proof (fail-closed: otherwise
-    no row is written and the observation is SIMULATED by absence). Never a caller flag. Idempotent
-    per observation; conflicting provenance is rejected."""
-    origin_kind = _derive_origin_kind(transport)
+    Postmark ingestion path. REAL_PROVIDER requires BOTH the kernel-private provider attestation
+    (real reconciliation) AND that the observation's action already carries a REAL_PROVIDER action
+    proof (fail-closed: otherwise no row is written and the observation is SIMULATED by absence).
+    Never a caller flag. Idempotent per observation; conflicting provenance is rejected."""
+    origin_kind = REAL_PROVIDER if _is_real_attestation(provider_state) else SIMULATED
     with db.transaction(conn) as cur:
         cur.execute("SELECT venture_id, market_action_spec_id, action_request_id FROM market_observation "
                     "WHERE id = %s", (market_observation_id,))

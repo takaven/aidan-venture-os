@@ -323,7 +323,11 @@ def test_48_validation_only_recommendation_unchanged(migrated):
     assert rec.action_type == "HOLD" and rec.reason_code == "NO_HIGH_VALUE_ACTION_NOW"
 
 
-def test_49_migrations_bounded_to_0023(migrated):
+def test_49_slice3_added_its_canonical_entities(migrated):
+    # forward-stable Slice-3 invariant: Slice 3 introduced exactly its three append-only entities
+    # (not a global migration ceiling — later slices add migrations legitimately).
     with migrated.cursor() as cur:
-        cur.execute("SELECT max(version) FROM schema_migrations")
-        assert cur.fetchone()[0] == "0023"
+        cur.execute("SELECT to_regclass('public.market_window_completion'), "
+                    "to_regclass('public.recommendation_market_window_completion'), "
+                    "to_regclass('public.alpha_intervention')")
+        assert all(x is not None for x in cur.fetchone())

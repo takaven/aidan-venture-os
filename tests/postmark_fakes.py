@@ -45,7 +45,8 @@ class FakePostmarkTransport:
     verifier reads it via find_outbound_by_correlation / get_outbound_message."""
 
     network_calls = 0  # stays 0 forever — a guard the suite asserts
-    origin_kind = "SIMULATED"  # a fixture-backed evidence path; can never be REAL_PROVIDER
+    # NOTE: no origin_kind flag — a fixture is SIMULATED because it is not a PostmarkHttpTransport,
+    # derived inside the trusted origin writer; it can never declare itself REAL_PROVIDER.
 
     def __init__(self):
         self.outbound: dict[str, dict] = {}
@@ -62,14 +63,6 @@ class FakePostmarkTransport:
 
     def get_outbound_message(self, message_id):
         return self.outbound.get(message_id)
-
-    def find_outbound_by_correlation(self, correlation):
-        keys = ("venture", "market_action_spec", "action_request", "action_spec_hash")
-        return [r for r in self.outbound.values()
-                if all(str(r["Metadata"].get(k)) == str(correlation.get(k)) for k in keys)]
-
-    def check_webhook_auth(self, auth_header):
-        return auth_header == basic_auth()
 
 
 PostmarkRun = namedtuple("PostmarkRun", "setup action_id spec worker verify transport resolver source")

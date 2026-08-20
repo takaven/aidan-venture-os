@@ -96,8 +96,6 @@ class PostmarkTransport(Protocol):
     def send_email(self, *, server_id: str, sender: str, to: str, subject: str, text_body: str,
                    reply_to: str, metadata: dict) -> str: ...
     def get_outbound_message(self, message_id: str) -> Optional[dict]: ...
-    def find_outbound_by_correlation(self, correlation: dict) -> list[dict]: ...
-    def check_webhook_auth(self, auth_header: str) -> bool: ...
 
 
 @runtime_checkable
@@ -181,9 +179,14 @@ class PostmarkActionVerifier:
         correlation = dict(pm.get("correlation", {}))
         claimed = str((request.worker_structured_output or {}).get("message_id"))
 
-        found = self._t.find_outbound_by_correlation(correlation) if correlation else []
-        exists = len(found) >= 1
-        msg = found[0] if exists else {}
+        # Independent provider fetch by the claimed MessageID (works for the fake AND the real
+        # PostmarkHttpTransport via GET /messages/outbound/{id}/details). The located message's
+        # own Metadata is then checked against the canonical correlation, so a worker that lies
+        # about its MessageID (nonexistent, or one belonging to another action) is rejected.
+        msg = self._t.get_outbound_message(claimed) if claimed and claimed != "None" else None
+        exists = msg is not None
+        msg = msg or {}
+        meta = dict(msg.get("Metadata", {}))
         expected_recipient = None
         if correlation:
             expected_recipient = self._resolver.resolve(
@@ -192,15 +195,18 @@ class PostmarkActionVerifier:
         checks = []
         checks.append(("ACTION_EXISTS", exists))
         if exists:
+            checks.append(("CORRELATION_IDENTITY",
+                           all(str(meta.get(k)) == str(correlation.get(k)) for k in correlation)))
             checks.append(("ACTION_IDENTITY",
                            channels_mod.content_sha(str(msg.get("TextBody", ""))) == market.get("content_hash")
-                           and str(msg.get("Metadata", {}).get("action_spec_hash")) == str(market.get("action_spec_hash"))))
+                           and str(meta.get("action_spec_hash")) == str(market.get("action_spec_hash"))))
             checks.append(("AUDIENCE_IDENTITY", str(msg.get("To")) == str(expected_recipient)))
             checks.append(("CHANNEL_IDENTITY", str(msg.get("ServerID")) == str(self._source.server_id)))
             checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(self._source.sender)))
             checks.append(("ACCEPTANCE_IDENTITY", claimed == str(msg.get("MessageID")) and claimed not in ("", "None")))
         else:
-            for name in ("ACTION_IDENTITY", "AUDIENCE_IDENTITY", "CHANNEL_IDENTITY", "SENDER_IDENTITY", "ACCEPTANCE_IDENTITY"):
+            for name in ("CORRELATION_IDENTITY", "ACTION_IDENTITY", "AUDIENCE_IDENTITY", "CHANNEL_IDENTITY",
+                         "SENDER_IDENTITY", "ACCEPTANCE_IDENTITY"):
                 checks.append((name, False))
 
         ok = all(v for _n, v in checks)
@@ -284,9 +290,7 @@ def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkT
             cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_request_id,))
             venture_id = cur.fetchone()[0]
         origin_mod.record_evidence_origin(
-            conn, action_request_id,
-            origin_kind=getattr(transport, "origin_kind", origin_mod.SIMULATED),
-            provider_kind="postmark",
+            conn, action_request_id, transport=transport, provider_kind="postmark",
             source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), actor=actor)
     return outcome
 
@@ -382,16 +386,29 @@ class PostmarkHttpTransport:
         with urllib.request.urlopen(req) as resp:  # network — Slice-5 only
             return json.loads(resp.read()).get("MessageID")
 
-    def get_outbound_message(self, message_id):  # pragma: no cover
+    def get_outbound_message(self, message_id):  # pragma: no cover - real network, Slice-5 only
+        # Live independent reconciliation: GET /messages/outbound/{id}/details returns the
+        # provider's own To/From/Subject/TextBody/Metadata/Status. The verifier compares this
+        # provider state against the canonical correlation — no metadata-search endpoint needed.
         import json
         import urllib.request
         req = urllib.request.Request(f"{self._API}/messages/outbound/{message_id}/details",
                                      headers=self._headers(), method="GET")
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None                    # unknown MessageID -> no reconcilable record
+            raise
+        # normalize the provider payload to the shape the verifier reads
+        recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
+        return {
+            "MessageID": data.get("MessageID"), "ServerID": self._server_id_of(data),
+            "From": data.get("From"), "To": recipients[0] if recipients else data.get("To"),
+            "Subject": data.get("Subject"), "TextBody": data.get("TextBody"),
+            "Metadata": data.get("Metadata", {}), "Status": data.get("Status")}
 
-    def find_outbound_by_correlation(self, correlation):  # pragma: no cover
-        raise NotImplementedError("Slice-5 operational dependency: live Metadata search")
-
-    def check_webhook_auth(self, auth_header):  # pragma: no cover
-        raise NotImplementedError("Slice-5 operational dependency: live webhook Basic-Auth")
+    @staticmethod
+    def _server_id_of(data):  # pragma: no cover - real network, Slice-5 only
+        return data.get("MessageStream") or data.get("ServerID")

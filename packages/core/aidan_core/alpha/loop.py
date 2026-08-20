@@ -7,16 +7,19 @@ boundary is reconstructed from existing state:
                           ->  market_action_spec  ->  VERIFIED MARKET_ACTION proof
                           ->  market_observation / market_window_completion  ->  next recommendation
 
-``start_at`` / ``end_at`` are canonical recommendation/decision timestamps, so autonomy assistance
-is scoped to the exact loop interval: an intervention BEFORE the loop, AFTER it, or on another
-venture never contaminates the classification. Three independent dimensions are returned —
-completeness, assistance (CLEAN vs HUMAN_ASSISTED), and reality (REAL vs SIMULATED) — and a
-synthetic (fixture) loop can never be ``eligible_clean_real_alpha`` because its reality is
-SIMULATED.
+The next recommendation is not trusted merely because it exists: it must belong to the same
+venture, follow the start, AND cite (via recommendation provenance) an observation or no-response
+completion of THIS loop's exact market action — otherwise it is rejected. ``start_at`` / ``end_at``
+are canonical timestamps, so assistance is scoped strictly to the exact loop interval.
+
+Three independent dimensions are returned — completeness, assistance (CLEAN vs HUMAN_ASSISTED),
+and reality (REAL vs SIMULATED). REAL requires a REAL_PROVIDER action proof AND a deterministic
+NO_RESPONSE completion anchored to it (a generic/unauthenticated observation NEVER confers REAL);
+so a synthetic fixture is never ``eligible_clean_real_alpha`` (COMPLETE + CLEAN + REAL).
 """
 from __future__ import annotations
 
-from ..errors import NotFoundError
+from ..errors import MarketAuthorityError, NotFoundError
 from ..market import origin as origin_mod
 from .autonomy import CLEAN, HUMAN_ASSISTED
 
@@ -41,6 +44,26 @@ def _committed(cur, start_recommendation_id):
         "SELECT decision, resulting_action_id, created_at FROM investment_decision_record "
         "WHERE source_recommendation_id = %s", (start_recommendation_id,))
     return cur.fetchone()
+
+
+def _loop_spec(cur, action_request_id):
+    cur.execute("SELECT id FROM market_action_spec WHERE action_request_id = %s", (action_request_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _cites_spec(cur, recommendation_id, spec_id) -> bool:
+    """True iff the recommendation's exact provenance cites an observation OR a no-response
+    completion of this market_action_spec — proof it consumed THIS loop's outcome."""
+    cur.execute(
+        "SELECT 1 FROM recommendation_market_observation rmo "
+        "JOIN market_observation mo ON mo.id = rmo.observation_id "
+        "WHERE rmo.recommendation_id = %s AND mo.market_action_spec_id = %s "
+        "UNION SELECT 1 FROM recommendation_market_window_completion rmc "
+        "JOIN market_window_completion mwc ON mwc.id = rmc.window_completion_id "
+        "WHERE rmc.recommendation_id = %s AND mwc.market_action_spec_id = %s LIMIT 1",
+        (recommendation_id, spec_id, recommendation_id, spec_id))
+    return cur.fetchone() is not None
 
 
 def _action_complete(cur, action_request_id):
@@ -74,35 +97,48 @@ def _interventions_in(cur, venture_id, start_at, end_at) -> int:
 def classify_loop(conn, *, start_recommendation_id: str, next_recommendation_id=None) -> dict:
     """Deterministically classify the loop that starts at ``start_recommendation_id``.
 
-    Truth projection only — reads canonical state and writes nothing.
+    Truth projection only — reads canonical state and writes nothing. Rejects a
+    ``next_recommendation_id`` that is not the loop's actual next allocation.
     """
     with conn.cursor() as cur:
         venture_id, start_at = _rec(cur, start_recommendation_id)
         committed = _committed(cur, start_recommendation_id)
+        decision = resulting_action_id = decided_at = None
+        loop_spec_id = None
+        if committed is not None:
+            decision, resulting_action_id, decided_at = committed
+            if resulting_action_id is not None:
+                loop_spec_id = _loop_spec(cur, resulting_action_id)
 
-        # loop interval end: the next recommendation (open loop) or, for a terminal decision, the
-        # decision instant. Assistance is scoped strictly to [start_at, end_at).
+        # bound the loop with the next recommendation — validated as THIS loop's next allocation.
         end_at = None
         next_exists = False
         if next_recommendation_id is not None:
-            nrow = _rec(cur, next_recommendation_id)
-            end_at = nrow[1]
+            n_venture, n_at = _rec(cur, next_recommendation_id)
+            if str(n_venture) != str(venture_id):
+                raise MarketAuthorityError("next recommendation belongs to a different venture")
+            if not (n_at > start_at):
+                raise MarketAuthorityError("next recommendation does not follow the loop start")
+            if loop_spec_id is None or not _cites_spec(cur, next_recommendation_id, loop_spec_id):
+                raise MarketAuthorityError("next recommendation does not cite this loop's market outcome")
+            end_at = n_at
             next_exists = True
 
         reality = SIMULATED
         if committed is None:
-            completeness = INCOMPLETE          # no canonical allocation decision yet
+            completeness = INCOMPLETE
+        elif decision in _TERMINAL:
+            completeness = COMPLETE          # a terminal allocation (e.g. KILL) is a complete loop
+            if end_at is None:
+                end_at = decided_at
+        elif resulting_action_id is not None:
+            # REAL requires a REAL_PROVIDER action proof AND a NO_RESPONSE completion anchored to
+            # it; a generic observation never confers REAL.
+            if origin_mod.has_real_no_response(conn, loop_spec_id, resulting_action_id):
+                reality = REAL
+            completeness = COMPLETE if (_action_complete(cur, resulting_action_id) and next_exists) else INCOMPLETE
         else:
-            decision, resulting_action_id, decided_at = committed
-            if decision in _TERMINAL:
-                completeness = COMPLETE        # a terminal allocation (e.g. KILL) is a complete loop
-                if end_at is None:
-                    end_at = decided_at
-            elif resulting_action_id is not None:
-                reality = origin_mod.action_reality(conn, resulting_action_id)
-                completeness = COMPLETE if (_action_complete(cur, resulting_action_id) and next_exists) else INCOMPLETE
-            else:
-                completeness = INCOMPLETE
+            completeness = INCOMPLETE
 
         assisted = _interventions_in(cur, venture_id, start_at, end_at) > 0
         assistance = HUMAN_ASSISTED if assisted else CLEAN

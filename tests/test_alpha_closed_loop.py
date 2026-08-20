@@ -164,12 +164,11 @@ def test_D_action_proof_missing_no_completion(migrated):
 def test_E_outcome_without_verified_action_rejected(migrated):
     setup = _setup(migrated, "E")
     a = market_action(migrated, setup.venture_id, key="E")
-    spec = freeze_outreach(migrated, setup, a)   # frozen but never executed/verified
-    # an observation can be recorded, but the window/loop cannot treat it as a completed action
-    from aidan_core.market import action as market_mod
-    with pytest.raises(origin_mod.MarketAuthorityError):
-        origin_mod.record_evidence_origin(migrated, a, origin_kind="SIMULATED", provider_kind="local",
-                                          source_instance_ref="x")   # no verified proof
+    freeze_outreach(migrated, setup, a)   # frozen but never executed/verified / not postmark-verified
+    from aidan_core.errors import MarketAuthorityError
+    with pytest.raises(MarketAuthorityError):   # not a postmark-verified action; origin cannot bind
+        origin_mod.record_evidence_origin(migrated, a, transport=FakePostmarkTransport(),
+                                          provider_kind="local", source_instance_ref="x")
 
 
 # ==========================================================================
@@ -272,7 +271,7 @@ def test_S_fake_provider_cannot_be_real(migrated):
 def test_S_origin_write_is_idempotent_and_immutable(migrated):
     r = postmark_run(migrated, "S2")
     with migrated.cursor() as cur:
-        cur.execute("SELECT id FROM external_evidence_origin eo JOIN proof_receipt pr ON pr.id = eo.proof_receipt_id "
+        cur.execute("SELECT eo.id FROM external_evidence_origin eo JOIN proof_receipt pr ON pr.id = eo.proof_receipt_id "
                     "WHERE pr.action_request_id = %s", (r.action_id,))
         oid = cur.fetchone()[0]
         with pytest.raises(psycopg.errors.RaiseException):
@@ -405,3 +404,123 @@ def test_AI_no_market_or_autonomy_score(migrated):
                     "('external_evidence_origin','next_action_recommendation') AND column_name IN "
                     "('score','confidence','market_score','autonomy_score')")
         assert cur.fetchone()[0] == 0
+
+
+# ==========================================================================
+# Finding A — REAL_PROVIDER is not caller-selectable
+# ==========================================================================
+def _force_real_origin(conn, action_id):
+    """Test scaffolding: inject a REAL_PROVIDER origin for a proof (bypassing the writer) to
+    exercise the loop's reality LOGIC — production code can only produce REAL via a live transport."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pr.id, pr.execution_attempt_id, ar.venture_id FROM proof_receipt pr "
+                    "JOIN action_request ar ON ar.id = pr.action_request_id WHERE pr.action_request_id = %s "
+                    "AND pr.verification_type = 'MARKET_ACTION' AND pr.result = 'VERIFIED'", (action_id,))
+        proof_id, attempt, vid = cur.fetchone()
+        cur.execute("INSERT INTO external_evidence_origin (venture_id, proof_receipt_id, execution_attempt_id, "
+                    "origin_kind, provider_kind, source_instance_ref, origin_hash) "
+                    "VALUES (%s,%s,%s,'REAL_PROVIDER','postmark','x','forced') "
+                    "ON CONFLICT (proof_receipt_id) DO NOTHING", (vid, proof_id, attempt))
+
+
+def test_finding_A_fake_transport_origin_is_simulated(migrated):
+    # a Postmark FAKE action records a SIMULATED origin; there is no origin_kind param to force REAL
+    r = postmark_run(migrated, "fA")
+    assert origin_mod.action_reality(migrated, r.action_id) == "SIMULATED"
+    import inspect
+    assert "origin_kind" not in inspect.signature(origin_mod.record_evidence_origin).parameters
+
+
+def test_finding_A_local_action_cannot_bind_origin(migrated):
+    # a local (non-postmark) verified action cannot be bound a provider origin at all
+    from aidan_core.errors import MarketAuthorityError
+    setup = _setup(migrated, "fA2")
+    a, _spec = _local_market_action(migrated, setup, key="fA2")   # verifier_kind = market-action
+    with pytest.raises(MarketAuthorityError):
+        origin_mod.record_evidence_origin(migrated, a, transport=FakePostmarkTransport(),
+                                          provider_kind="postmark", source_instance_ref="x")
+
+
+def test_finding_7_origin_conflict_on_material_change(migrated):
+    from aidan_core.errors import IdempotencyConflictError
+    r = postmark_run(migrated, "f7")   # verify already bound a SIMULATED origin (provider 'postmark')
+    with pytest.raises(IdempotencyConflictError):   # different provenance for the same proof conflicts
+        origin_mod.record_evidence_origin(migrated, r.action_id, transport=FakePostmarkTransport(),
+                                          provider_kind="DIFFERENT", source_instance_ref="y")
+
+
+# ==========================================================================
+# Finding B — next recommendation must belong to this loop
+# ==========================================================================
+def test_finding_B_next_wrong_venture_rejected(migrated):
+    from aidan_core.errors import MarketAuthorityError
+    a = sim_loop(migrated, "fBa", outcome="REPLIED")
+    b = sim_loop(migrated, "fBb", outcome="REPLIED")
+    with pytest.raises(MarketAuthorityError):   # b.r2 is another venture's recommendation
+        loop.classify_loop(migrated, start_recommendation_id=a.r1.recommendation_id,
+                           next_recommendation_id=b.r2.recommendation_id)
+
+
+def test_finding_B_next_not_following_start_rejected(migrated):
+    from aidan_core.errors import MarketAuthorityError
+    c = sim_loop(migrated, "fB2", outcome="REPLIED")
+    with pytest.raises(MarketAuthorityError):   # r1 precedes r2; using r1 as the "next" of r2 is invalid
+        loop.classify_loop(migrated, start_recommendation_id=c.r2.recommendation_id,
+                           next_recommendation_id=c.r1.recommendation_id)
+
+
+# ==========================================================================
+# Finding C — a REAL action + generic observation is NOT a REAL loop
+# ==========================================================================
+def test_finding_C_real_action_generic_observation_not_real(migrated):
+    c = sim_loop(migrated, "fC", outcome="REPLIED")
+    _force_real_origin(migrated, c.loop_action)   # simulate a REAL outbound action proof
+    r = loop.classify_loop(migrated, start_recommendation_id=c.r1.recommendation_id,
+                           next_recommendation_id=c.r2.recommendation_id)
+    # the REAL action + a generic REPLIED observation does NOT qualify as a REAL loop
+    assert r["reality_class"] == "SIMULATED" and r["eligible_clean_real_alpha"] is False
+
+
+def test_finding_C_real_action_no_response_is_real(migrated):
+    c = sim_loop(migrated, "fC2", outcome="NO_RESPONSE", days=5)
+    _force_real_origin(migrated, c.loop_action)   # REAL outbound action + deterministic NO_RESPONSE
+    r = loop.classify_loop(migrated, start_recommendation_id=c.r1.recommendation_id,
+                           next_recommendation_id=c.r2.recommendation_id)
+    assert r["reality_class"] == "REAL" and r["completeness"] == "COMPLETE"
+    assert r["assistance_class"] == autonomy.CLEAN and r["eligible_clean_real_alpha"] is True
+
+
+# ==========================================================================
+# Finding D — real Postmark reconciliation has no NotImplementedError in the verify path
+# ==========================================================================
+def test_finding_D_http_transport_reconciliation_implemented(migrated):
+    from aidan_core.market.postmark import PostmarkHttpTransport
+    t = PostmarkHttpTransport("FAKE-TOKEN-not-used")
+    # the verifier reconciles via get_outbound_message (GET-by-MessageID); the removed metadata
+    # search is gone, so no NotImplementedError remains in the live verification path
+    assert hasattr(t, "get_outbound_message")
+    assert not hasattr(t, "find_outbound_by_correlation")
+    src = __import__("inspect").getsource(t.get_outbound_message.__func__)
+    assert "NotImplementedError" not in src
+
+
+def test_finding_D_worker_claiming_foreign_message_rejected(migrated):
+    # a worker whose claimed MessageID resolves (in provider state) to ANOTHER action's message is
+    # rejected: the located message's Metadata does not match this action's canonical correlation.
+    from aidan_core.factory.verifiers import VerificationRequest
+    from aidan_core.market import action as market_mod
+    from aidan_core.market import postmark as pm
+    transport = FakePostmarkTransport()
+    resolver = FakeRecipientResolver()
+    source = default_source()
+    a = postmark_run(migrated, "fD", transport=transport, resolver=resolver, source=source)
+    other = postmark_run(migrated, "fDx", transport=transport, resolver=resolver, source=source)
+    other_spec = str(market_mod.get_market_action_spec(migrated, other.action_id)[0])
+    foreign_mid = next(mid for mid, m in transport.outbound.items()
+                       if str(m["Metadata"].get("market_action_spec")) == other_spec)
+    _task, contract = pm._postmark_contract(migrated, a.action_id, source)
+    req = VerificationRequest(action_request_id=a.action_id, execution_attempt_id="x",
+                              verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
+                              worker_structured_output={"message_id": foreign_mid}, artifacts=(), spec_hash="h")
+    verdict = pm.PostmarkActionVerifier(transport, resolver, source).verify(req)
+    assert verdict.verdict == "REJECTED"

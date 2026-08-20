@@ -139,7 +139,7 @@ def classify_loop(conn, *, start_recommendation_id: str, next_recommendation_id=
 
         # bound the loop with the next recommendation — validated as THIS loop's next allocation.
         end_at = None
-        next_exists = False
+        next_committed = False
         if next_recommendation_id is not None:
             n_venture, n_at = _rec(cur, next_recommendation_id)
             if str(n_venture) != str(venture_id):
@@ -148,8 +148,15 @@ def classify_loop(conn, *, start_recommendation_id: str, next_recommendation_id=
                 raise MarketAuthorityError("next recommendation does not follow the loop start")
             if loop_spec_id is None or not _cites_spec(cur, next_recommendation_id, loop_spec_id):
                 raise MarketAuthorityError("next recommendation does not cite this loop's market outcome")
-            end_at = n_at
-            next_exists = True
+            # the loop is complete only when the next recommendation is COMMITTED into a canonical
+            # investment decision (the actual next allocation) — a recommendation alone is not
+            # sufficient. The loop interval ends at that decision, so any intervention between the
+            # next recommendation and its commitment falls inside the loop.
+            cur.execute("SELECT created_at FROM investment_decision_record WHERE source_recommendation_id = %s",
+                        (next_recommendation_id,))
+            drow = cur.fetchone()
+            next_committed = drow is not None
+            end_at = drow[0] if next_committed else n_at
 
         reality = SIMULATED
         if committed is None:
@@ -165,7 +172,7 @@ def classify_loop(conn, *, start_recommendation_id: str, next_recommendation_id=
             # unrelated REAL observation elsewhere in the venture cannot upgrade this loop.
             if _outcome_is_real(cur, conn, next_recommendation_id, loop_spec_id, resulting_action_id):
                 reality = REAL
-            completeness = COMPLETE if (_action_complete(cur, resulting_action_id) and next_exists) else INCOMPLETE
+            completeness = COMPLETE if (_action_complete(cur, resulting_action_id) and next_committed) else INCOMPLETE
         else:
             completeness = INCOMPLETE
 

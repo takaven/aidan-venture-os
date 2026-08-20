@@ -65,8 +65,9 @@ def _setup(conn, slug, *, days=7):
     return MarketSetup(s.venture_id, s.opportunity_id, vt)
 
 
-def sim_loop(conn, slug, *, outcome="REPLIED", days=7):
-    """Build one complete SIMULATED closed loop; return r1/r2 + the loop action/spec."""
+def sim_loop(conn, slug, *, outcome="REPLIED", days=7, commit_next=True):
+    """Build one SIMULATED closed loop; return r1/r2 + the loop action/spec. When ``commit_next``
+    the next recommendation is committed into a canonical investment decision (the true loop exit)."""
     setup = _setup(conn, slug, days=days)
     # seed market evidence so the allocator selects MARKET
     _seed_a, seed_spec = _local_market_action(conn, setup, key=f"{slug}-seed")
@@ -89,6 +90,8 @@ def sim_loop(conn, slug, *, outcome="REPLIED", days=7):
                                   observation_type=outcome, channel_kind="fake-local",
                                   occurred_at=start + timedelta(days=1))
     r2 = nextaction.recommend(conn, setup.venture_id, setup.opportunity_id, recommendation_key=f"{slug}-k2")
+    if commit_next:   # commit the next recommendation into a canonical investment decision (true exit)
+        commitment.commit_recommendation(conn, r2.recommendation_id)
     return _Ctx(setup=setup, r1=r1, r2=r2, loop_action=loop_action, loop_spec=loop_spec,
                 r1_at=_rec_time(conn, r1.recommendation_id), r2_at=_rec_time(conn, r2.recommendation_id))
 
@@ -363,13 +366,40 @@ def test_AC_cross_venture_evidence_isolation(migrated):
 
 
 def test_AD_next_action_still_bounded_by_policy_capital(migrated):
-    c = sim_loop(migrated, "AD", outcome="REPLIED")
+    # the next recommendation is committed via the canonical governed path (bounded by Policy/capital)
+    c = sim_loop(migrated, "AD", outcome="REPLIED", commit_next=False)
     before = _counts(migrated, c.setup.venture_id)
-    # committing the next MARKET recommendation goes through the canonical governed path
-    res = commitment.commit_recommendation(migrated, c.r2.recommendation_id)
+    res = commitment.commit_recommendation(migrated, c.r2.recommendation_id)   # first commit
     after = _counts(migrated, c.setup.venture_id)
-    assert res.decision == "MARKET" and after["acts"] == before["acts"] + 1  # exactly one governed action
-    assert after["cap"] == before["cap"]   # allocator moved no capital
+    assert res.decision == "MARKET" and after["acts"] == before["acts"] + 1    # exactly one governed action
+    assert after["cap"] == before["cap"]                                       # allocator moved no capital
+    # replay is idempotent: no duplicate decision/action
+    again = commitment.commit_recommendation(migrated, c.r2.recommendation_id)
+    assert again.created is False and again.decision_id == res.decision_id
+    assert _counts(migrated, c.setup.venture_id)["acts"] == after["acts"]
+
+
+# ==========================================================================
+# True closed-loop exit — COMPLETE requires the next decision to be committed
+# ==========================================================================
+def test_next_uncommitted_recommendation_is_incomplete(migrated):
+    c = sim_loop(migrated, "NX", outcome="REPLIED", commit_next=False)   # r2 not committed
+    r = _classify(migrated, c)
+    assert r["completeness"] == "INCOMPLETE" and r["eligible_clean_real_alpha"] is False
+
+
+def test_next_committed_decision_completes_loop(migrated):
+    c = sim_loop(migrated, "NC", outcome="REPLIED", commit_next=True)    # r2 committed
+    assert _classify(migrated, c)["completeness"] == "COMPLETE"
+
+
+def test_intervention_before_commitment_is_human_assisted(migrated):
+    # an intervention AFTER the next recommendation but BEFORE its commitment is inside the loop
+    c = sim_loop(migrated, "IC", outcome="REPLIED", commit_next=False)
+    _intervene(migrated, c.setup.venture_id, at=c.r2_at)                 # after recommendation
+    commitment.commit_recommendation(migrated, c.r2.recommendation_id)   # decision committed later
+    r = _classify(migrated, c)
+    assert r["completeness"] == "COMPLETE" and r["assistance_class"] == autonomy.HUMAN_ASSISTED
 
 
 # ==========================================================================
@@ -550,15 +580,18 @@ def real_loop(conn, slug, monkeypatch, *, outcome="REPLIED"):
     mid = next(k for k, v in store.items() if k != "_n"
                and str(v["Metadata"].get("market_action_spec")) == str(loop_spec.market_action_spec_id))
     if outcome == "REPLIED":
+        buyer = resolver.resolve(str(setup.venture_id), f"{pm.POSTMARK_CHANNEL}:{setup.venture_id}", "aud://segment-1")
         pm.ingest_postmark_reply(conn, {"RecordType": "Inbound",
                                         "MailboxHash": pm.reply_mailbox_hash(setup.venture_id, loop_spec.market_action_spec_id),
-                                        "From": "lead@x.invalid", "TextBody": "yes", "MessageID": "in-real"},
-                                 source=source, auth_header=basic_auth(), transport=transport)
+                                        "From": buyer, "TextBody": "yes", "MessageID": "in-real"},
+                                 source=source, auth_header=basic_auth(), transport=transport, resolver=resolver)
     else:
         pm.ingest_postmark_event(conn, {"RecordType": "Bounce", "MessageID": mid, "Type": "HardBounce"},
                                  source=source, auth_header=basic_auth(), transport=transport)
     r2 = nextaction.recommend(conn, setup.venture_id, setup.opportunity_id, recommendation_key=f"{slug}-k2")
-    return _Ctx(setup=setup, r1=r1, r2=r2, loop_action=loop_action, loop_spec=loop_spec)
+    commitment.commit_recommendation(conn, r2.recommendation_id)   # true loop exit: committed next decision
+    return _Ctx(setup=setup, r1=r1, r2=r2, loop_action=loop_action, loop_spec=loop_spec,
+                r1_at=_rec_time(conn, r1.recommendation_id), r2_at=_rec_time(conn, r2.recommendation_id))
 
 
 def test_real_reply_loop_is_real_and_eligible(migrated, monkeypatch):

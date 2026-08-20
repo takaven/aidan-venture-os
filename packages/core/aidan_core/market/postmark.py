@@ -19,10 +19,11 @@ Basic-Auth secret AND reconcile every consequential event against provider state
 correlation before it becomes evidence — never trusting an unauthenticated raw POST. This
 limitation is explicit (see ADR-027).
 
-Slice 2 performs NO real send, uses NO live credential, and makes NO network call: a
-deterministic in-memory ``PostmarkTransport`` fake holds provider-side state in tests. The
-real ``PostmarkHttpTransport`` is defined but never exercised in the suite; live credentials,
-sender identity, recipient authorization, and network execution are Slice-5 dependencies.
+No real send, no live credential, no network call in tests: a deterministic in-memory
+``PostmarkTransport`` fake holds provider-side state, and the genuine ``PostmarkHttpTransport``
+is exercised by stubbing its single low-level HTTP boundary (``_http_request``) — never by
+subclassing/replacing it. Live credentials, sender identity, recipient authorization, and real
+network execution remain Slice-5 dependencies.
 """
 from __future__ import annotations
 
@@ -314,19 +315,29 @@ def _authenticate(source: PostmarkSource, auth_header: str) -> None:
 
 
 def _spec_for_message(conn, message_id: str, transport: PostmarkTransport):
-    """Independent reconciliation: resolve a provider MessageID to its canonical market action
-    via provider Metadata (never trusting event fields alone)."""
-    msg = transport.get_outbound_message(message_id)
+    """Bind a provider event to the EXACT market action by requiring its MessageID to equal the
+    proven outbound MessageID (execution_result.external_result_id) of that action's VERIFIED
+    MARKET_ACTION proof — provider Metadata is only a secondary cross-check, never the primary key.
+    So a different provider message carrying copied canonical Metadata is rejected."""
+    msg = transport.get_outbound_message(message_id)   # independent provider reconciliation
     if msg is None:
         raise MarketAuthorityError(f"Postmark MessageID {message_id!r} has no reconcilable outbound record")
-    spec_id = str(msg.get("Metadata", {}).get("market_action_spec"))
     with conn.cursor() as cur:
-        cur.execute("SELECT id, venture_id FROM market_action_spec WHERE id = %s AND channel_kind = %s",
-                    (spec_id, POSTMARK_CHANNEL))
+        cur.execute(
+            "SELECT ms.id, ms.venture_id FROM market_action_spec ms "
+            "JOIN proof_receipt pr ON pr.action_request_id = ms.action_request_id "
+            "  AND pr.verification_type = 'MARKET_ACTION' AND pr.result = 'VERIFIED' "
+            "JOIN execution_result er ON er.id = pr.execution_result_id "
+            "WHERE er.external_result_id = %s AND ms.channel_kind = %s",
+            (message_id, POSTMARK_CHANNEL))
         row = cur.fetchone()
     if row is None:
-        raise MarketAuthorityError("provider message does not reconcile to a canonical Postmark market action")
-    return str(row[0]), str(row[1])
+        raise MarketAuthorityError(
+            "event MessageID is not the exact proven outbound MessageID of any Postmark action")
+    spec_id, venture_id = str(row[0]), str(row[1])
+    if str(msg.get("Metadata", {}).get("market_action_spec")) != spec_id:
+        raise MarketAuthorityError("provider Metadata does not match the exact proven action")
+    return spec_id, venture_id
 
 
 def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth_header: str,
@@ -353,21 +364,37 @@ def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth
     return res
 
 
+def _normalize_email(value) -> str:
+    """Deterministic address extraction: 'Name <a@b>' or 'a@b' -> 'a@b' (lowercased/stripped)."""
+    import re
+    if not value:
+        return ""
+    m = re.search(r"<([^>]+)>", str(value))
+    return (m.group(1) if m else str(value)).strip().lower()
+
+
 def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, auth_header: str,
-                          transport: PostmarkTransport, actor: str = "market"):
-    """Authenticate a Postmark Inbound reply and correlate it to exactly one market action by
-    the structural MailboxHash token (never by subject/body similarity). Reply text stays DATA."""
+                          transport: PostmarkTransport, resolver: RecipientResolver, actor: str = "market"):
+    """Authenticate a Postmark Inbound reply, correlate it to exactly one market action by the
+    structural MailboxHash token, AND prove the inbound sender is the exact authorized outbound
+    recipient (a reply from any other sender to the unique address is rejected). Reply text is DATA."""
     _authenticate(source, auth_header)
     mailbox_hash = str(raw_inbound.get("MailboxHash"))
     if not mailbox_hash or mailbox_hash == "None":
         raise MarketAuthorityError("inbound reply carries no MailboxHash correlation token")
     with conn.cursor() as cur:
-        cur.execute("SELECT id, venture_id FROM market_action_spec WHERE channel_kind = %s", (POSTMARK_CHANNEL,))
+        cur.execute("SELECT id, venture_id, audience_ref FROM market_action_spec WHERE channel_kind = %s",
+                    (POSTMARK_CHANNEL,))
         rows = cur.fetchall()
-    match = [(str(sid), str(vid)) for sid, vid in rows if reply_mailbox_hash(vid, sid) == mailbox_hash]
+    match = [(str(sid), str(vid), aud) for sid, vid, aud in rows if reply_mailbox_hash(vid, sid) == mailbox_hash]
     if len(match) != 1:
         raise MarketAuthorityError("inbound reply MailboxHash does not correlate to exactly one market action")
-    spec_id, venture_id = match[0]
+    spec_id, venture_id, audience_ref = match[0]
+    # buyer attribution: the inbound sender must be the exact authorized outbound recipient
+    expected = _normalize_email(resolver.resolve(
+        venture_id, channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), audience_ref))
+    if _normalize_email(raw_inbound.get("From")) != expected:
+        raise MarketAuthorityError("inbound reply sender is not the authorized outbound recipient")
     external_event_id = f"Inbound:{raw_inbound.get('MessageID')}"
     res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type="REPLIED",
@@ -393,22 +420,24 @@ def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, au
 # production HTTP transport (stdlib only; NOT exercised in the Slice-2 suite)
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
-# real-provider attestation (kernel-private) + the low-level HTTP boundary
+# real-provider attestation (trusted provider-path) + the low-level HTTP boundary
 # --------------------------------------------------------------------------
 _ATTEST_KEY = object()   # module-private; only this module can construct a real attestation
 
 
 class _PostmarkVerifiedProviderState:
-    """Kernel-private proof that the genuine production Postmark HTTP path actually retrieved and
-    reconciled provider state for a MessageID. It is NOT a caller/worker value and cannot be
-    constructed outside this module (guarded by a private key), so REAL_PROVIDER provenance can
-    never be forged from a runtime type, a subclass, or a fabricated object."""
+    """Trusted proof that the genuine production Postmark HTTP path actually retrieved and
+    reconciled provider state for a MessageID. It is NOT a caller/worker value: the private key +
+    exact-type guard stop REAL provenance from being forged from a runtime type, a subclass, a
+    fabricated object, or the public API. Under the current in-process trust model this is a
+    kernel/provider-path boundary (specialist workers hold no DB authority), NOT a language-level
+    guarantee against arbitrary in-process malicious code — that sandbox is a later-gate concern."""
 
     __slots__ = ("message_id", "server_id")
 
     def __init__(self, _key, *, message_id, server_id):
         if _key is not _ATTEST_KEY:
-            raise RuntimeError("_PostmarkVerifiedProviderState is kernel-private and cannot be constructed directly")
+            raise RuntimeError("_PostmarkVerifiedProviderState requires the trusted provider-path key")
         self.message_id = message_id
         self.server_id = server_id
 
@@ -431,7 +460,7 @@ class PostmarkHttpTransport:
     """Real Postmark transport over stdlib urllib (no third-party dependency). All network I/O
     goes through the module-level ``_http_request`` (the only place tests stub); the token is a
     trusted runtime injection, never persisted in canonical state. Its ``reconcile`` produces the
-    kernel-private attestation that the origin kernel treats as REAL_PROVIDER evidence."""
+    trusted attestation that the origin kernel treats as REAL_PROVIDER evidence."""
 
     _API = "https://api.postmarkapp.com"
 
@@ -463,7 +492,7 @@ class PostmarkHttpTransport:
 
     def reconcile(self, message_id: str):
         """Independently retrieve provider state (real HTTP) and, on success, attest it. Returns a
-        kernel-private ``_PostmarkVerifiedProviderState`` or None. Only THIS module holds the key."""
+        trusted ``_PostmarkVerifiedProviderState`` or None (constructed only by this trusted provider path)."""
         msg = self.get_outbound_message(message_id)
         if msg is None or not msg.get("MessageID"):
             return None

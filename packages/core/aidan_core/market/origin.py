@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from .. import audit, db
 from ..actions import canonical_payload_hash
-from ..errors import IdempotencyConflictError, MarketAuthorityError
+from ..errors import IdempotencyConflictError, MarketAuthorityError, NotFoundError
 
 REAL_PROVIDER = "REAL_PROVIDER"
 SIMULATED = "SIMULATED"
@@ -41,9 +41,12 @@ def _verified_proof(cur, action_request_id):
 
 
 def _is_real_attestation(provider_state) -> bool:
-    """REAL only for the kernel-private ``_PostmarkVerifiedProviderState`` produced by the genuine
-    production Postmark HTTP/reconciliation path — never a runtime type, subclass, or caller flag.
-    That object cannot be constructed outside the postmark module (private-key guarded)."""
+    """REAL only for the ``_PostmarkVerifiedProviderState`` produced by the genuine production
+    Postmark HTTP/reconciliation path — never a runtime type, subclass, or caller flag. Under the
+    current in-process trust model, REAL provenance is writable only through the trusted kernel/
+    provider paths (specialist workers hold no DB connection/authority); the private key + exact
+    type guard prevent accidental/public-API misuse, but are not a language security boundary
+    against arbitrary in-process malicious code (a Gate-9 sandbox concern, out of scope here)."""
     from .postmark import _PostmarkVerifiedProviderState  # lazy import to avoid a cycle
     # exact type (not isinstance) so a subclass that skips the key-guarded __init__ cannot forge it
     return type(provider_state) is _PostmarkVerifiedProviderState
@@ -52,7 +55,7 @@ def _is_real_attestation(provider_state) -> bool:
 def record_evidence_origin(conn, action_request_id: str, *, provider_state, provider_kind: str,
                            source_instance_ref: str, actor: str = "market") -> OriginResult:
     """Bind the action's VERIFIED MARKET_ACTION proof to a trusted origin. REAL_PROVIDER requires
-    the kernel-private provider attestation (produced only by the real HTTP reconciliation path);
+    the trusted provider attestation (produced only by the real HTTP reconciliation path);
     otherwise SIMULATED. Only a Postmark-verified action may be bound (a REAL origin cannot attach
     to a local/generic action). Idempotent per proof; conflicting provenance is rejected."""
     from .postmark import POSTMARK_VERIFIER_KIND  # lazy import to avoid a cycle
@@ -122,7 +125,7 @@ def has_real_no_response(conn, market_action_spec_id: str, action_request_id: st
 def record_observation_origin(conn, market_observation_id: str, *, provider_state, provider_kind: str,
                               source_instance_ref: str, provider_event_ref: str, actor: str = "market"):
     """Bind a market_observation to trusted REAL_PROVIDER provenance — ONLY from the trusted
-    Postmark ingestion path. REAL_PROVIDER requires BOTH the kernel-private provider attestation
+    Postmark ingestion path. REAL_PROVIDER requires BOTH the trusted provider attestation
     (real reconciliation) AND that the observation's action already carries a REAL_PROVIDER action
     proof (fail-closed: otherwise no row is written and the observation is SIMULATED by absence).
     Never a caller flag. Idempotent per observation; conflicting provenance is rejected."""

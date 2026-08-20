@@ -50,6 +50,14 @@ class ExecutionBlockedError(AidanCoreError):
     """Execution is prohibited by current policy (e.g. DENY / kill switch)."""
 
 
+class AmbiguousExternalEffectError(AidanCoreError):
+    """A consequential external action (e.g. an email send) may have crossed the provider boundary
+    but its effect cannot be deterministically reconciled to exactly one compliant result. It must
+    NOT be automatically retried: the runtime fails the action CLOSED into RECOVERY_REQUIRED, which
+    is not auto-claimable and requires explicit reconciliation/operator resolution. A merely empty,
+    eventually-consistent provider search is NOT proof the effect did not occur."""
+
+
 class ApprovalRequiredError(AidanCoreError):
     """No valid, non-expired approval exists for the current policy state."""
 

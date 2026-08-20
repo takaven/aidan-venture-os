@@ -27,7 +27,12 @@ from decimal import Decimal
 from typing import Optional
 
 from .. import audit, budget, db, execution, policy, proof
-from ..errors import ApprovalRequiredError, ExecutionBlockedError, NotFoundError
+from ..errors import (
+    AmbiguousExternalEffectError,
+    ApprovalRequiredError,
+    ExecutionBlockedError,
+    NotFoundError,
+)
 from . import artifacts as artifacts_mod
 from . import spec as spec_mod
 from .verifiers import VerificationRequest, VerifierRegistry, default_registry
@@ -68,6 +73,26 @@ def _record_failure(conn, action_id, attempt_id, attempt_number, max_attempts, b
         detail={"base_class": base_class, **(detail or {})}, terminal=terminal,
     )
     return to_state, final_class
+
+
+def _record_ambiguous_recovery_required(conn, action_id, attempt_id, detail):
+    """Fail an attempt CLOSED after an unresolved ambiguous external effect: the attempt is FAILED
+    (non-retryable), the action becomes RECOVERY_REQUIRED (not auto-claimable — see the execute_action
+    guard), and the budget reservation is HELD (the spend may have occurred). No ordinary retry may
+    dispatch again; only explicit recovery may reconcile the exact provider result later."""
+    with db.transaction(conn) as cur:
+        cur.execute(
+            "UPDATE execution_attempt SET status = 'FAILED', failure_class = 'AMBIGUOUS_EXTERNAL_EFFECT', "
+            "updated_at = now() WHERE id = %s",
+            (attempt_id,),
+        )
+        execution._set_status(cur, action_id, "RECOVERY_REQUIRED", actor="factory",
+                              reason="AMBIGUOUS_EXTERNAL_EFFECT")
+        audit.record_event(
+            cur, event_type="execution.ambiguous_external_effect", actor="factory", action_id=action_id,
+            payload={"attempt_id": str(attempt_id), **(detail or {})},
+        )
+    return "RECOVERY_REQUIRED"
 
 
 def request_dispatch_authorization(
@@ -153,6 +178,11 @@ def execute_action(
     status = execution.get_status(conn, action_request_id)
     if status in ("SUCCEEDED", "FAILED"):
         raise ExecutionBlockedError(f"action is terminal ({status}); no further attempt")
+    # A fail-closed action (a consequential external effect became ambiguous) is NOT auto-claimable:
+    # only explicit recovery may resolve it, so ordinary dispatch can never blind-re-issue the effect.
+    if status == "RECOVERY_REQUIRED":
+        raise ExecutionBlockedError(
+            "action is RECOVERY_REQUIRED (ambiguous external effect); explicit recovery required")
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM execution_attempt WHERE action_request_id = %s", (action_request_id,))
         prior_attempts = cur.fetchone()[0]
@@ -188,6 +218,14 @@ def execute_action(
     started = clock()
     try:
         result = adapter.execute(request)
+    except AmbiguousExternalEffectError as exc:
+        # The consequential external boundary was crossed ambiguously and could not be reconciled.
+        # This must NEVER auto-retry: fail CLOSED into RECOVERY_REQUIRED (not auto-claimable), so a
+        # later attempt can never blind-re-issue the effect. Only explicit recovery may resolve it.
+        to_state = _record_ambiguous_recovery_required(
+            conn, action_request_id, handle.attempt_id, {"error_type": type(exc).__name__})
+        return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
+                             to_state, dispatched=True, failure_class="AMBIGUOUS_EXTERNAL_EFFECT")
     except Exception as exc:  # a worker fault is a classified machine failure, not a crash
         to_state, final_class = _record_failure(
             conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,

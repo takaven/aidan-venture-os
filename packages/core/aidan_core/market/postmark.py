@@ -35,8 +35,8 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from psycopg.types.json import Json
 
-from .. import audit, db
-from ..errors import MarketAuthorityError, NotFoundError
+from .. import audit, db, execution
+from ..errors import AmbiguousExternalEffectError, MarketAuthorityError, NotFoundError
 from ..factory import runtime as factory_runtime
 from ..factory import spec as spec_mod
 from ..factory.verifiers import VerificationRequest, VerificationResult, VerifierRegistry
@@ -54,6 +54,12 @@ MARKET_ACTION = "MARKET_ACTION"
 # result is reconciled against provider state via the opaque correlation metadata (below)
 # before any retry. Never blind-retry an ambiguous real send.
 POSTMARK_SEND_SAFETY = "RECONCILABLE"
+
+
+class PostmarkSendRejected(MarketAuthorityError):
+    """A Postmark POST /email returned a 4xx client rejection: the send was deterministically NOT
+    accepted, so it is a PROVEN no-external-effect failure (ordinarily retryable) — distinct from an
+    ambiguous no-response / 5xx fault where the effect may have occurred."""
 
 # Verified provider events normalize ONLY into the existing finite observation vocabulary.
 _EVENT_TO_OBSERVATION = {"Delivery": "DELIVERED", "Bounce": "BOUNCED"}
@@ -222,28 +228,34 @@ class PostmarkEmailWorker:
         try:                                                   # (2) attempt the consequential POST
             mid = self._t.send_email(message_stream=message_stream, sender=sender, to=to, subject=subject,
                                      text_body=text_body, reply_to=reply_to, metadata=dict(correlation))
-        except Exception:                                      # AMBIGUOUS: may have crossed the boundary
-            reconciled = self._reconcile(expected, correlation)
-            if reconciled is not None:
-                return reconciled                              # the send DID occur -> capture, never re-POST
-            raise MarketAuthorityError(
-                "ambiguous Postmark send could not be reconciled against provider state; failing closed")
-        if not mid or str(mid) in ("", "None"):                # no usable MessageID -> not a proven send
+        except PostmarkSendRejected:
+            # A received provider REJECTION (HTTP response, not accepted): the send was NOT accepted,
+            # so this is a PROVEN no-effect failure — retryable (WORKER_ERROR), not recovery. Reconcile
+            # defensively in case a compliant message somehow exists; otherwise it is a plain failure.
             reconciled = self._reconcile(expected, correlation)
             if reconciled is not None:
                 return reconciled
-            raise MarketAuthorityError("Postmark send returned no usable MessageID; failing closed")
+            raise MarketAuthorityError("Postmark rejected the send (no external effect); retryable")
+        except Exception:
+            # AMBIGUOUS: no usable provider response — the POST MAY have crossed the boundary. Reconcile
+            # against provider state; capture if the exact message landed, else FAIL CLOSED into recovery
+            # (an empty, eventually-consistent search is NOT proof the effect did not occur).
+            reconciled = self._reconcile(expected, correlation)
+            if reconciled is not None:
+                return reconciled                              # the send DID occur -> capture, never re-POST
+            raise AmbiguousExternalEffectError(
+                "ambiguous Postmark send could not be reconciled against provider state; failing closed")
         return str(mid)
 
     def _reconcile(self, expected, correlation):
         """The single provider MessageID for the exact frozen action iff provider state holds exactly
-        one FULLY-compliant correlated message; None if none; raise if more than one (a prior
-        duplicate must never be silently resolved to an arbitrary id)."""
+        one FULLY-compliant correlated message; None if none; if more than one, the effect is
+        ambiguously duplicated -> fail CLOSED into recovery (never resolve to an arbitrary id)."""
         candidates = [msg for msg in self._t.find_outbound_by_correlation(dict(correlation))
                       if _message_matches_frozen(msg, expected)]
         if len(candidates) > 1:
-            raise MarketAuthorityError(
-                "multiple correlated Postmark messages exist for one action; refusing to send (prior duplicate)")
+            raise AmbiguousExternalEffectError(
+                "multiple correlated Postmark messages exist for one action; failing closed (prior duplicate)")
         return str(candidates[0]["MessageID"]) if candidates else None
 
 
@@ -477,6 +489,61 @@ def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkT
     return outcome
 
 
+def _frozen_expected(conn, action_request_id):
+    """The frozen correlation + exact-identity expectations for reconciling a Postmark action."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT expected_output_contract FROM execution_spec WHERE action_request_id = %s",
+                    (action_request_id,))
+        row = cur.fetchone()
+    c = dict(row[0] or {}) if row else {}
+    market = dict(c.get("market", {}))
+    pm = dict(c.get("postmark", {}))
+    fs = dict(pm.get("source", {}))
+    correlation = dict(pm.get("correlation", {}))
+    expected = {"correlation": correlation, "content_hash": market.get("content_hash"),
+                "recipient_hash": str(pm.get("recipient_hash")), "subject": fs.get("subject"),
+                "reply_to": pm.get("reply_to"), "sender": fs.get("sender"),
+                "message_stream": fs.get("message_stream")}
+    return correlation, expected
+
+
+def reconcile_postmark_recovery(conn, action_request_id: str, *, transport: PostmarkTransport,
+                                actual_cost=0, actor: str = "market"):
+    """Explicit recovery for a Postmark action that FAILED CLOSED on an ambiguous send (status
+    RECOVERY_REQUIRED). Search provider state by the frozen correlation: EXACTLY ONE fully-compliant
+    message -> capture it and complete through the normal deterministic verifier (one proof); ZERO
+    (an empty, eventually-consistent search is NOT proof of absence) or MULTIPLE (an ambiguous
+    duplicate) -> remain RECOVERY_REQUIRED, never redispatch and never pick arbitrarily. Ordinary
+    execute_action can never perform this — a RECOVERY_REQUIRED action is not auto-claimable."""
+    status = execution.get_status(conn, action_request_id)
+    if status != "RECOVERY_REQUIRED":
+        return {"outcome": "not_recovery_required", "status": status}
+    correlation, expected = _frozen_expected(conn, action_request_id)
+    candidates = [m for m in transport.find_outbound_by_correlation(dict(correlation))
+                  if _message_matches_frozen(m, expected)]
+    if len(candidates) > 1:
+        return {"outcome": "duplicate_detected"}          # ambiguous duplicate -> stay fail-closed
+    if not candidates:
+        return {"outcome": "still_ambiguous"}             # zero != proven absence -> stay fail-closed
+    message_id = str(candidates[0]["MessageID"])
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM execution_attempt WHERE action_request_id = %s "
+                    "ORDER BY attempt_number DESC LIMIT 1", (action_request_id,))
+        attempt_id = cur.fetchone()[0]
+    raw_payload = {"worker_kind": POSTMARK_VERIFIER_KIND, "worker_version": "postmark-recovery",
+                   "reported_outcome": "success",
+                   "structured_output": {"message_id": message_id, "sent": True, "delivered": True},
+                   "artifacts": [], "failure_metadata": {}}
+    execution.record_execution_result(conn, action_request_id, external_result_id=message_id,
+                                      reported_outcome="success", raw_payload=raw_payload, attempt_id=attempt_id)
+    with db.transaction(conn) as cur:
+        execution._set_status(cur, action_request_id, "RUNNING", actor=actor, reason="recovery.reconciled")
+    outcome = verify_postmark_action(conn, action_request_id, transport=transport,
+                                     actual_cost=actual_cost, actor=actor)
+    return {"outcome": "reconciled", "message_id": message_id,
+            "verified": bool(getattr(outcome, "verified", False))}
+
+
 # --------------------------------------------------------------------------
 # provider-event normalization -> existing market_observation
 # --------------------------------------------------------------------------
@@ -667,8 +734,15 @@ class PostmarkHttpTransport:
         import json
         body = json.dumps({"From": sender, "To": to, "Subject": subject, "TextBody": text_body,
                            "ReplyTo": reply_to, "Metadata": metadata, "MessageStream": message_stream}).encode()
-        _status, data = _http_request("POST", f"{self._API}/email", headers=self._headers(), body=body)
-        return (data or {}).get("MessageID")
+        status, data = _http_request("POST", f"{self._API}/email", headers=self._headers(), body=body)
+        mid = (data or {}).get("MessageID")
+        if status is not None and 200 <= status < 300 and mid:
+            return str(mid)
+        if status is not None and 400 <= status < 500:
+            # a received 4xx = deterministic client rejection: the send was NOT accepted (no effect)
+            raise PostmarkSendRejected(f"Postmark rejected the send (status={status})")
+        # 5xx / unusable response / accepted-without-id: the effect MAY have occurred -> ambiguous
+        raise AmbiguousExternalEffectError(f"Postmark send outcome is ambiguous (status={status})")
 
     def get_server_state(self) -> PostmarkServerState:
         """The actual Postmark server facts for the runtime token: GET /server -> ("ID","DeliveryType")

@@ -26,25 +26,38 @@ and only re-verified — it never exercised "provider accepted, client never rec
 
 ## Decisions
 
-### The worker guarantees exactly-once against provider state
+### The worker avoids blind duplicate dispatch against provider state
 
 `PostmarkEmailWorker` no longer issues a bare `send_email`. `_send_reconcilably`:
 
-1. **Never duplicates.** Before any POST it searches provider state by the frozen correlation
-   (`find_outbound_by_correlation`) and, if exactly one *fully-compliant* correlated message already
-   exists (`_message_matches_frozen`: correlation + content + recipient + Subject + Reply-To + sender
-   + MessageStream, not Sandboxed), it captures that MessageID instead of sending. So a retry after a
-   possibly-sent attempt reconciles rather than re-POSTs.
-2. **Reconciles ambiguity.** If the POST raises (network fault after dispatch) or returns no usable
-   MessageID, it searches again: exactly one compliant message → capture it (the send did occur, no
-   re-POST); **zero or unreconcilable → fail closed** (`MarketAuthorityError`), never a blind retry
-   and never a fabricated id.
-3. **More than one correlated message → fail closed** (evidence of a prior duplicate; never resolve
-   to an arbitrary id).
+1. **Never duplicates a reconcilable send.** Before any POST it searches provider state by the frozen
+   correlation (`find_outbound_by_correlation`) and, if exactly one *fully-compliant* correlated
+   message already exists (`_message_matches_frozen`: correlation + content + recipient + Subject +
+   Reply-To + sender + MessageStream, not Sandboxed), it captures that MessageID instead of sending.
+2. **Reconciles ambiguity.** If the POST fails after dispatch, it searches again: exactly one
+   compliant message → capture it (the send did occur, no re-POST).
+3. **More than one correlated message → fail closed** (ambiguous duplicate; never resolve to an
+   arbitrary id).
 
 Known **pre-send** failures (wrong frozen server, wrong credential/server, Sandbox server, wrong
-recipient/sender/source) are rejected *before* any POST and never reach the reconciler — they carry
-no external effect and remain ordinarily retryable.
+recipient/sender/source, and a deterministic 4xx `PostmarkSendRejected`) carry no external effect and
+remain ordinarily retryable — they never reach the ambiguous path.
+
+### Exactly-once is not provable from an empty eventually-consistent search — fail closed
+
+An empty `find_outbound_by_correlation` result is an *observation* ("no matching message returned
+now"), never proof the POST did not occur: provider search is eventually consistent and can lag or be
+briefly unavailable. Conflating "zero now" with "proven absence" would let a later attempt blind-POST
+a possibly-sent email. Therefore, when the consequential boundary has been crossed ambiguously (a
+network/5xx fault, or a pre-existing multiple-match) and reconciliation cannot resolve it to exactly
+one compliant message, the worker raises the generic `AmbiguousExternalEffectError`. The factory maps
+it to a durable **`RECOVERY_REQUIRED`** state that is **not auto-claimable** (`execute_action` refuses
+it), so no ordinary later attempt — and no `max_attempts > 1` — can re-issue the effect. The budget
+reservation is held. Only **explicit** recovery (`reconcile_postmark_recovery`) resolves it: exactly
+one compliant provider message → capture it and complete through the normal deterministic verifier
+(one proof); zero (still not proven absent) or multiple (duplicate) → stay `RECOVERY_REQUIRED`, never
+redispatch and never select arbitrarily. This is **no blind duplicate dispatch**, not an absolute
+distributed-systems exactly-once claim.
 
 ### The dispatch path declares the real safety mode
 

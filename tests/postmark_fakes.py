@@ -71,6 +71,11 @@ class FakePostmarkTransport:
     def get_server_state(self):
         return pm.PostmarkServerState(server_id=self._server_id, delivery_type=self._delivery_type)
 
+    def find_outbound_by_correlation(self, correlation):
+        want = {k: str(v) for k, v in correlation.items()}
+        return [dict(m) for m in self.outbound.values()
+                if all(str(dict(m.get("Metadata", {})).get(k)) == v for k, v in want.items())]
+
 
 def stub_postmark_http(store, server_id="server-A", delivery_type="Live"):
     """A drop-in for ``postmark._http_request`` backed by an in-memory Postmark HTTP API, including
@@ -92,6 +97,14 @@ def stub_postmark_http(store, server_id="server-A", delivery_type="Live"):
                           "Sandboxed": delivery_type == "Sandbox",
                           "Metadata": data["Metadata"], "Status": "Sent"}
             return 200, {"MessageID": mid}
+        if method == "GET" and "/messages/outbound?" in url:   # correlation search (metadata_* filters)
+            import urllib.parse as _up
+            q = _up.parse_qs(_up.urlparse(url).query)
+            want = {k[len("metadata_"):]: v[0] for k, v in q.items() if k.startswith("metadata_")}
+            msgs = [{"MessageID": mid} for mid, rec in store.items()
+                    if mid != "_n" and all(str(dict(rec.get("Metadata", {})).get(kk)) == vv
+                                           for kk, vv in want.items())]
+            return 200, {"Messages": msgs}
         if method == "GET" and "/messages/outbound/" in url:
             mid = url.split("/messages/outbound/")[1].split("/details")[0]
             rec = store.get(mid)

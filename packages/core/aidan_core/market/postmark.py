@@ -117,6 +117,7 @@ class PostmarkTransport(Protocol):
                    reply_to: str, metadata: dict) -> str: ...
     def get_outbound_message(self, message_id: str) -> Optional[dict]: ...
     def get_server_state(self) -> "PostmarkServerState": ...   # actual Server ID + DeliveryType
+    def find_outbound_by_correlation(self, correlation: dict) -> list: ...   # reconcile ambiguous sends
 
 
 @runtime_checkable
@@ -190,15 +191,60 @@ class PostmarkEmailWorker:
             subject = "Unapproved subject line"
         if self.mode == "wrong_reply_to":
             reply_to = "reply+FORGED@reply.invalid"
-        message_id = "claimed-nonexistent"
-        if self.mode != "nothing":
-            message_id = self._t.send_email(
-                message_stream=message_stream, sender=sender, to=recipient, subject=subject,
-                text_body=text_body, reply_to=reply_to, metadata=dict(pm["correlation"]))
+        correlation = dict(pm["correlation"])
+        if self.mode == "nothing":
+            message_id = "claimed-nonexistent"                 # a proven NO-SEND (no external effect)
+        else:
+            # RECONCILABLE consequential send (ADR-034): never POST while provider state already holds
+            # the exact correlated message, and on an AMBIGUOUS POST (it may have crossed the boundary)
+            # reconcile against provider state before ANY retry — capture if present, else FAIL CLOSED.
+            expected = {"correlation": correlation, "content_hash": m["content_hash"],
+                        "recipient_hash": str(pm.get("recipient_hash")), "subject": fs["subject"],
+                        "reply_to": pm["reply_to"], "sender": fs["sender"], "message_stream": fs["message_stream"]}
+            message_id = self._send_reconcilably(
+                expected, message_stream=message_stream, sender=sender, to=recipient, subject=subject,
+                text_body=text_body, reply_to=reply_to, correlation=correlation)
         return WorkerResult(
             worker_kind=self.kind, external_result_id=message_id, reported_outcome="success",
             worker_version="postmark-test",
             structured_output={"message_id": message_id, "sent": True, "delivered": True})
+
+    def _send_reconcilably(self, expected, *, message_stream, sender, to, subject, text_body,
+                           reply_to, correlation) -> str:
+        """Issue the consequential POST with an exactly-once guarantee. Provider state is the arbiter:
+        a POST is never issued while the exact correlated message already exists, and a POST whose
+        outcome is ambiguous (network fault after dispatch, or no usable MessageID) is reconciled
+        against provider state — captured if the exact message landed, else failed closed with NO
+        blind re-dispatch. Known PRE-send failures are handled earlier and never reach here."""
+        existing = self._reconcile(expected, correlation)      # (1) never duplicate a prior send
+        if existing is not None:
+            return existing
+        try:                                                   # (2) attempt the consequential POST
+            mid = self._t.send_email(message_stream=message_stream, sender=sender, to=to, subject=subject,
+                                     text_body=text_body, reply_to=reply_to, metadata=dict(correlation))
+        except Exception:                                      # AMBIGUOUS: may have crossed the boundary
+            reconciled = self._reconcile(expected, correlation)
+            if reconciled is not None:
+                return reconciled                              # the send DID occur -> capture, never re-POST
+            raise MarketAuthorityError(
+                "ambiguous Postmark send could not be reconciled against provider state; failing closed")
+        if not mid or str(mid) in ("", "None"):                # no usable MessageID -> not a proven send
+            reconciled = self._reconcile(expected, correlation)
+            if reconciled is not None:
+                return reconciled
+            raise MarketAuthorityError("Postmark send returned no usable MessageID; failing closed")
+        return str(mid)
+
+    def _reconcile(self, expected, correlation):
+        """The single provider MessageID for the exact frozen action iff provider state holds exactly
+        one FULLY-compliant correlated message; None if none; raise if more than one (a prior
+        duplicate must never be silently resolved to an arbitrary id)."""
+        candidates = [msg for msg in self._t.find_outbound_by_correlation(dict(correlation))
+                      if _message_matches_frozen(msg, expected)]
+        if len(candidates) > 1:
+            raise MarketAuthorityError(
+                "multiple correlated Postmark messages exist for one action; refusing to send (prior duplicate)")
+        return str(candidates[0]["MessageID"]) if candidates else None
 
 
 # --------------------------------------------------------------------------
@@ -316,6 +362,21 @@ def _recipient_hash(address: str) -> str:
     return hashlib.sha256(_normalize_email(address).encode("utf-8")).hexdigest()
 
 
+def _message_matches_frozen(msg: dict, expected: dict) -> bool:
+    """A provider message IS the exact frozen action only if its correlation, content, recipient,
+    subject, Reply-To, sender and stream all match the frozen contract and it is not Sandboxed —
+    a bare Metadata match is never sufficient for reconciliation (mirrors the verifier's identities)."""
+    meta = dict(msg.get("Metadata", {}))
+    return (all(str(meta.get(k)) == str(v) for k, v in expected["correlation"].items())
+            and channels_mod.content_sha(str(msg.get("TextBody", ""))) == expected["content_hash"]
+            and _recipient_hash(str(msg.get("To"))) == str(expected["recipient_hash"])
+            and str(msg.get("Subject")) == str(expected["subject"])
+            and _normalize_email(msg.get("ReplyTo")) == _normalize_email(expected["reply_to"])
+            and str(msg.get("From")) == str(expected["sender"])
+            and str(msg.get("MessageStream")) == str(expected["message_stream"])
+            and msg.get("Sandboxed") is not True)
+
+
 def _frozen_source(source: PostmarkSource) -> dict:
     """The exact non-secret provider execution identity frozen at authorization (never the token)."""
     return {"provider_kind": "postmark", "postmark_server_id": source.postmark_server_id,
@@ -374,8 +435,12 @@ def execute_postmark_action(conn, action_request_id: str, *, registry: WorkerReg
                             max_attempts: int = 1, actor: str = "market", **kw):
     prepare_postmark_execution(conn, action_request_id, source=source, resolver=resolver,
                                max_attempts=max_attempts, actor=actor)
+    # Declare the ACTUAL send safety: a real email is a consequential, non-idempotent action, so it
+    # must NOT inherit the factory IDEMPOTENT default. The worker enforces exactly-once against
+    # provider state (never a blind duplicate); RECONCILABLE also governs crash/lease recovery.
     return factory_runtime.execute_action(
-        conn, action_request_id, registry=registry, workspace_ref=f"market://{POSTMARK_CHANNEL}", actor=actor, **kw)
+        conn, action_request_id, registry=registry, workspace_ref=f"market://{POSTMARK_CHANNEL}",
+        safety_mode=POSTMARK_SEND_SAFETY, actor=actor, **kw)
 
 
 def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkTransport,
@@ -631,6 +696,22 @@ class PostmarkHttpTransport:
             "Subject": data.get("Subject"), "TextBody": data.get("TextBody"),
             "ReplyTo": reply_to, "Sandboxed": data.get("Sandboxed"),
             "Metadata": data.get("Metadata", {}), "Status": data.get("Status")}
+
+    def find_outbound_by_correlation(self, correlation: dict) -> list:
+        """Search Postmark's outbound messages by the frozen correlation Metadata (the unique action
+        identity), then load each candidate's full details for exact-identity reconciliation. A bare
+        metadata match is never trusted alone — the caller re-checks the full frozen contract."""
+        import urllib.parse
+        params = "&".join(f"metadata_{k}={urllib.parse.quote(str(v))}" for k, v in correlation.items())
+        _status, data = _http_request(
+            "GET", f"{self._API}/messages/outbound?count=100&offset=0&{params}", headers=self._headers())
+        out = []
+        for m in (data or {}).get("Messages", []):
+            mid = m.get("MessageID")
+            full = self.get_outbound_message(mid) if mid else None
+            if full is not None:
+                out.append(full)
+        return out
 
     def reconcile(self, message_id: str):
         """Independently retrieve provider state (real HTTP) and, on success, attest it with the

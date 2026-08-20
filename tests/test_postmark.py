@@ -254,9 +254,9 @@ def test_39_send_safety_mode_is_reconcilable(migrated):
     assert pm.POSTMARK_SEND_SAFETY == "RECONCILABLE"
 
 
-def test_40_ambiguous_result_reconciles_against_provider_state(migrated):
-    # the message exists in provider state; re-verifying reconciles to the same proof WITHOUT
-    # resending (exactly-once), i.e. an ambiguous result is resolved by provider reconciliation.
+def test_40_verification_replay_is_idempotent(migrated):
+    # a durable captured result re-verifies to the SAME single proof without resending (replay
+    # convergence) — this is NOT the ambiguous-send case (that is covered below).
     r = postmark_run(migrated, "p40")
     assert r.verify.verified is True
     before_sends = len(r.transport.outbound)
@@ -717,3 +717,191 @@ def test_sandbox_action_stays_simulated(migrated, monkeypatch):
         source=default_source("server-A"), resolver=FakeRecipientResolver())
     assert store.get("_n", 0) == 0                 # Sandbox blocked before send
     assert origin_mod.action_reality(migrated, a) == "SIMULATED"   # no REAL loop can form from Sandbox
+
+
+# ==========================================================================
+# ZIP-audit correction: ambiguous consequential send must never blind-retry (ADR-034)
+# ==========================================================================
+import json as _json
+
+
+def _store_message(store, data, *, sandboxed=False):
+    store["_n"] = store.get("_n", 0) + 1
+    mid = f"pmhttp-{data['Metadata']['market_action_spec']}-{store['_n']}"
+    store[mid] = {"MessageID": mid, "MessageStream": data["MessageStream"], "From": data["From"],
+                  "To": [{"Email": data["To"]}], "Subject": data["Subject"], "TextBody": data["TextBody"],
+                  "ReplyTo": data.get("ReplyTo"), "Sandboxed": sandboxed,
+                  "Metadata": data["Metadata"], "Status": "Sent"}
+    return mid
+
+
+def _search(store, url, *, hidden=None):
+    import urllib.parse as _up
+    q = _up.parse_qs(_up.urlparse(url).query)
+    want = {k[len("metadata_"):]: v[0] for k, v in q.items() if k.startswith("metadata_")}
+    hidden = hidden or set()
+    return {"Messages": [{"MessageID": mid} for mid, rec in store.items()
+                         if mid != "_n" and mid not in hidden
+                         and all(str(dict(rec.get("Metadata", {})).get(kk)) == vv for kk, vv in want.items())]}
+
+
+def _run_amb(migrated, monkeypatch, slug, req_fn, *, max_attempts=1):
+    monkeypatch.setattr(pm, "_http_request", req_fn)
+    transport = pm.PostmarkHttpTransport("STUB-not-used")
+    setup = operating_setup(migrated, slug)
+    a, spec = postmark_action(migrated, setup, key=slug)
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))),
+        source=default_source("server-A"), resolver=FakeRecipientResolver(), max_attempts=max_attempts)
+    return a, transport
+
+
+def test_ambiguous_send_reconciles_no_duplicate(migrated, monkeypatch):
+    # provider ACCEPTS + stores the email, but the client never receives the MessageID (POST raises);
+    # reconciliation finds the exact message -> capture it, verify it, ONE provider send, one proof.
+    store, posts = {}, {"n": 0}
+
+    def flaky(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": "server-A", "DeliveryType": "Live"}
+        if method == "POST" and url.endswith("/email"):
+            posts["n"] += 1
+            _store_message(store, _json.loads(body))         # provider recorded it ...
+            raise TimeoutError("connection reset after send")  # ... but the client never learns the id
+        if method == "GET" and "/messages/outbound?" in url:
+            return 200, _search(store, url)
+        if method == "GET" and "/messages/outbound/" in url:
+            mid = url.split("/messages/outbound/")[1].split("/details")[0]
+            rec = store.get(mid)
+            return (200, rec) if rec is not None else (404, None)
+        return 400, None
+
+    a, transport = _run_amb(migrated, monkeypatch, "amb-ok", flaky)
+    assert posts["n"] == 1                               # exactly one POST crossed the boundary
+    assert store.get("_n") == 1                          # exactly one provider message exists
+    assert pm.verify_postmark_action(migrated, a, transport=transport).verified is True
+
+
+def test_ambiguous_send_unreconcilable_fails_closed(migrated, monkeypatch):
+    # POST may have crossed the boundary but reconciliation is inconclusive (search cannot confirm):
+    # NO second POST, NO proof, NO REAL origin, action FAILED (fail closed).
+    posts = {"n": 0}
+
+    def amb(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": "server-A", "DeliveryType": "Live"}
+        if method == "POST" and url.endswith("/email"):
+            posts["n"] += 1
+            raise ConnectionError("lost; send status unknown")
+        if method == "GET" and "/messages/outbound?" in url:
+            return 200, {"Messages": []}                 # provider search cannot confirm the send
+        if method == "GET" and "/messages/outbound/" in url:
+            return 404, None
+        return 400, None
+
+    a, transport = _run_amb(migrated, monkeypatch, "amb-x", amb)
+    assert posts["n"] == 1                               # exactly one attempt; NO blind re-dispatch
+    with migrated.cursor() as cur:
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "FAILED"
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s "
+                    "AND verification_type='MARKET_ACTION' AND result='VERIFIED'", (a,))
+        assert cur.fetchone()[0] == 0
+    from aidan_core.market import origin as origin_mod
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"
+
+
+def test_send_rejected_creates_no_false_success(migrated, monkeypatch):
+    # a deterministic provider rejection (no outbound message created) must never become a proof.
+    def rej(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": "server-A", "DeliveryType": "Live"}
+        if method == "POST" and url.endswith("/email"):
+            return 422, None                             # rejected before acceptance; nothing stored
+        if method == "GET" and "/messages/outbound?" in url:
+            return 200, {"Messages": []}
+        if method == "GET" and "/messages/outbound/" in url:
+            return 404, None
+        return 400, None
+
+    a, transport = _run_amb(migrated, monkeypatch, "rej", rej)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s "
+                    "AND verification_type='MARKET_ACTION' AND result='VERIFIED'", (a,))
+        assert cur.fetchone()[0] == 0
+    from aidan_core.market import origin as origin_mod
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"
+
+
+def test_retry_after_ambiguous_send_does_not_duplicate(migrated, monkeypatch):
+    # max_attempts=2, but a fresh attempt can NEVER blindly re-POST. Attempt 1's POST lands yet the
+    # message is momentarily invisible to search (attempt 1's pre- AND post-send searches both miss
+    # it) -> attempt 1 fails closed; attempt 2's PRE-send search now sees it and CAPTURES it — one
+    # provider send total, action VERIFIED, two genuine attempts, no duplicate dispatch.
+    store, posts, reveal = {}, {"n": 0}, {"skip": 2}     # hide from attempt-1 pre+post searches
+
+    def laggy(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": "server-A", "DeliveryType": "Live"}
+        if method == "POST" and url.endswith("/email"):
+            posts["n"] += 1
+            _store_message(store, _json.loads(body))     # provider recorded it
+            raise TimeoutError("response lost")          # client never learns the id
+        if method == "GET" and "/messages/outbound?" in url:
+            if reveal["skip"] > 0:                        # search lag: invisible until attempt 2
+                reveal["skip"] -= 1
+                return 200, {"Messages": []}
+            return 200, _search(store, url)
+        if method == "GET" and "/messages/outbound/" in url:
+            mid = url.split("/messages/outbound/")[1].split("/details")[0]
+            rec = store.get(mid)
+            return (200, rec) if rec is not None else (404, None)
+        return 400, None
+
+    monkeypatch.setattr(pm, "_http_request", laggy)
+    transport = pm.PostmarkHttpTransport("STUB-not-used")
+    setup = operating_setup(migrated, "amb-retry")
+    a, spec = postmark_action(migrated, setup, key="amb-retry")
+    common = dict(source=default_source("server-A"), resolver=FakeRecipientResolver(), max_attempts=2)
+    # attempt 1 -> ambiguous, unreconcilable this round -> worker fails closed (retryable; the worker
+    # raised, so NO execution_result was captured and there is nothing yet to verify)
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))), **common)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM execution_result WHERE action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0                    # attempt 1 captured no result (failed closed)
+    # attempt 2 -> pre-send reconciliation finds the already-sent message and CAPTURES it (no re-POST)
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))), **common)
+    assert posts["n"] == 1                               # attempt 2 reconciled; it did NOT re-POST
+    assert store.get("_n") == 1
+    assert pm.verify_postmark_action(migrated, a, transport=transport).verified is True
+    with migrated.cursor() as cur:
+        cur.execute("SELECT count(*) FROM execution_attempt WHERE action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 2                    # two genuine attempts
+
+
+def test_worker_reconciles_prior_send_without_duplicate(migrated):
+    # code-level invariant (independent of runtime max_attempts): re-running the worker against a
+    # provider that already holds the exact correlated message CAPTURES it rather than re-POSTing.
+    setup, a = _prepare(migrated, "idem", source=default_source("server-A"))
+    t = FakePostmarkTransport()
+    req = _frozen_worker_request(migrated, a, setup.venture_id)
+    w = pm.PostmarkEmailWorker(t, FakeRecipientResolver(), default_source("server-A"))
+    r1 = w.execute(req)
+    assert len(t.outbound) == 1
+    r2 = w.execute(req)                                  # a "second attempt" must not re-POST
+    assert len(t.outbound) == 1 and r2.external_result_id == r1.external_result_id
+
+
+def test_worker_refuses_when_multiple_correlated_messages_exist(migrated):
+    # provider state holds two messages for one action (evidence of a prior duplicate): fail closed,
+    # never send again and never resolve to an arbitrary id.
+    r = postmark_run(migrated, "multi")
+    m1 = _mid(r)
+    r.transport.outbound["pm-DUPE"] = {**r.transport.outbound[m1], "MessageID": "pm-DUPE"}
+    before = len(r.transport.outbound)
+    req = _frozen_worker_request(migrated, r.action_id, r.setup.venture_id)
+    with pytest.raises(MarketAuthorityError):
+        pm.PostmarkEmailWorker(r.transport, FakeRecipientResolver(), default_source("server-A")).execute(req)
+    assert len(r.transport.outbound) == before          # no additional send

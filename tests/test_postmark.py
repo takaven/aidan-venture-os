@@ -20,6 +20,7 @@ from aidan_core.market import observation as obs_mod
 from aidan_core.market import postmark as pm
 
 from postmark_fakes import (
+    SYNTHETIC_TOKEN,
     FakePostmarkTransport,
     FakeRecipientResolver,
     basic_auth,
@@ -299,14 +300,22 @@ def test_45_46_cross_venture_recipient_isolation(migrated):
     assert ra != rb
 
 
-def test_47_48_no_raw_credentials_in_canonical_state(migrated):
+def test_47_48_only_opaque_credential_ref_is_canonical(migrated):
+    # accepted authority model: the OPAQUE credential_ref + frozen non-secret source/recipient
+    # identity ARE canonical; the raw server token and webhook secret must NEVER be canonical.
     r = postmark_run(migrated, "p47")
     from aidan_core.factory import spec as spec_mod
     row = spec_mod.get_execution_spec(migrated, r.action_id)
     blob = str(row)
-    # the opaque credential ref / fake token never enter the execution spec / task payload
+    frozen = spec_mod.get_execution_spec(migrated, r.action_id)[4]["postmark"]
+    # opaque credential_ref + frozen recipient identity are canonical (frozen provider authority)
+    assert frozen["source"]["credential_ref"] == r.source.credential_ref
+    assert r.source.credential_ref in blob
+    assert len(frozen["recipient_hash"]) == 64
+    # secret credential material is NEVER canonical (raw token + webhook secret, exact fixture values)
+    assert SYNTHETIC_TOKEN not in blob                        # raw server token
+    assert r.source.webhook_secret and r.source.webhook_secret not in blob   # webhook Basic-Auth secret
     assert "FAKE-SERVER-TOKEN" not in blob and "FAKE-WEBHOOK-SECRET" not in blob
-    assert r.source.credential_ref not in blob
 
 
 def test_50_no_network_calls_in_suite(migrated):

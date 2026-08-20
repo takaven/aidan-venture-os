@@ -34,6 +34,10 @@ class VerificationRequest:
     worker_structured_output: dict[str, Any]
     artifacts: tuple[dict[str, Any], ...]
     spec_hash: str
+    # The exact CAPTURED execution_result.external_result_id the Proof Receipt will bind to. A
+    # verifier that proves a provider object MUST prove the object named by THIS canonical id,
+    # never a divergent value taken only from the (untrusted) worker structured output.
+    external_result_id: str = ""
 
 
 @dataclass(frozen=True)

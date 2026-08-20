@@ -551,7 +551,8 @@ def test_finding_D_worker_claiming_foreign_message_rejected(migrated):
     _task, contract = pm._postmark_contract(migrated, a.action_id, source, resolver)
     req = VerificationRequest(action_request_id=a.action_id, execution_attempt_id="x",
                               verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
-                              worker_structured_output={"message_id": foreign_mid}, artifacts=(), spec_hash="h")
+                              worker_structured_output={"message_id": foreign_mid}, artifacts=(), spec_hash="h",
+                              external_result_id=foreign_mid)   # canonical id present; rejection is the foreign action
     verdict = pm.PostmarkActionVerifier(transport).verify(req)
     assert verdict.verdict == "REJECTED"
 

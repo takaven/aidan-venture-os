@@ -297,6 +297,9 @@ def verify_and_complete(
         action_request_id=str(action_request_id), execution_attempt_id=str(attempt_id),
         verifier_kind=verifier_kind, expected_output_contract=expected_output_contract,
         worker_structured_output=structured_output, artifacts=durable_artifacts, spec_hash=spec_hash,
+        # The canonical captured result identity the proof will bind to — the verifier proves THIS
+        # object, so it can never verify provider object B while the proof is attached to result A.
+        external_result_id=("" if external_result_id is None else str(external_result_id)),
     )
     vr = registry.get(verifier_kind).verify(request)  # KeyError on unknown kind -> no receipt, no completion
 

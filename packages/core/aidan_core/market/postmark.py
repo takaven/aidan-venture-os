@@ -96,12 +96,27 @@ def reply_mailbox_hash(venture_id, market_action_spec_id) -> str:
 # --------------------------------------------------------------------------
 # provider transport boundary (tiny + Postmark-specific)
 # --------------------------------------------------------------------------
+REQUIRED_DELIVERY_TYPE = "Live"   # a REAL Postmark market action must run on a Live server
+
+
+@dataclass(frozen=True)
+class PostmarkServerState:
+    """Trusted provider facts from the server-scoped GET /server (the SAME runtime token that
+    sends): the actual Server ID AND its DeliveryType. DeliveryType is fixed at server creation and
+    cannot change; a 'Sandbox' server ACCEPTS and 'delivers' messages (visible in the UI, webhooks,
+    and API) WITHOUT ever reaching a real recipient — so a REAL market action requires
+    ``delivery_type == 'Live'`` and a Sandbox server is blocked before any consequential send."""
+
+    server_id: str
+    delivery_type: str          # 'Live' | 'Sandbox'
+
+
 @runtime_checkable
 class PostmarkTransport(Protocol):
     def send_email(self, *, message_stream: str, sender: str, to: str, subject: str, text_body: str,
                    reply_to: str, metadata: dict) -> str: ...
     def get_outbound_message(self, message_id: str) -> Optional[dict]: ...
-    def get_server_identity(self) -> str: ...   # actual Postmark Server ID for the runtime token
+    def get_server_state(self) -> "PostmarkServerState": ...   # actual Server ID + DeliveryType
 
 
 @runtime_checkable
@@ -146,16 +161,23 @@ class PostmarkEmailWorker:
                 or str(src.default_subject) != str(fs.get("subject"))
                 or str(src.credential_ref) != str(fs.get("credential_ref"))):
             raise MarketAuthorityError("worker provider configuration does not match the frozen approved source")
-        # PROVE the transport's actual runtime credential belongs to the frozen Postmark server
-        # (GET /server) — a matching credential_ref string is NOT sufficient.
-        if str(self._t.get_server_identity()) != str(fs.get("postmark_server_id")):
+        # PROVE the transport's actual runtime credential belongs to the frozen Postmark server AND
+        # that the server is LIVE (GET /server) — a matching credential_ref string is NOT sufficient,
+        # and a Sandbox server (which 'delivers' without reaching a real recipient) is refused BEFORE
+        # any consequential send, never silently downgraded to SIMULATED after sending.
+        server = self._t.get_server_state()
+        if str(server.server_id) != str(fs.get("postmark_server_id")):
             raise MarketAuthorityError("transport credential does not belong to the frozen Postmark server")
+        if str(server.delivery_type) != REQUIRED_DELIVERY_TYPE:
+            raise MarketAuthorityError(
+                "Postmark server is not Live; a Sandbox server cannot perform a real market action")
         recipient = self._resolver.resolve(str(request.venture_id), m["source_instance_ref"], m["audience_ref"])
         if _recipient_hash(recipient) != str(pm.get("recipient_hash")):
             raise MarketAuthorityError("resolved recipient does not match the frozen approved recipient")
         # send using the FROZEN identities (adversarial modes tamper the OUTBOUND value after the
         # authority check, to also exercise the independent verifier).
         message_stream, sender, subject, text_body = fs["message_stream"], fs["sender"], fs["subject"], m["content"]
+        reply_to = pm["reply_to"]
         if self.mode == "wrong_content":
             text_body = text_body + " TAMPERED"
         if self.mode == "wrong_audience":
@@ -164,11 +186,15 @@ class PostmarkEmailWorker:
             sender = "spoofed@elsewhere.test"
         if self.mode == "wrong_source":
             message_stream = "stream-OTHER"
+        if self.mode == "wrong_subject":
+            subject = "Unapproved subject line"
+        if self.mode == "wrong_reply_to":
+            reply_to = "reply+FORGED@reply.invalid"
         message_id = "claimed-nonexistent"
         if self.mode != "nothing":
             message_id = self._t.send_email(
                 message_stream=message_stream, sender=sender, to=recipient, subject=subject,
-                text_body=text_body, reply_to=pm["reply_to"], metadata=dict(pm["correlation"]))
+                text_body=text_body, reply_to=reply_to, metadata=dict(pm["correlation"]))
         return WorkerResult(
             worker_kind=self.kind, external_result_id=message_id, reported_outcome="success",
             worker_version="postmark-test",
@@ -201,35 +227,52 @@ class PostmarkActionVerifier:
         # PostmarkSource/RecipientResolver supplied later.
         fs = dict(pm.get("source", {}))
         recipient_hash = str(pm.get("recipient_hash"))
+        expected_subject = str(fs.get("subject"))
+        expected_reply_to = _normalize_email(pm.get("reply_to"))
+        # CANONICAL result identity: the provider object proven MUST be the exact captured
+        # execution_result.external_result_id the Proof Receipt binds to. The worker's structured
+        # message_id is inert unless it EQUALS that canonical id, and the provider lookup itself uses
+        # the canonical id — so a worker can never verify object B while the proof is attached to
+        # result A (external_result_id == structured message_id == provider MessageID, all three).
+        canonical = str(request.external_result_id or "")
         claimed = str((request.worker_structured_output or {}).get("message_id"))
+        result_ok = canonical not in ("", "None") and claimed == canonical
 
-        # Independent provider fetch by the claimed MessageID (works for the fake AND the real
-        # PostmarkHttpTransport via GET /messages/outbound/{id}/details). The located message's
-        # own Metadata is then checked against the canonical correlation, so a worker that lies
-        # about its MessageID (nonexistent, or one belonging to another action) is rejected.
-        msg = self._t.get_outbound_message(claimed) if claimed and claimed != "None" else None
+        # Independent provider fetch BY the canonical result id (works for the fake AND the real
+        # PostmarkHttpTransport via GET /messages/outbound/{id}/details). The located message's own
+        # Metadata is then checked against the canonical correlation.
+        msg = self._t.get_outbound_message(canonical) if canonical not in ("", "None") else None
         exists = msg is not None
         msg = msg or {}
         meta = dict(msg.get("Metadata", {}))
-        # the transport credential must belong to the frozen Postmark server (independent GET /server)
-        server_ok = str(self._t.get_server_identity()) == str(fs.get("postmark_server_id"))
+        # the transport credential must belong to the frozen Postmark server AND be LIVE (GET /server)
+        server = self._t.get_server_state()
+        server_ok = str(server.server_id) == str(fs.get("postmark_server_id"))
+        live_ok = str(server.delivery_type) == REQUIRED_DELIVERY_TYPE
 
         checks = []
+        checks.append(("RESULT_IDENTITY", result_ok))
         checks.append(("ACTION_EXISTS", exists))
         checks.append(("SERVER_IDENTITY", server_ok))
+        checks.append(("LIVE_PROVIDER", live_ok))
         if exists:
             checks.append(("CORRELATION_IDENTITY",
                            all(str(meta.get(k)) == str(correlation.get(k)) for k in correlation)))
             checks.append(("ACTION_IDENTITY",
                            channels_mod.content_sha(str(msg.get("TextBody", ""))) == market.get("content_hash")
                            and str(meta.get("action_spec_hash")) == str(market.get("action_spec_hash"))))
+            checks.append(("SUBJECT_IDENTITY", str(msg.get("Subject")) == expected_subject))
             checks.append(("AUDIENCE_IDENTITY", _recipient_hash(str(msg.get("To"))) == recipient_hash))
+            checks.append(("REPLY_TO_IDENTITY", _normalize_email(msg.get("ReplyTo")) == expected_reply_to))
             checks.append(("CHANNEL_IDENTITY", str(msg.get("MessageStream")) == str(fs.get("message_stream"))))
             checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(fs.get("sender"))))
-            checks.append(("ACCEPTANCE_IDENTITY", claimed == str(msg.get("MessageID")) and claimed not in ("", "None")))
+            checks.append(("NOT_SANDBOXED", msg.get("Sandboxed") is not True))
+            checks.append(("ACCEPTANCE_IDENTITY",
+                           canonical == str(msg.get("MessageID")) and canonical not in ("", "None")))
         else:
-            for name in ("CORRELATION_IDENTITY", "ACTION_IDENTITY", "AUDIENCE_IDENTITY", "CHANNEL_IDENTITY",
-                         "SENDER_IDENTITY", "ACCEPTANCE_IDENTITY"):
+            for name in ("CORRELATION_IDENTITY", "ACTION_IDENTITY", "SUBJECT_IDENTITY", "AUDIENCE_IDENTITY",
+                         "REPLY_TO_IDENTITY", "CHANNEL_IDENTITY", "SENDER_IDENTITY", "NOT_SANDBOXED",
+                         "ACCEPTANCE_IDENTITY"):
                 checks.append((name, False))
 
         ok = all(v for _n, v in checks)
@@ -237,6 +280,7 @@ class PostmarkActionVerifier:
         evidence = {
             "market_action_spec_id": market.get("market_action_spec_id"),
             "action_spec_hash": market.get("action_spec_hash"),
+            "external_result_id": canonical,       # evidence binds the canonical captured result id
             "message_id": msg.get("MessageID") if exists else None,
             "checks": [[n, bool(v)] for n, v in checks],
         }
@@ -514,14 +558,15 @@ class _PostmarkVerifiedProviderState:
     kernel/provider-path boundary (specialist workers hold no DB authority), NOT a language-level
     guarantee against arbitrary in-process malicious code — that sandbox is a later-gate concern."""
 
-    __slots__ = ("message_id", "server_id", "message_stream")
+    __slots__ = ("message_id", "server_id", "message_stream", "delivery_type")
 
-    def __init__(self, _key, *, message_id, server_id, message_stream):
+    def __init__(self, _key, *, message_id, server_id, message_stream, delivery_type):
         if _key is not _ATTEST_KEY:
             raise RuntimeError("_PostmarkVerifiedProviderState requires the trusted provider-path key")
         self.message_id = message_id
         self.server_id = server_id            # actual Postmark Server ID (GET /server)
         self.message_stream = message_stream
+        self.delivery_type = delivery_type    # actual DeliveryType — a REAL attestation is only Live
 
 
 def _http_request(method: str, url: str, *, headers: dict, body: bytes = None):  # pragma: no cover - network
@@ -560,11 +605,13 @@ class PostmarkHttpTransport:
         _status, data = _http_request("POST", f"{self._API}/email", headers=self._headers(), body=body)
         return (data or {}).get("MessageID")
 
-    def get_server_identity(self) -> str:
-        """The actual Postmark Server ID for the runtime token: GET /server -> "ID" (server-scoped,
-        proves which server this token belongs to). Non-secret; no token returned into evidence."""
+    def get_server_state(self) -> PostmarkServerState:
+        """The actual Postmark server facts for the runtime token: GET /server -> ("ID","DeliveryType")
+        (server-scoped, proves which server the token belongs to AND whether it is Live vs Sandbox).
+        Non-secret; no token returned into evidence."""
         _status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
-        return str((data or {}).get("ID"))
+        data = data or {}
+        return PostmarkServerState(server_id=str(data.get("ID")), delivery_type=str(data.get("DeliveryType")))
 
     def get_outbound_message(self, message_id):
         status, data = _http_request("GET", f"{self._API}/messages/outbound/{message_id}/details",
@@ -572,21 +619,32 @@ class PostmarkHttpTransport:
         if status == 404 or data is None:
             return None                        # unknown MessageID -> no reconcilable record
         recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
+        # Reply-To: prefer the structured field; else parse the provider's raw message headers
+        # (stdlib email, no dependency) — never trust what the worker CLAIMED it sent.
+        reply_to = data.get("ReplyTo")
+        if not reply_to and data.get("Body"):
+            import email
+            reply_to = email.message_from_string(str(data.get("Body"))).get("Reply-To")
         return {
             "MessageID": data.get("MessageID"), "MessageStream": data.get("MessageStream"),
             "From": data.get("From"), "To": recipients[0] if recipients else data.get("To"),
             "Subject": data.get("Subject"), "TextBody": data.get("TextBody"),
+            "ReplyTo": reply_to, "Sandboxed": data.get("Sandboxed"),
             "Metadata": data.get("Metadata", {}), "Status": data.get("Status")}
 
     def reconcile(self, message_id: str):
         """Independently retrieve provider state (real HTTP) and, on success, attest it with the
-        ACTUAL server id (GET /server) and message stream. Returns a trusted state or None."""
+        ACTUAL server id + DeliveryType (GET /server) and message stream. A non-Live server OR a
+        Sandboxed message can NEVER produce a REAL attestation. Returns a trusted state or None."""
+        server = self.get_server_state()
         msg = self.get_outbound_message(message_id)
         if msg is None or not msg.get("MessageID"):
             return None
+        if str(server.delivery_type) != REQUIRED_DELIVERY_TYPE or msg.get("Sandboxed") is True:
+            return None                          # Sandbox / non-Live provider state is never REAL
         return _PostmarkVerifiedProviderState(
-            _ATTEST_KEY, message_id=str(msg.get("MessageID")), server_id=str(self.get_server_identity()),
-            message_stream=str(msg.get("MessageStream")))
+            _ATTEST_KEY, message_id=str(msg.get("MessageID")), server_id=str(server.server_id),
+            message_stream=str(msg.get("MessageStream")), delivery_type=str(server.delivery_type))
 
 
 def _trusted_provider_state(transport, message_id):

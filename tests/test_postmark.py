@@ -523,7 +523,8 @@ def test_verifier_rejects_wrong_server_credential(migrated):
     _task, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
     req = VerificationRequest(action_request_id=r.action_id, execution_attempt_id="x",
                               verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
-                              worker_structured_output={"message_id": mid}, artifacts=(), spec_hash="h")
+                              worker_structured_output={"message_id": mid}, artifacts=(), spec_hash="h",
+                              external_result_id=mid)   # canonical id matches; rejection is the wrong server
     assert pm.PostmarkActionVerifier(other).verify(req).verdict == "REJECTED"
 
 
@@ -576,3 +577,143 @@ def test_real_action_wrong_server_stays_simulated(migrated, monkeypatch):
         cur.execute("SELECT count(*) FROM market_observation WHERE action_request_id = %s", (a,))
         assert cur.fetchone()[0] == 0
     assert origin_mod.action_reality(migrated, a) == "SIMULATED"   # no REAL proof exists
+
+
+# ==========================================================================
+# ZIP-audit correction: canonical result-id binding + complete email + live provider
+# ==========================================================================
+from aidan_core.factory.verifiers import VerificationRequest as _VReq
+
+
+def _verify_req(contract, *, message_id, external_result_id, action_id):
+    return _VReq(action_request_id=action_id, execution_attempt_id="x",
+                 verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
+                 worker_structured_output={"message_id": message_id}, artifacts=(),
+                 spec_hash="h", external_result_id=external_result_id)
+
+
+# --- Finding 1: proof must prove the exact captured execution_result.external_result_id ---
+def test_verifier_binds_canonical_external_result_id(migrated):
+    r = postmark_run(migrated, "rid1")
+    b = _mid(r)                                    # a valid, exact provider message for THIS action
+    _t, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    v = pm.PostmarkActionVerifier(r.transport)
+    # structured message_id = valid B but canonical external_result_id = A -> REJECT (else the proof
+    # would bind result A while the verifier proved object B)
+    assert v.verify(_verify_req(contract, message_id=b, external_result_id="pm-BOGUS-A",
+                                action_id=r.action_id)).verdict == "REJECTED"
+    # canonical B, structured A -> REJECT (the worker's structured claim must equal the canonical id)
+    assert v.verify(_verify_req(contract, message_id="pm-BOGUS-A", external_result_id=b,
+                                action_id=r.action_id)).verdict == "REJECTED"
+    # all three equal (canonical == structured == provider MessageID) -> VERIFIED
+    assert v.verify(_verify_req(contract, message_id=b, external_result_id=b,
+                                action_id=r.action_id)).verdict == "VERIFIED"
+
+
+def test_verifier_evidence_hash_binds_canonical_result_id(migrated):
+    r = postmark_run(migrated, "rid2")
+    b = _mid(r)
+    _t, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    v = pm.PostmarkActionVerifier(r.transport)
+    h_b = v.verify(_verify_req(contract, message_id=b, external_result_id=b, action_id=r.action_id)).evidence_hash
+    h_o = v.verify(_verify_req(contract, message_id=b, external_result_id="pm-OTHER", action_id=r.action_id)).evidence_hash
+    assert h_b != h_o                              # evidence material binds the canonical result id
+
+
+def test_proof_binds_exact_verified_message_and_event(migrated):
+    r = postmark_run(migrated, "rid3")             # honest pipeline through verify_and_complete
+    b = _mid(r)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT er.external_result_id FROM execution_result er "
+                    "JOIN proof_receipt pr ON pr.execution_result_id = er.id "
+                    "WHERE pr.action_request_id = %s AND pr.verification_type='MARKET_ACTION' "
+                    "AND pr.result='VERIFIED'", (r.action_id,))
+        bound = cur.fetchone()[0]
+    assert bound == b                              # proof binds the exact verified provider message
+    res = pm.ingest_postmark_event(migrated, _delivery(b), source=r.source, auth_header=basic_auth(),
+                                   transport=r.transport)
+    assert res.market_observation_id               # the same exact MessageID attributes the event
+
+
+# --- Finding 2: the complete recipient-facing email (incl. Subject + Reply-To) is proven ---
+def test_verifier_requires_frozen_subject_and_reply_to(migrated):
+    assert postmark_run(migrated, "cmpl-ok").verify.verified is True
+
+
+def test_verifier_rejects_wrong_subject(migrated):
+    assert postmark_run(migrated, "subj", mode="wrong_subject").verify.verified is False
+
+
+def test_verifier_rejects_wrong_reply_to(migrated):
+    assert postmark_run(migrated, "rto", mode="wrong_reply_to").verify.verified is False
+
+
+def test_verifier_checks_subject_and_reply_to_names(migrated):
+    r = postmark_run(migrated, "cmpl-names")
+    b = _mid(r)
+    _t, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    detail = pm.PostmarkActionVerifier(r.transport).verify(
+        _verify_req(contract, message_id=b, external_result_id=b, action_id=r.action_id)).detail
+    names = {c["name"] for c in detail["checks"]}
+    assert {"SUBJECT_IDENTITY", "REPLY_TO_IDENTITY"} <= names
+
+
+# --- Finding 3: REAL requires a LIVE Postmark server; Sandbox is blocked/rejected ---
+def test_worker_blocks_sandbox_server_before_send(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    setup, a = _prepare(migrated, "sbx-send", source=default_source("server-A"))
+    transport, store = install_real_postmark(monkeypatch, server_id="server-A", delivery_type="Sandbox")
+    req = _frozen_worker_request(migrated, a, setup.venture_id)
+    with pytest.raises(MarketAuthorityError):
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A")).execute(req)
+    assert store.get("_n", 0) == 0                 # Sandbox blocked BEFORE any POST /email
+
+
+def test_verifier_rejects_sandbox_server(migrated):
+    r = postmark_run(migrated, "sbx-verify")       # a compliant Live message exists
+    b = _mid(r)
+    sandbox = FakePostmarkTransport(server_id="server-A", delivery_type="Sandbox")
+    sandbox.outbound[b] = dict(r.transport.outbound[b])   # exact same message, but server is Sandbox
+    _t, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    assert pm.PostmarkActionVerifier(sandbox).verify(
+        _verify_req(contract, message_id=b, external_result_id=b, action_id=r.action_id)).verdict == "REJECTED"
+
+
+def test_verifier_rejects_sandboxed_outbound_on_live_server(migrated):
+    r = postmark_run(migrated, "sbx-flag")
+    b = _mid(r)
+    r.transport.outbound[b] = {**r.transport.outbound[b], "Sandboxed": True}   # provider flags it sandboxed
+    _t, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    assert pm.PostmarkActionVerifier(r.transport).verify(
+        _verify_req(contract, message_id=b, external_result_id=b, action_id=r.action_id)).verdict == "REJECTED"
+
+
+def test_sandbox_reconcile_never_real(monkeypatch):
+    from postmark_fakes import install_real_postmark
+    transport, store = install_real_postmark(monkeypatch, server_id="server-A", delivery_type="Sandbox")
+    mid = transport.send_email(message_stream="outbound", sender="a@b.invalid", to="c@d.invalid",
+                               subject="s", text_body="t", reply_to="r@d.invalid",
+                               metadata={"market_action_spec": "x"})
+    assert store.get(mid) is not None              # a Sandbox server accepts/delivers the message ...
+    assert pm._trusted_provider_state(transport, mid) is None   # ... but it can NEVER attest REAL
+
+
+def test_attestation_carries_live_delivery_type(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    transport, store = install_real_postmark(monkeypatch, server_id="server-A", delivery_type="Live")
+    postmark_run(migrated, "live-att", transport=transport, resolver=FakeRecipientResolver(), source=default_source())
+    ps = pm._trusted_provider_state(transport, next(k for k in store if k != "_n"))
+    assert ps is not None and ps.delivery_type == "Live"
+
+
+def test_sandbox_action_stays_simulated(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    from aidan_core.market import origin as origin_mod
+    setup = operating_setup(migrated, "sbxsim")
+    a, spec = postmark_action(migrated, setup, key="sbxsim")
+    transport, store = install_real_postmark(monkeypatch, server_id="server-A", delivery_type="Sandbox")
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))),
+        source=default_source("server-A"), resolver=FakeRecipientResolver())
+    assert store.get("_n", 0) == 0                 # Sandbox blocked before send
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"   # no REAL loop can form from Sandbox

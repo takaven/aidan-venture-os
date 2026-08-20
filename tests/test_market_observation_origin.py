@@ -55,7 +55,7 @@ def test_attestation_requires_trusted_provider_key(migrated):
     # the attestation cannot be constructed via the public API / without the trusted provider-path
     # key (a kernel/provider-path boundary under the in-process trust model, not a language sandbox)
     with pytest.raises(RuntimeError):
-        pm._PostmarkVerifiedProviderState(object(), message_id="x", server_id="y")
+        pm._PostmarkVerifiedProviderState(object(), message_id="x", server_id="y", message_stream="s")
 
 
 def test_nonexistent_observation_raises_not_found(migrated, monkeypatch):

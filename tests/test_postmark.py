@@ -99,7 +99,7 @@ def test_2_3_4_5_6_exact_frozen_request_reaches_provider(migrated):
     # exact frozen content, source-authorized sender/subject, resolved recipient, synthetic MessageID
     assert msg["TextBody"] == DEFAULT_CONTENT
     assert msg["From"] == r.source.sender and msg["Subject"] == r.source.default_subject
-    assert msg["ServerID"] == r.source.server_id
+    assert msg["MessageStream"] == r.source.message_stream
     expected_to = r.resolver.resolve(str(r.setup.venture_id),
                                      f"{pm.POSTMARK_CHANNEL}:{r.setup.venture_id}", "aud://segment-1")
     assert msg["To"] == expected_to
@@ -430,7 +430,7 @@ def test_worker_rejects_source_substitution_before_send(migrated):
 def test_worker_rejects_sender_substitution_before_send(migrated):
     A = default_source("server-A")
     setup, a = _prepare(migrated, "sub-sender", source=A)
-    B = PostmarkSource(server_id="server-A", sender="spoofed@evil.invalid", default_subject=A.default_subject,
+    B = PostmarkSource(postmark_server_id="server-A", message_stream="outbound", sender="spoofed@evil.invalid", default_subject=A.default_subject,
                        inbound_domain=A.inbound_domain, credential_ref=A.credential_ref)
     transport = FakePostmarkTransport()
     req = _frozen_worker_request(migrated, a, setup.venture_id)
@@ -442,7 +442,7 @@ def test_worker_rejects_sender_substitution_before_send(migrated):
 def test_worker_rejects_credential_ref_substitution_before_send(migrated):
     A = default_source("server-A")
     setup, a = _prepare(migrated, "sub-cred", source=A)
-    B = PostmarkSource(server_id="server-A", sender=A.sender, default_subject=A.default_subject,
+    B = PostmarkSource(postmark_server_id="server-A", message_stream="outbound", sender=A.sender, default_subject=A.default_subject,
                        inbound_domain=A.inbound_domain, credential_ref="secret://postmark/OTHER")
     transport = FakePostmarkTransport()
     req = _frozen_worker_request(migrated, a, setup.venture_id)
@@ -481,9 +481,73 @@ def test_frozen_source_and_recipient_persisted_no_token(migrated):
     setup, a = _prepare(migrated, "frozen", source=default_source("server-A"))
     contract = _spec_mod.get_execution_spec(migrated, a)[4]["postmark"]
     fs = contract["source"]
-    assert fs["server_id"] == "server-A" and fs["sender"] == "alpha@sender.invalid"
+    assert fs["postmark_server_id"] == "server-A" and fs["message_stream"] == "outbound"
+    assert fs["sender"] == "alpha@sender.invalid"
     assert fs["credential_ref"] == "secret://postmark/alpha" and fs["source_identity"].startswith("postmark:")
     assert len(contract["recipient_hash"]) == 64            # deterministic recipient identity (hash)
     # no raw token / webhook secret anywhere in canonical execution state
     blob = str(_spec_mod.get_execution_spec(migrated, a))
     assert "FAKE-SERVER-TOKEN" not in blob and "FAKE-WEBHOOK-SECRET" not in blob
+
+
+# ==========================================================================
+# Actual-server credential binding (ZIP-audit correction)
+# ==========================================================================
+def test_contract_distinguishes_server_from_stream(migrated):
+    setup, a = _prepare(migrated, "svr-stream", source=default_source("server-A", "outbound"))
+    fs = _spec_mod.get_execution_spec(migrated, a)[4]["postmark"]["source"]
+    assert fs["postmark_server_id"] == "server-A" and fs["message_stream"] == "outbound"
+    assert fs["postmark_server_id"] != fs["message_stream"]     # distinct Postmark concepts
+    assert fs["source_identity"] == "postmark:secret://postmark/alpha:server-A"   # server, not stream
+
+
+def test_worker_rejects_wrong_server_token_before_send(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    # config matches frozen server A, but the transport's actual credential belongs to server B
+    setup, a = _prepare(migrated, "tok-sub", source=default_source("server-A"))
+    transport, store = install_real_postmark(monkeypatch, server_id="server-B")   # runtime token -> server B
+    req = _frozen_worker_request(migrated, a, setup.venture_id)
+    with pytest.raises(MarketAuthorityError):
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A")).execute(req)
+    assert store.get("_n", 0) == 0   # no POST /email occurred
+
+
+def test_verifier_rejects_wrong_server_credential(migrated):
+    # even with the exact message present, a transport whose credential belongs to another server
+    # cannot verify the action (independent GET /server != frozen postmark_server_id).
+    from aidan_core.factory.verifiers import VerificationRequest
+    r = postmark_run(migrated, "vsrv")   # compliant, server-A
+    mid = _mid(r)
+    other = FakePostmarkTransport(server_id="server-B")
+    other.outbound[mid] = dict(r.transport.outbound[mid])          # same message, wrong credential
+    _task, contract = pm._postmark_contract(migrated, r.action_id, default_source(), FakeRecipientResolver())
+    req = VerificationRequest(action_request_id=r.action_id, execution_attempt_id="x",
+                              verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
+                              worker_structured_output={"message_id": mid}, artifacts=(), spec_hash="h")
+    assert pm.PostmarkActionVerifier(other).verify(req).verdict == "REJECTED"
+
+
+def _mid_real(store):
+    return next(k for k in store if k != "_n")
+
+
+def test_attestation_carries_actual_server_and_stream(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    transport, store = install_real_postmark(monkeypatch, server_id="server-A")
+    postmark_run(migrated, "att", transport=transport, resolver=FakeRecipientResolver(), source=default_source())
+    ps = pm._trusted_provider_state(transport, _mid_real(store))
+    assert ps is not None and ps.server_id == "server-A" and ps.message_stream == "outbound"
+
+
+def test_real_action_wrong_server_stays_simulated(migrated, monkeypatch):
+    from postmark_fakes import install_real_postmark
+    from aidan_core.market import origin as origin_mod
+    # a genuine transport whose token belongs to server B cannot even send action frozen for A
+    setup = operating_setup(migrated, "rsimu")
+    a, spec = postmark_action(migrated, setup, key="rsimu")
+    transport, store = install_real_postmark(monkeypatch, server_id="server-B")
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))),
+        source=default_source("server-A"), resolver=FakeRecipientResolver())
+    assert pm.verify_postmark_action(migrated, a, transport=transport).verified is False   # blocked
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"

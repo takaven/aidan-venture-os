@@ -13,11 +13,12 @@ Load-bearing boundaries (unchanged from Gate 7):
   * action proof (the exact authorized email was accepted by Postmark) is NOT a market
     outcome. Delivery/Bounce/inbound-Reply are later, separate ``market_observation`` evidence.
 
-Authenticity: Postmark does NOT sign webhooks (no HMAC). Its official boundary is HTTP Basic
-Auth on the webhook URL + IP allowlisting. We therefore authenticate events by a shared
-Basic-Auth secret AND reconcile every consequential event against provider state / canonical
-correlation before it becomes evidence — never trusting an unauthenticated raw POST. This
-limitation is explicit (see ADR-027).
+Authenticity: Postmark does NOT sign webhooks (no HMAC). THIS code authenticates events by a
+shared Basic-Auth secret AND reconciles every consequential event against provider state /
+canonical correlation before it becomes evidence — never trusting an unauthenticated raw POST.
+Postmark also recommends IP allowlisting, but that is an INGRESS/firewall boundary and is NOT
+enforced by this code; it is a Slice-5 operational-evidence requirement (HTTPS + Basic-Auth +
+Postmark IP allowlist + POST-only + payload validation), not something these comments prove.
 
 No real send, no live credential, no network call in tests: a deterministic in-memory
 ``PostmarkTransport`` fake holds provider-side state, and the genuine ``PostmarkHttpTransport``
@@ -60,15 +61,18 @@ _EVENT_TO_OBSERVATION = {"Delivery": "DELIVERED", "Bounce": "BOUNCED"}
 
 @dataclass(frozen=True)
 class PostmarkSource:
-    """Trusted, venture-scoped provider configuration. Carries an OPAQUE credential reference
-    (never a raw token in canonical state) and the source-authorized sender/subject/streams.
-    The webhook Basic-Auth secret authenticates inbound provider callbacks."""
+    """Trusted, venture-scoped provider configuration — NON-SECRET identity only. The actual
+    Postmark SERVER ID (from GET /server) and the MessageStream id are distinct Postmark concepts;
+    the opaque credential_ref is an OS secret HANDLE and is NOT proof that the runtime token
+    belongs to that server (the transport proves that independently via GET /server). The raw
+    server token and webhook secret never enter canonical state."""
 
-    server_id: str
+    postmark_server_id: str        # actual Postmark Server ID (GET /server) — non-secret
+    message_stream: str            # Postmark MessageStream id (e.g. 'outbound')
     sender: str                    # source-authorized From; the worker cannot choose another
     default_subject: str           # source-authorized subject; not worker prose
     inbound_domain: str            # Reply-To domain for inbound correlation
-    credential_ref: str            # opaque lookup handle; the real token lives outside canon
+    credential_ref: str            # opaque OS secret handle; the real token lives outside canon
     webhook_user: str = ""
     webhook_secret: str = ""
 
@@ -94,9 +98,10 @@ def reply_mailbox_hash(venture_id, market_action_spec_id) -> str:
 # --------------------------------------------------------------------------
 @runtime_checkable
 class PostmarkTransport(Protocol):
-    def send_email(self, *, server_id: str, sender: str, to: str, subject: str, text_body: str,
+    def send_email(self, *, message_stream: str, sender: str, to: str, subject: str, text_body: str,
                    reply_to: str, metadata: dict) -> str: ...
     def get_outbound_message(self, message_id: str) -> Optional[dict]: ...
+    def get_server_identity(self) -> str: ...   # actual Postmark Server ID for the runtime token
 
 
 @runtime_checkable
@@ -133,18 +138,24 @@ class PostmarkEmailWorker:
         pm = dict((request.task_payload or {}).get("postmark", {}))
         fs = dict(pm.get("source", {}))                       # FROZEN approved provider identity
         src = self._source
-        # The runtime configuration is an I/O dependency, NOT authority: it must correspond to the
-        # frozen approved non-secret identity, else refuse to send (before any external call).
-        if (str(src.server_id) != str(fs.get("server_id")) or str(src.sender) != str(fs.get("sender"))
+        # The runtime configuration is an I/O dependency, NOT authority: its NON-SECRET identity
+        # must correspond to the frozen approved identity, else refuse to send (before any call).
+        if (str(src.postmark_server_id) != str(fs.get("postmark_server_id"))
+                or str(src.message_stream) != str(fs.get("message_stream"))
+                or str(src.sender) != str(fs.get("sender"))
                 or str(src.default_subject) != str(fs.get("subject"))
                 or str(src.credential_ref) != str(fs.get("credential_ref"))):
             raise MarketAuthorityError("worker provider configuration does not match the frozen approved source")
+        # PROVE the transport's actual runtime credential belongs to the frozen Postmark server
+        # (GET /server) — a matching credential_ref string is NOT sufficient.
+        if str(self._t.get_server_identity()) != str(fs.get("postmark_server_id")):
+            raise MarketAuthorityError("transport credential does not belong to the frozen Postmark server")
         recipient = self._resolver.resolve(str(request.venture_id), m["source_instance_ref"], m["audience_ref"])
         if _recipient_hash(recipient) != str(pm.get("recipient_hash")):
             raise MarketAuthorityError("resolved recipient does not match the frozen approved recipient")
         # send using the FROZEN identities (adversarial modes tamper the OUTBOUND value after the
         # authority check, to also exercise the independent verifier).
-        server_id, sender, subject, text_body = fs["server_id"], fs["sender"], fs["subject"], m["content"]
+        message_stream, sender, subject, text_body = fs["message_stream"], fs["sender"], fs["subject"], m["content"]
         if self.mode == "wrong_content":
             text_body = text_body + " TAMPERED"
         if self.mode == "wrong_audience":
@@ -152,11 +163,11 @@ class PostmarkEmailWorker:
         if self.mode == "wrong_sender":
             sender = "spoofed@elsewhere.test"
         if self.mode == "wrong_source":
-            server_id = "server-OTHER"
+            message_stream = "stream-OTHER"
         message_id = "claimed-nonexistent"
         if self.mode != "nothing":
             message_id = self._t.send_email(
-                server_id=server_id, sender=sender, to=recipient, subject=subject,
+                message_stream=message_stream, sender=sender, to=recipient, subject=subject,
                 text_body=text_body, reply_to=pm["reply_to"], metadata=dict(pm["correlation"]))
         return WorkerResult(
             worker_kind=self.kind, external_result_id=message_id, reported_outcome="success",
@@ -200,9 +211,12 @@ class PostmarkActionVerifier:
         exists = msg is not None
         msg = msg or {}
         meta = dict(msg.get("Metadata", {}))
+        # the transport credential must belong to the frozen Postmark server (independent GET /server)
+        server_ok = str(self._t.get_server_identity()) == str(fs.get("postmark_server_id"))
 
         checks = []
         checks.append(("ACTION_EXISTS", exists))
+        checks.append(("SERVER_IDENTITY", server_ok))
         if exists:
             checks.append(("CORRELATION_IDENTITY",
                            all(str(meta.get(k)) == str(correlation.get(k)) for k in correlation)))
@@ -210,7 +224,7 @@ class PostmarkActionVerifier:
                            channels_mod.content_sha(str(msg.get("TextBody", ""))) == market.get("content_hash")
                            and str(meta.get("action_spec_hash")) == str(market.get("action_spec_hash"))))
             checks.append(("AUDIENCE_IDENTITY", _recipient_hash(str(msg.get("To"))) == recipient_hash))
-            checks.append(("CHANNEL_IDENTITY", str(msg.get("ServerID")) == str(fs.get("server_id"))))
+            checks.append(("CHANNEL_IDENTITY", str(msg.get("MessageStream")) == str(fs.get("message_stream"))))
             checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(fs.get("sender"))))
             checks.append(("ACCEPTANCE_IDENTITY", claimed == str(msg.get("MessageID")) and claimed not in ("", "None")))
         else:
@@ -250,8 +264,8 @@ def _frozen_contract_source(conn, action_request_id) -> dict:
 # prepare / execute / verify (reuse the Gate-7 market binding + Gate-4 runtime)
 # --------------------------------------------------------------------------
 def source_identity(source: PostmarkSource) -> str:
-    """Concrete NON-SECRET provider source identity (credential ref + server/stream) — no token."""
-    return f"postmark:{source.credential_ref}:{source.server_id}"
+    """Concrete NON-SECRET provider source identity (credential ref + actual server id) — no token."""
+    return f"postmark:{source.credential_ref}:{source.postmark_server_id}"
 
 
 def _recipient_hash(address: str) -> str:
@@ -260,7 +274,8 @@ def _recipient_hash(address: str) -> str:
 
 def _frozen_source(source: PostmarkSource) -> dict:
     """The exact non-secret provider execution identity frozen at authorization (never the token)."""
-    return {"provider_kind": "postmark", "server_id": source.server_id, "sender": source.sender,
+    return {"provider_kind": "postmark", "postmark_server_id": source.postmark_server_id,
+            "message_stream": source.message_stream, "sender": source.sender,
             "subject": source.default_subject, "credential_ref": source.credential_ref,
             "inbound_domain": source.inbound_domain, "source_identity": source_identity(source)}
 
@@ -342,7 +357,10 @@ def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkT
         # attest via the real reconciliation path (None for a fake/subclass transport -> SIMULATED);
         # the attested provider server must also match the frozen approved source, else not REAL.
         provider_state = _trusted_provider_state(transport, message_id) if message_id else None
-        if provider_state is not None and str(getattr(provider_state, "server_id", "")) != str(fs.get("server_id")):
+        # the attested actual server AND message stream must match the frozen approved source
+        if provider_state is not None and (
+                str(getattr(provider_state, "server_id", "")) != str(fs.get("postmark_server_id"))
+                or str(getattr(provider_state, "message_stream", "")) != str(fs.get("message_stream"))):
             provider_state = None
         origin_mod.record_evidence_origin(
             conn, action_request_id, provider_state=provider_state, provider_kind="postmark",
@@ -399,7 +417,8 @@ def _observation_provider_state(transport, message_id, frozen_source):
     """Trusted attestation for an observation, only if the attested provider server matches the
     action's frozen approved source (a runtime source for another server cannot confer REAL)."""
     ps = _trusted_provider_state(transport, message_id)
-    if ps is not None and str(getattr(ps, "server_id", "")) != str(frozen_source.get("server_id")):
+    if ps is not None and (str(getattr(ps, "server_id", "")) != str(frozen_source.get("postmark_server_id"))
+                           or str(getattr(ps, "message_stream", "")) != str(frozen_source.get("message_stream"))):
         return None
     return ps
 
@@ -495,13 +514,14 @@ class _PostmarkVerifiedProviderState:
     kernel/provider-path boundary (specialist workers hold no DB authority), NOT a language-level
     guarantee against arbitrary in-process malicious code — that sandbox is a later-gate concern."""
 
-    __slots__ = ("message_id", "server_id")
+    __slots__ = ("message_id", "server_id", "message_stream")
 
-    def __init__(self, _key, *, message_id, server_id):
+    def __init__(self, _key, *, message_id, server_id, message_stream):
         if _key is not _ATTEST_KEY:
             raise RuntimeError("_PostmarkVerifiedProviderState requires the trusted provider-path key")
         self.message_id = message_id
-        self.server_id = server_id
+        self.server_id = server_id            # actual Postmark Server ID (GET /server)
+        self.message_stream = message_stream
 
 
 def _http_request(method: str, url: str, *, headers: dict, body: bytes = None):  # pragma: no cover - network
@@ -533,12 +553,18 @@ class PostmarkHttpTransport:
         return {"X-Postmark-Server-Token": self._token, "Accept": "application/json",
                 "Content-Type": "application/json"}
 
-    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:
+    def send_email(self, *, message_stream, sender, to, subject, text_body, reply_to, metadata) -> str:
         import json
         body = json.dumps({"From": sender, "To": to, "Subject": subject, "TextBody": text_body,
-                           "ReplyTo": reply_to, "Metadata": metadata, "MessageStream": server_id}).encode()
+                           "ReplyTo": reply_to, "Metadata": metadata, "MessageStream": message_stream}).encode()
         _status, data = _http_request("POST", f"{self._API}/email", headers=self._headers(), body=body)
         return (data or {}).get("MessageID")
+
+    def get_server_identity(self) -> str:
+        """The actual Postmark Server ID for the runtime token: GET /server -> "ID" (server-scoped,
+        proves which server this token belongs to). Non-secret; no token returned into evidence."""
+        _status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
+        return str((data or {}).get("ID"))
 
     def get_outbound_message(self, message_id):
         status, data = _http_request("GET", f"{self._API}/messages/outbound/{message_id}/details",
@@ -547,19 +573,20 @@ class PostmarkHttpTransport:
             return None                        # unknown MessageID -> no reconcilable record
         recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
         return {
-            "MessageID": data.get("MessageID"), "ServerID": data.get("MessageStream") or data.get("ServerID"),
+            "MessageID": data.get("MessageID"), "MessageStream": data.get("MessageStream"),
             "From": data.get("From"), "To": recipients[0] if recipients else data.get("To"),
             "Subject": data.get("Subject"), "TextBody": data.get("TextBody"),
             "Metadata": data.get("Metadata", {}), "Status": data.get("Status")}
 
     def reconcile(self, message_id: str):
-        """Independently retrieve provider state (real HTTP) and, on success, attest it. Returns a
-        trusted ``_PostmarkVerifiedProviderState`` or None (constructed only by this trusted provider path)."""
+        """Independently retrieve provider state (real HTTP) and, on success, attest it with the
+        ACTUAL server id (GET /server) and message stream. Returns a trusted state or None."""
         msg = self.get_outbound_message(message_id)
         if msg is None or not msg.get("MessageID"):
             return None
-        return _PostmarkVerifiedProviderState(_ATTEST_KEY, message_id=str(msg.get("MessageID")),
-                                              server_id=str(msg.get("ServerID")))
+        return _PostmarkVerifiedProviderState(
+            _ATTEST_KEY, message_id=str(msg.get("MessageID")), server_id=str(self.get_server_identity()),
+            message_stream=str(msg.get("MessageStream")))
 
 
 def _trusted_provider_state(transport, message_id):

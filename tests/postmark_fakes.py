@@ -20,9 +20,10 @@ SYNTHETIC_WEBHOOK_USER = "hook"
 SYNTHETIC_WEBHOOK_SECRET = "FAKE-WEBHOOK-SECRET"
 
 
-def default_source(server_id="server-A"):
+def default_source(postmark_server_id="server-A", message_stream="outbound"):
     return PostmarkSource(
-        server_id=server_id, sender="alpha@sender.invalid", default_subject="A quick question",
+        postmark_server_id=postmark_server_id, message_stream=message_stream,
+        sender="alpha@sender.invalid", default_subject="A quick question",
         inbound_domain="reply.invalid", credential_ref="secret://postmark/alpha",
         webhook_user=SYNTHETIC_WEBHOOK_USER, webhook_secret=SYNTHETIC_WEBHOOK_SECRET)
 
@@ -48,15 +49,16 @@ class FakePostmarkTransport:
     # NOTE: no origin_kind flag — a fixture is SIMULATED because it is not a PostmarkHttpTransport,
     # derived inside the trusted origin writer; it can never declare itself REAL_PROVIDER.
 
-    def __init__(self):
+    def __init__(self, server_id="server-A"):
         self.outbound: dict[str, dict] = {}
         self._n = 0
+        self._server_id = server_id   # actual Postmark Server ID this (fake) token belongs to
 
-    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:
+    def send_email(self, *, message_stream, sender, to, subject, text_body, reply_to, metadata) -> str:
         self._n += 1
         message_id = f"pm-{metadata.get('market_action_spec')}-{self._n}"
         self.outbound[message_id] = {
-            "MessageID": message_id, "ServerID": server_id, "From": sender, "To": to,
+            "MessageID": message_id, "MessageStream": message_stream, "From": sender, "To": to,
             "Subject": subject, "TextBody": text_body, "ReplyTo": reply_to,
             "Metadata": dict(metadata), "Status": "Sent"}
         return message_id
@@ -64,14 +66,20 @@ class FakePostmarkTransport:
     def get_outbound_message(self, message_id):
         return self.outbound.get(message_id)
 
+    def get_server_identity(self):
+        return self._server_id
 
-def stub_postmark_http(store):
-    """A drop-in for ``postmark._http_request`` backed by an in-memory Postmark HTTP API. Tests
-    patch the LOW-LEVEL network boundary beneath the GENUINE production PostmarkHttpTransport —
-    they never subclass/replace the transport object (Slice-4 §4/§5). No network."""
+
+def stub_postmark_http(store, server_id="server-A"):
+    """A drop-in for ``postmark._http_request`` backed by an in-memory Postmark HTTP API, including
+    the server-scoped GET /server (returns the actual Server ID this token belongs to). Tests patch
+    the LOW-LEVEL network boundary beneath the GENUINE production PostmarkHttpTransport — they never
+    subclass/replace the transport object. No network."""
     import json
 
     def _req(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": server_id}                    # actual Postmark Server ID for the token
         if method == "POST" and url.endswith("/email"):
             data = json.loads(body)
             store["_n"] = store.get("_n", 0) + 1
@@ -89,10 +97,11 @@ def stub_postmark_http(store):
     return _req
 
 
-def install_real_postmark(monkeypatch):
-    """Return a GENUINE production PostmarkHttpTransport whose HTTP boundary is stubbed in-memory."""
+def install_real_postmark(monkeypatch, *, server_id="server-A"):
+    """Return a GENUINE production PostmarkHttpTransport whose HTTP boundary (incl. GET /server) is
+    stubbed in-memory; ``server_id`` is the actual Postmark server the runtime token belongs to."""
     store: dict = {}
-    monkeypatch.setattr(pm, "_http_request", stub_postmark_http(store))
+    monkeypatch.setattr(pm, "_http_request", stub_postmark_http(store, server_id))
     return pm.PostmarkHttpTransport("STUB-TOKEN-not-used"), store
 
 

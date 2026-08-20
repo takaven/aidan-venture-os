@@ -526,12 +526,14 @@ def test_finding_C_real_action_no_response_is_real(migrated):
 def test_finding_D_http_transport_reconciliation_implemented(migrated):
     from aidan_core.market.postmark import PostmarkHttpTransport
     t = PostmarkHttpTransport("FAKE-TOKEN-not-used")
-    # the verifier reconciles via get_outbound_message (GET-by-MessageID); the removed metadata
-    # search is gone, so no NotImplementedError remains in the live verification path
-    assert hasattr(t, "get_outbound_message")
-    assert not hasattr(t, "find_outbound_by_correlation")
-    src = __import__("inspect").getsource(t.get_outbound_message.__func__)
-    assert "NotImplementedError" not in src
+    # BOTH live Postmark reconciliation seams are concretely implemented — no abstract/NotImplemented
+    # placeholder remains. Verification reconciles by MessageID (get_outbound_message); ambiguous-send
+    # recovery reconciles by the frozen-correlation metadata search (find_outbound_by_correlation,
+    # ADR-034). Behaviour is proved by the functional reconciliation suite in test_postmark.py; this
+    # is only a narrow STRUCTURAL guard that both seams exist as concrete callables on the transport.
+    for name in ("get_outbound_message", "find_outbound_by_correlation"):
+        assert callable(getattr(t, name))
+        assert name in PostmarkHttpTransport.__dict__      # concretely defined here, not an inherited stub
 
 
 def test_finding_D_worker_claiming_foreign_message_rejected(migrated):

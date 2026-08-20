@@ -980,6 +980,110 @@ def test_recovery_multiple_matches_fails_closed(migrated, monkeypatch):
         assert cur.fetchone()[0] == 0
 
 
+def _ambiguous_to_recovery_required(migrated, monkeypatch, slug):
+    """Drive a genuine ambiguous send on approved Live server A (message stored but search invisible)
+    -> action RECOVERY_REQUIRED. Returns (action_id, store_a with the exact provider message)."""
+    store_a = {}
+
+    def amb_a(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": "server-A", "DeliveryType": "Live"}
+        if method == "POST" and url.endswith("/email"):
+            _store_message(store_a, _json.loads(body))
+            raise TimeoutError("response lost")
+        if method == "GET" and "/messages/outbound?" in url:
+            return 200, {"Messages": []}                 # invisible during the ambiguous attempt
+        if method == "GET" and "/messages/outbound/" in url:
+            mid = url.split("/messages/outbound/")[1].split("/details")[0]
+            rec = store_a.get(mid)
+            return (200, rec) if rec is not None else (404, None)
+        return 400, None
+
+    monkeypatch.setattr(pm, "_http_request", amb_a)
+    transport_a = pm.PostmarkHttpTransport("A")
+    setup = operating_setup(migrated, slug)
+    a, spec = postmark_action(migrated, setup, key=slug)
+    common = dict(source=default_source("server-A"), resolver=FakeRecipientResolver(), max_attempts=2)
+    pm.execute_postmark_action(migrated, a, registry=registry_with(
+        pm.PostmarkEmailWorker(transport_a, FakeRecipientResolver(), default_source("server-A"))), **common)
+    with migrated.cursor() as cur:
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "RECOVERY_REQUIRED"
+    return a, store_a, transport_a, common
+
+
+def _recovery_stub_for(store, *, server_id, delivery_type):
+    def _req(method, url, *, headers, body=None):
+        if method == "GET" and url.endswith("/server"):
+            return 200, {"ID": server_id, "DeliveryType": delivery_type}
+        if method == "GET" and "/messages/outbound?" in url:
+            return 200, _search(store, url)
+        if method == "GET" and "/messages/outbound/" in url:
+            mid = url.split("/messages/outbound/")[1].split("/details")[0]
+            rec = store.get(mid)
+            return (200, rec) if rec is not None else (404, None)
+        return 400, None
+    return _req
+
+
+def test_recovery_wrong_server_stays_recovery_required(migrated, monkeypatch):
+    # explicit recovery finds ONE structurally-compliant candidate on the WRONG server B. The
+    # candidate is captured but the canonical verifier rejects SERVER_IDENTITY. A rejected recovery
+    # verification must NOT become ordinary PENDING retry — it must remain fail closed.
+    a, store_a, transport_a, common = _ambiguous_to_recovery_required(migrated, monkeypatch, "rec-wsrv")
+    store_b = {k: (dict(v) if k != "_n" else v) for k, v in store_a.items()}   # same correlation/content
+    monkeypatch.setattr(pm, "_http_request", _recovery_stub_for(store_b, server_id="server-B", delivery_type="Live"))
+    transport_b = pm.PostmarkHttpTransport("B")
+    res = pm.reconcile_postmark_recovery(migrated, a, transport=transport_b)
+    assert res["outcome"] == "reconciled" and res["verified"] is False   # captured, but verifier rejected
+    with migrated.cursor() as cur:
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "RECOVERY_REQUIRED"                  # NOT PENDING
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s "
+                    "AND verification_type='MARKET_ACTION' AND result='VERIFIED'", (a,))
+        assert cur.fetchone()[0] == 0
+    from aidan_core.market import origin as origin_mod
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"
+    # ordinary execution remains refused -> no second consequential POST possible
+    with pytest.raises(ExecutionBlockedError):
+        pm.execute_postmark_action(migrated, a, registry=registry_with(
+            pm.PostmarkEmailWorker(transport_a, FakeRecipientResolver(), default_source("server-A"))), **common)
+
+
+def test_recovery_sandbox_stays_recovery_required(migrated, monkeypatch):
+    # explicit recovery candidate is on the approved server id but a SANDBOX server: the verifier
+    # rejects LIVE_PROVIDER, and the action must remain fail closed (never PENDING, never REAL).
+    a, store_a, transport_a, common = _ambiguous_to_recovery_required(migrated, monkeypatch, "rec-sbx")
+    store_s = {k: (dict(v) if k != "_n" else v) for k, v in store_a.items()}
+    monkeypatch.setattr(pm, "_http_request", _recovery_stub_for(store_s, server_id="server-A", delivery_type="Sandbox"))
+    transport_s = pm.PostmarkHttpTransport("S")
+    res = pm.reconcile_postmark_recovery(migrated, a, transport=transport_s)
+    assert res["verified"] is False
+    with migrated.cursor() as cur:
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "RECOVERY_REQUIRED"
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s "
+                    "AND verification_type='MARKET_ACTION' AND result='VERIFIED'", (a,))
+        assert cur.fetchone()[0] == 0
+    from aidan_core.market import origin as origin_mod
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"
+    with pytest.raises(ExecutionBlockedError):
+        pm.execute_postmark_action(migrated, a, registry=registry_with(
+            pm.PostmarkEmailWorker(transport_a, FakeRecipientResolver(), default_source("server-A"))), **common)
+
+
+def test_recover_action_does_not_reclaim_ambiguous_attempt(migrated, monkeypatch):
+    # generic recover_action must NOT reclaim the fail-closed ambiguous attempt (it is FAILED, not
+    # CLAIMED), so no new dispatchable attempt can appear via the crash-recovery path.
+    from aidan_core import recovery
+    a, store_a, _t, _common = _ambiguous_to_recovery_required(migrated, monkeypatch, "rec-noreclaim")
+    out = recovery.recover_action(migrated, a)
+    assert out["outcome"] in ("not_active", "no_attempt")
+    with migrated.cursor() as cur:
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "RECOVERY_REQUIRED"
+
+
 def test_worker_reconciles_prior_send_without_duplicate(migrated):
     # code-level invariant (independent of runtime max_attempts): re-running the worker against a
     # provider that already holds the exact correlated message CAPTURES it rather than re-POSTing.

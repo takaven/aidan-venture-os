@@ -56,8 +56,13 @@ it), so no ordinary later attempt — and no `max_attempts > 1` — can re-issue
 reservation is held. Only **explicit** recovery (`reconcile_postmark_recovery`) resolves it: exactly
 one compliant provider message → capture it and complete through the normal deterministic verifier
 (one proof); zero (still not proven absent) or multiple (duplicate) → stay `RECOVERY_REQUIRED`, never
-redispatch and never select arbitrarily. This is **no blind duplicate dispatch**, not an absolute
-distributed-systems exactly-once claim.
+redispatch and never select arbitrarily. Candidate selection (`_message_matches_frozen`) is not the
+authority — the canonical `PostmarkActionVerifier` still runs, and a **rejected** recovery
+verification (e.g. wrong actual Server ID or a non-Live/Sandbox server) is not evidence the original
+effect did not occur: `verify_and_complete` keeps such an action `RECOVERY_REQUIRED` (never the
+ordinary retryable `VERIFICATION_FAILED`→`PENDING` path), so a failed reconciliation can never reopen
+automatic dispatch. This is **no blind duplicate dispatch**, not an absolute distributed-systems
+exactly-once claim.
 
 ### The dispatch path declares the real safety mode
 

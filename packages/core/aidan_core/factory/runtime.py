@@ -358,7 +358,37 @@ def verify_and_complete(
             attempt_id=attempt_id, lifecycle_to=None, actor=actor, record_proof=_record_proof,
         )
 
-    # Rejected: record a FAILED proof receipt (history is preserved) and classify the
+    # Was this result captured while resolving an ambiguous-effect RECOVERY_REQUIRED attempt? That
+    # durable fact (the attempt's own failure_class) is set ONLY by _record_ambiguous_recovery_required.
+    with conn.cursor() as cur:
+        cur.execute("SELECT failure_class FROM execution_attempt WHERE id = %s", (attempt_id,))
+        prior = cur.fetchone()
+    recovery_origin = prior is not None and prior[0] == "RECOVERY_REQUIRED"
+
+    if recovery_origin:
+        # A rejected RECOVERY verification is NOT ordinary retryable failure: a failed reconciliation
+        # is no proof the original effect did not occur. Stay FAIL CLOSED — keep RECOVERY_REQUIRED (never
+        # PENDING), keep the attempt's RECOVERY_REQUIRED class, hold the reservation, no auto-retry.
+        with db.transaction(conn) as cur:
+            proof_id = proof._write_receipt(
+                cur, action_request_id, result_id, verdict="FAILED", verification_type=vr.verification_type,
+                verifier_name=f"gate4.{verifier_kind}", evidence_hash=vr.evidence_hash,
+                execution_attempt_id=attempt_id,
+            )
+            cur.execute(
+                "UPDATE execution_attempt SET status = 'FAILED', failure_class = 'RECOVERY_REQUIRED', "
+                "updated_at = now() WHERE id = %s",
+                (attempt_id,),
+            )
+            execution._set_status(cur, action_request_id, "RECOVERY_REQUIRED", actor=actor,
+                                  reason="recovery.verification_rejected")
+            audit.record_event(
+                cur, event_type="execution.recovery_verification_rejected", actor=actor,
+                action_id=action_request_id, payload={"verifier_detail": vr.detail},
+            )
+        return execution.CompletionOutcome("RECOVERY_REQUIRED", proof_id, verified=False, duplicated=False)
+
+    # Ordinary rejected path: record a FAILED proof receipt (history is preserved) and classify the
     # attempt as VERIFICATION_FAILED — retryable while attempts remain — atomically.
     terminal, final_class = _decide_failure("VERIFICATION_FAILED", attempt_number, max_attempts)
     with db.transaction(conn) as cur:

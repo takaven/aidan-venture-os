@@ -84,6 +84,33 @@ def _action_complete(cur, action_request_id):
     return cur.fetchone()[0] > 0
 
 
+def _outcome_is_real(cur, conn, recommendation_id, spec_id, action_request_id) -> bool:
+    """REAL iff the recommendation cites, for THIS market action, either (A) an observation with a
+    trusted REAL_PROVIDER ``market_observation_origin``, or (B) a NO_RESPONSE completion whose
+    action proof is REAL_PROVIDER. A generic observation never qualifies."""
+    if recommendation_id is None:
+        return False
+    # path A: a cited REAL provider observation of this spec
+    cur.execute(
+        "SELECT 1 FROM recommendation_market_observation rmo "
+        "JOIN market_observation mo ON mo.id = rmo.observation_id "
+        "JOIN market_observation_origin moo ON moo.market_observation_id = mo.id "
+        "WHERE rmo.recommendation_id = %s AND mo.market_action_spec_id = %s "
+        "AND moo.origin_kind = 'REAL_PROVIDER' LIMIT 1", (recommendation_id, spec_id))
+    if cur.fetchone() is not None:
+        return True
+    # path B: a cited NO_RESPONSE completion of this spec, anchored to a REAL_PROVIDER action proof
+    if origin_mod.action_reality(conn, action_request_id) == REAL:
+        cur.execute(
+            "SELECT 1 FROM recommendation_market_window_completion rmc "
+            "JOIN market_window_completion mwc ON mwc.id = rmc.window_completion_id "
+            "WHERE rmc.recommendation_id = %s AND mwc.market_action_spec_id = %s "
+            "AND mwc.completion_type = 'NO_RESPONSE' LIMIT 1", (recommendation_id, spec_id))
+        if cur.fetchone() is not None:
+            return True
+    return False
+
+
 def _interventions_in(cur, venture_id, start_at, end_at) -> int:
     if end_at is not None:
         cur.execute("SELECT count(*) FROM alpha_intervention WHERE venture_id = %s "
@@ -132,9 +159,11 @@ def classify_loop(conn, *, start_recommendation_id: str, next_recommendation_id=
             if end_at is None:
                 end_at = decided_at
         elif resulting_action_id is not None:
-            # REAL requires a REAL_PROVIDER action proof AND a NO_RESPONSE completion anchored to
-            # it; a generic observation never confers REAL.
-            if origin_mod.has_real_no_response(conn, loop_spec_id, resulting_action_id):
+            # REAL is derived over the EXACT outcome the next recommendation consumed: a cited
+            # trusted REAL provider observation (path A) or a cited NO_RESPONSE completion anchored
+            # to a REAL action proof (path B). A generic observation never confers REAL, and an
+            # unrelated REAL observation elsewhere in the venture cannot upgrade this loop.
+            if _outcome_is_real(cur, conn, next_recommendation_id, loop_spec_id, resulting_action_id):
                 reality = REAL
             completeness = COMPLETE if (_action_complete(cur, resulting_action_id) and next_exists) else INCOMPLETE
         else:

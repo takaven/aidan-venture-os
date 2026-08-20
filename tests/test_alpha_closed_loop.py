@@ -524,3 +524,64 @@ def test_finding_D_worker_claiming_foreign_message_rejected(migrated):
                               worker_structured_output={"message_id": foreign_mid}, artifacts=(), spec_hash="h")
     verdict = pm.PostmarkActionVerifier(transport, resolver, source).verify(req)
     assert verdict.verdict == "REJECTED"
+
+
+# ==========================================================================
+# REAL provider loops (trusted stub transport — proves the trust boundary, no network)
+# ==========================================================================
+def real_loop(conn, slug, *, outcome="REPLIED"):
+    """A closed loop whose consequential action executes through a genuine (stub, no-network)
+    PostmarkHttpTransport and whose outcome is a trusted, reconciled provider observation."""
+    from postmark_fakes import StubRealPostmarkTransport, FakeRecipientResolver, default_source, basic_auth
+    from aidan_core.market import postmark as pm
+    setup = _setup(conn, slug)
+    _sa, seed_spec = _local_market_action(conn, setup, key=f"{slug}-seed")
+    record_market_observation(conn, seed_spec.market_action_spec_id, external_event_id="seed",
+                              observation_type="DELIVERED", channel_kind="fake-local")
+    r1 = nextaction.recommend(conn, setup.venture_id, setup.opportunity_id, recommendation_key=f"{slug}-k1")
+    loop_action = commitment.commit_recommendation(conn, r1.recommendation_id).resulting_action_id
+    transport, resolver, source = StubRealPostmarkTransport(), FakeRecipientResolver(), default_source()
+    loop_spec = freeze_outreach(conn, setup, loop_action, channel_kind=pm.POSTMARK_CHANNEL)
+    pm.execute_postmark_action(conn, loop_action, registry=registry_with(
+        pm.PostmarkEmailWorker(transport, resolver, source)), source=source)
+    assert pm.verify_postmark_action(conn, loop_action, transport=transport, resolver=resolver, source=source).verified
+    mid = next(m for m, rec in transport.outbound.items()
+               if str(rec["Metadata"].get("market_action_spec")) == str(loop_spec.market_action_spec_id))
+    if outcome == "REPLIED":
+        pm.ingest_postmark_reply(conn, {"RecordType": "Inbound",
+                                        "MailboxHash": pm.reply_mailbox_hash(setup.venture_id, loop_spec.market_action_spec_id),
+                                        "From": "lead@x.invalid", "TextBody": "yes", "MessageID": "in-real"},
+                                 source=source, auth_header=basic_auth(), transport=transport)
+    else:
+        pm.ingest_postmark_event(conn, {"RecordType": "Bounce", "MessageID": mid, "Type": "HardBounce"},
+                                 source=source, auth_header=basic_auth(), transport=transport)
+    r2 = nextaction.recommend(conn, setup.venture_id, setup.opportunity_id, recommendation_key=f"{slug}-k2")
+    return _Ctx(setup=setup, r1=r1, r2=r2, loop_action=loop_action, loop_spec=loop_spec)
+
+
+def test_real_reply_loop_is_real_and_eligible(migrated):
+    c = real_loop(migrated, "RL", outcome="REPLIED")
+    r = _classify(migrated, c)
+    assert r["reality_class"] == "REAL" and r["completeness"] == "COMPLETE"
+    assert r["assistance_class"] == autonomy.CLEAN and r["eligible_clean_real_alpha"] is True
+
+
+def test_real_bounce_loop_is_real(migrated):
+    c = real_loop(migrated, "RLb", outcome="BOUNCED")
+    # a real negative outcome is still REAL market evidence
+    assert _classify(migrated, c)["reality_class"] == "REAL"
+
+
+def test_real_loop_with_intervention_is_human_assisted(migrated):
+    c = real_loop(migrated, "RLi", outcome="REPLIED")
+    _intervene(migrated, c.setup.venture_id, at=c.r1_at if hasattr(c, "r1_at") else _rec_time(migrated, c.r1.recommendation_id))
+    r = _classify(migrated, c)
+    assert r["reality_class"] == "REAL" and r["assistance_class"] == autonomy.HUMAN_ASSISTED
+    assert r["eligible_clean_real_alpha"] is False   # REAL but not CLEAN
+
+
+def test_unrelated_real_observation_cannot_upgrade_loop(migrated):
+    # a SIMULATED loop is not upgraded to REAL by a REAL observation elsewhere in the venture
+    c = sim_loop(migrated, "URO", outcome="REPLIED")
+    other = real_loop(migrated, "UROreal", outcome="REPLIED")   # different venture, REAL
+    assert _classify(migrated, c)["reality_class"] == "SIMULATED"

@@ -65,6 +65,29 @@ class FakePostmarkTransport:
         return self.outbound.get(message_id)
 
 
+class StubRealPostmarkTransport(pm.PostmarkHttpTransport):
+    """A test stand-in that IS a genuine ``PostmarkHttpTransport`` (so the trusted origin
+    derivation classifies it REAL_PROVIDER) but overrides only the network I/O with an in-memory
+    store — proving the trust boundary without a live network call (Slice-4 discipline §25)."""
+
+    def __init__(self):
+        super().__init__("STUB-REAL-TOKEN-not-used")
+        self.outbound: dict[str, dict] = {}
+        self._n = 0
+
+    def send_email(self, *, server_id, sender, to, subject, text_body, reply_to, metadata) -> str:
+        self._n += 1
+        message_id = f"pmreal-{metadata.get('market_action_spec')}-{self._n}"
+        self.outbound[message_id] = {
+            "MessageID": message_id, "ServerID": server_id, "From": sender, "To": to,
+            "Subject": subject, "TextBody": text_body, "ReplyTo": reply_to,
+            "Metadata": dict(metadata), "Status": "Sent"}
+        return message_id
+
+    def get_outbound_message(self, message_id):   # no network — in-memory provider state
+        return self.outbound.get(message_id)
+
+
 PostmarkRun = namedtuple("PostmarkRun", "setup action_id spec worker verify transport resolver source")
 
 

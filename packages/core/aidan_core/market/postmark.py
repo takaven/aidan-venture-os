@@ -330,15 +330,21 @@ def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth
     if otype is None:
         raise MarketAuthorityError(f"unsupported Postmark event RecordType {record_type!r}")
     message_id = str(raw_event.get("MessageID"))
-    spec_id, _venture = _spec_for_message(conn, message_id, transport)
+    spec_id, venture_id = _spec_for_message(conn, message_id, transport)
     external_event_id = f"{record_type}:{message_id}"
-    return record_market_observation(
+    res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type=otype,
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_event), actor=actor)
+    # bind trusted provider provenance (REAL_PROVIDER only for a real transport + real action proof)
+    origin_mod.record_observation_origin(
+        conn, res.market_observation_id, transport=transport, provider_kind="postmark",
+        source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
+        provider_event_ref=external_event_id, actor=actor)
+    return res
 
 
 def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, auth_header: str,
-                          actor: str = "market"):
+                          transport: PostmarkTransport, actor: str = "market"):
     """Authenticate a Postmark Inbound reply and correlate it to exactly one market action by
     the structural MailboxHash token (never by subject/body similarity). Reply text stays DATA."""
     _authenticate(source, auth_header)
@@ -351,11 +357,16 @@ def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, au
     match = [(str(sid), str(vid)) for sid, vid in rows if reply_mailbox_hash(vid, sid) == mailbox_hash]
     if len(match) != 1:
         raise MarketAuthorityError("inbound reply MailboxHash does not correlate to exactly one market action")
-    spec_id, _venture = match[0]
+    spec_id, venture_id = match[0]
     external_event_id = f"Inbound:{raw_inbound.get('MessageID')}"
-    return record_market_observation(
+    res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type="REPLIED",
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_inbound), actor=actor)
+    origin_mod.record_observation_origin(
+        conn, res.market_observation_id, transport=transport, provider_kind="postmark",
+        source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
+        provider_event_ref=external_event_id, actor=actor)
+    return res
 
 
 # --------------------------------------------------------------------------

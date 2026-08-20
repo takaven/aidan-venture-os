@@ -548,11 +548,11 @@ def test_finding_D_worker_claiming_foreign_message_rejected(migrated):
     other_spec = str(market_mod.get_market_action_spec(migrated, other.action_id)[0])
     foreign_mid = next(mid for mid, m in transport.outbound.items()
                        if str(m["Metadata"].get("market_action_spec")) == other_spec)
-    _task, contract = pm._postmark_contract(migrated, a.action_id, source)
+    _task, contract = pm._postmark_contract(migrated, a.action_id, source, resolver)
     req = VerificationRequest(action_request_id=a.action_id, execution_attempt_id="x",
                               verifier_kind=pm.POSTMARK_VERIFIER_KIND, expected_output_contract=contract,
                               worker_structured_output={"message_id": foreign_mid}, artifacts=(), spec_hash="h")
-    verdict = pm.PostmarkActionVerifier(transport, resolver, source).verify(req)
+    verdict = pm.PostmarkActionVerifier(transport).verify(req)
     assert verdict.verdict == "REJECTED"
 
 
@@ -575,8 +575,8 @@ def real_loop(conn, slug, monkeypatch, *, outcome="REPLIED"):
     loop_action = commitment.commit_recommendation(conn, r1.recommendation_id).resulting_action_id
     loop_spec = freeze_outreach(conn, setup, loop_action, channel_kind=pm.POSTMARK_CHANNEL)
     pm.execute_postmark_action(conn, loop_action, registry=registry_with(
-        pm.PostmarkEmailWorker(transport, resolver, source)), source=source)
-    assert pm.verify_postmark_action(conn, loop_action, transport=transport, resolver=resolver, source=source).verified
+        pm.PostmarkEmailWorker(transport, resolver, source)), source=source, resolver=resolver)
+    assert pm.verify_postmark_action(conn, loop_action, transport=transport).verified
     mid = next(k for k, v in store.items() if k != "_n"
                and str(v["Metadata"].get("market_action_spec")) == str(loop_spec.market_action_spec_id))
     if outcome == "REPLIED":
@@ -584,7 +584,7 @@ def real_loop(conn, slug, monkeypatch, *, outcome="REPLIED"):
         pm.ingest_postmark_reply(conn, {"RecordType": "Inbound",
                                         "MailboxHash": pm.reply_mailbox_hash(setup.venture_id, loop_spec.market_action_spec_id),
                                         "From": buyer, "TextBody": "yes", "MessageID": "in-real"},
-                                 source=source, auth_header=basic_auth(), transport=transport, resolver=resolver)
+                                 source=source, auth_header=basic_auth(), transport=transport)
     else:
         pm.ingest_postmark_event(conn, {"RecordType": "Bounce", "MessageID": mid, "Type": "HardBounce"},
                                  source=source, auth_header=basic_auth(), transport=transport)

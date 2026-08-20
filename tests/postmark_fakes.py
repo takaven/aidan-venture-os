@@ -115,6 +115,6 @@ def postmark_run(conn, slug, *, mode="compliant", key=None, source=None, transpo
     setup = operating_setup(conn, slug, key=key)
     a, spec = postmark_action(conn, setup, key=key)
     worker = pm.PostmarkEmailWorker(transport, resolver, source, mode=mode)
-    pm.execute_postmark_action(conn, a, registry=registry_with(worker), source=source)
-    verify = pm.verify_postmark_action(conn, a, transport=transport, resolver=resolver, source=source)
+    pm.execute_postmark_action(conn, a, registry=registry_with(worker), source=source, resolver=resolver)
+    verify = pm.verify_postmark_action(conn, a, transport=transport)
     return PostmarkRun(setup, a, spec, worker, verify, transport, resolver, source)

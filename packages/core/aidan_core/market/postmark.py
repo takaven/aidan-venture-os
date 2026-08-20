@@ -131,10 +131,20 @@ class PostmarkEmailWorker:
         self.last_request = request
         m = dict((request.task_payload or {}).get("market", {}))
         pm = dict((request.task_payload or {}).get("postmark", {}))
-        source = self._source
-        server_id, sender = source.server_id, source.sender
+        fs = dict(pm.get("source", {}))                       # FROZEN approved provider identity
+        src = self._source
+        # The runtime configuration is an I/O dependency, NOT authority: it must correspond to the
+        # frozen approved non-secret identity, else refuse to send (before any external call).
+        if (str(src.server_id) != str(fs.get("server_id")) or str(src.sender) != str(fs.get("sender"))
+                or str(src.default_subject) != str(fs.get("subject"))
+                or str(src.credential_ref) != str(fs.get("credential_ref"))):
+            raise MarketAuthorityError("worker provider configuration does not match the frozen approved source")
         recipient = self._resolver.resolve(str(request.venture_id), m["source_instance_ref"], m["audience_ref"])
-        text_body = m["content"]
+        if _recipient_hash(recipient) != str(pm.get("recipient_hash")):
+            raise MarketAuthorityError("resolved recipient does not match the frozen approved recipient")
+        # send using the FROZEN identities (adversarial modes tamper the OUTBOUND value after the
+        # authority check, to also exercise the independent verifier).
+        server_id, sender, subject, text_body = fs["server_id"], fs["sender"], fs["subject"], m["content"]
         if self.mode == "wrong_content":
             text_body = text_body + " TAMPERED"
         if self.mode == "wrong_audience":
@@ -146,7 +156,7 @@ class PostmarkEmailWorker:
         message_id = "claimed-nonexistent"
         if self.mode != "nothing":
             message_id = self._t.send_email(
-                server_id=server_id, sender=sender, to=recipient, subject=source.default_subject,
+                server_id=server_id, sender=sender, to=recipient, subject=subject,
                 text_body=text_body, reply_to=pm["reply_to"], metadata=dict(pm["correlation"]))
         return WorkerResult(
             worker_kind=self.kind, external_result_id=message_id, reported_outcome="success",
@@ -169,15 +179,17 @@ class PostmarkActionVerifier:
     kind = POSTMARK_VERIFIER_KIND
     verification_type = MARKET_ACTION
 
-    def __init__(self, transport: PostmarkTransport, resolver: RecipientResolver, source: PostmarkSource):
+    def __init__(self, transport: PostmarkTransport):
         self._t = transport
-        self._resolver = resolver
-        self._source = source
 
     def verify(self, request: VerificationRequest) -> VerificationResult:
         market = dict((request.expected_output_contract or {}).get("market", {}))
         pm = dict((request.expected_output_contract or {}).get("postmark", {}))
         correlation = dict(pm.get("correlation", {}))
+        # ALL authoritative expected values come from the IMMUTABLE contract — never a runtime
+        # PostmarkSource/RecipientResolver supplied later.
+        fs = dict(pm.get("source", {}))
+        recipient_hash = str(pm.get("recipient_hash"))
         claimed = str((request.worker_structured_output or {}).get("message_id"))
 
         # Independent provider fetch by the claimed MessageID (works for the fake AND the real
@@ -188,10 +200,6 @@ class PostmarkActionVerifier:
         exists = msg is not None
         msg = msg or {}
         meta = dict(msg.get("Metadata", {}))
-        expected_recipient = None
-        if correlation:
-            expected_recipient = self._resolver.resolve(
-                correlation.get("venture"), market.get("source_instance_ref"), market.get("audience_ref"))
 
         checks = []
         checks.append(("ACTION_EXISTS", exists))
@@ -201,9 +209,9 @@ class PostmarkActionVerifier:
             checks.append(("ACTION_IDENTITY",
                            channels_mod.content_sha(str(msg.get("TextBody", ""))) == market.get("content_hash")
                            and str(meta.get("action_spec_hash")) == str(market.get("action_spec_hash"))))
-            checks.append(("AUDIENCE_IDENTITY", str(msg.get("To")) == str(expected_recipient)))
-            checks.append(("CHANNEL_IDENTITY", str(msg.get("ServerID")) == str(self._source.server_id)))
-            checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(self._source.sender)))
+            checks.append(("AUDIENCE_IDENTITY", _recipient_hash(str(msg.get("To"))) == recipient_hash))
+            checks.append(("CHANNEL_IDENTITY", str(msg.get("ServerID")) == str(fs.get("server_id"))))
+            checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(fs.get("sender"))))
             checks.append(("ACCEPTANCE_IDENTITY", claimed == str(msg.get("MessageID")) and claimed not in ("", "None")))
         else:
             for name in ("CORRELATION_IDENTITY", "ACTION_IDENTITY", "AUDIENCE_IDENTITY", "CHANNEL_IDENTITY",
@@ -224,17 +232,40 @@ class PostmarkActionVerifier:
             detail={"checks": [{"name": n, "result": "PASS" if v else "FAIL"} for n, v in checks]})
 
 
-def postmark_verifier_registry(transport: PostmarkTransport, resolver: RecipientResolver,
-                               source: PostmarkSource) -> VerifierRegistry:
+def postmark_verifier_registry(transport: PostmarkTransport) -> VerifierRegistry:
     reg = VerifierRegistry()
-    reg.register(PostmarkActionVerifier(transport, resolver, source))
+    reg.register(PostmarkActionVerifier(transport))
     return reg
+
+
+def _frozen_contract_source(conn, action_request_id) -> dict:
+    with conn.cursor() as cur:
+        cur.execute("SELECT expected_output_contract FROM execution_spec WHERE action_request_id = %s",
+                    (action_request_id,))
+        row = cur.fetchone()
+    return dict((row[0] or {}).get("postmark", {}).get("source", {})) if row else {}
 
 
 # --------------------------------------------------------------------------
 # prepare / execute / verify (reuse the Gate-7 market binding + Gate-4 runtime)
 # --------------------------------------------------------------------------
-def _postmark_contract(conn, action_request_id, source: PostmarkSource):
+def source_identity(source: PostmarkSource) -> str:
+    """Concrete NON-SECRET provider source identity (credential ref + server/stream) — no token."""
+    return f"postmark:{source.credential_ref}:{source.server_id}"
+
+
+def _recipient_hash(address: str) -> str:
+    return hashlib.sha256(_normalize_email(address).encode("utf-8")).hexdigest()
+
+
+def _frozen_source(source: PostmarkSource) -> dict:
+    """The exact non-secret provider execution identity frozen at authorization (never the token)."""
+    return {"provider_kind": "postmark", "server_id": source.server_id, "sender": source.sender,
+            "subject": source.default_subject, "credential_ref": source.credential_ref,
+            "inbound_domain": source.inbound_domain, "source_identity": source_identity(source)}
+
+
+def _postmark_contract(conn, action_request_id, source: PostmarkSource, resolver: RecipientResolver):
     ms_row = action_mod.get_market_action_spec(conn, action_request_id)
     if ms_row is None:
         raise MarketAuthorityError(
@@ -245,24 +276,32 @@ def _postmark_contract(conn, action_request_id, source: PostmarkSource):
     if channel_kind != POSTMARK_CHANNEL:
         raise MarketAuthorityError(
             f"market action channel is {channel_kind!r}, not {POSTMARK_CHANNEL!r}")
-    source_instance = channels_mod.source_instance_ref(venture_id, channel_kind)
+    source_instance = channels_mod.source_instance_ref(venture_id, channel_kind)   # Gate-7 dedupe key
     correlation = correlation_metadata(venture_id, _id, action_request_id, action_spec_hash)
     reply_to = f"reply+{reply_mailbox_hash(venture_id, _id)}@{source.inbound_domain}"
+    # Resolve + FREEZE the exact non-secret provider execution identities at authorization time, so
+    # a later runtime source/resolver cannot substitute sender/source/recipient. Recipient is stored
+    # as a deterministic hash (no plaintext PII in canonical state).
+    frozen_source = _frozen_source(source)
+    recipient_hash = _recipient_hash(resolver.resolve(str(venture_id), source_instance, audience_ref))
     market = {
         "market_action_spec_id": str(_id), "action_spec_hash": action_spec_hash,
         "channel_kind": channel_kind, "audience_ref": audience_ref, "content": content,
         "content_hash": content_hash, "source_instance_ref": source_instance,
     }
-    postmark = {"correlation": correlation, "reply_to": reply_to, "server_id": source.server_id}
-    task_payload = {"market": market, "postmark": postmark}
-    contract = {"market": market, "postmark": {"correlation": correlation}}
+    frozen = {"correlation": correlation, "reply_to": reply_to,
+              "source": frozen_source, "recipient_hash": recipient_hash}
+    task_payload = {"market": market, "postmark": frozen}
+    contract = {"market": market, "postmark": frozen}
     return task_payload, contract
 
 
 def prepare_postmark_execution(conn, action_request_id: str, *, source: PostmarkSource,
-                               timeout_seconds: int = 60, max_attempts: int = 1, actor: str = "market"):
-    """Bind the frozen market_action_spec into an execution spec forcing the Postmark verifier."""
-    task_payload, contract = _postmark_contract(conn, action_request_id, source)
+                               resolver: RecipientResolver, timeout_seconds: int = 60,
+                               max_attempts: int = 1, actor: str = "market"):
+    """Freeze the exact approved provider source + recipient identity into the immutable execution
+    contract and force the Postmark verifier. Runtime worker/verifier config cannot alter these."""
+    task_payload, contract = _postmark_contract(conn, action_request_id, source, resolver)
     spec = spec_mod.create_execution_spec(
         conn, action_request_id, worker_kind=POSTMARK_VERIFIER_KIND, verifier_kind=POSTMARK_VERIFIER_KIND,
         timeout_seconds=timeout_seconds, max_attempts=max_attempts,
@@ -272,19 +311,21 @@ def prepare_postmark_execution(conn, action_request_id: str, *, source: Postmark
 
 
 def execute_postmark_action(conn, action_request_id: str, *, registry: WorkerRegistry,
-                            source: PostmarkSource, max_attempts: int = 1, actor: str = "market", **kw):
-    prepare_postmark_execution(conn, action_request_id, source=source, max_attempts=max_attempts, actor=actor)
+                            source: PostmarkSource, resolver: RecipientResolver,
+                            max_attempts: int = 1, actor: str = "market", **kw):
+    prepare_postmark_execution(conn, action_request_id, source=source, resolver=resolver,
+                               max_attempts=max_attempts, actor=actor)
     return factory_runtime.execute_action(
         conn, action_request_id, registry=registry, workspace_ref=f"market://{POSTMARK_CHANNEL}", actor=actor, **kw)
 
 
 def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkTransport,
-                           resolver: RecipientResolver, source: PostmarkSource, actual_cost=0, actor: str = "market"):
-    """Deterministically verify the exact email occurred in Postmark and, only if VERIFIED,
-    complete via the canonical proof-gated path (the ONE MARKET_ACTION proof_receipt) AND bind a
-    durable evidence origin taken from the transport's OWN declared origin (never a caller flag)."""
+                           actual_cost=0, actor: str = "market"):
+    """Deterministically verify the exact email occurred in Postmark (all expected identities from
+    the IMMUTABLE contract, not a runtime source/resolver) and, only if VERIFIED, complete via the
+    canonical proof-gated path AND bind a durable evidence origin from the trusted reconciliation."""
     outcome = factory_runtime.verify_and_complete(
-        conn, action_request_id, verifier_registry=postmark_verifier_registry(transport, resolver, source),
+        conn, action_request_id, verifier_registry=postmark_verifier_registry(transport),
         actual_cost=actual_cost, actor=actor)
     if getattr(outcome, "verified", False):
         with conn.cursor() as cur:
@@ -297,11 +338,15 @@ def verify_postmark_action(conn, action_request_id: str, *, transport: PostmarkT
                         (action_request_id,))
             row = cur.fetchone()
         message_id = row[0] if row else None
-        # attest via the real reconciliation path (None for a fake/subclass transport -> SIMULATED)
+        fs = _frozen_contract_source(conn, action_request_id)      # concrete non-secret source identity
+        # attest via the real reconciliation path (None for a fake/subclass transport -> SIMULATED);
+        # the attested provider server must also match the frozen approved source, else not REAL.
         provider_state = _trusted_provider_state(transport, message_id) if message_id else None
+        if provider_state is not None and str(getattr(provider_state, "server_id", "")) != str(fs.get("server_id")):
+            provider_state = None
         origin_mod.record_evidence_origin(
             conn, action_request_id, provider_state=provider_state, provider_kind="postmark",
-            source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), actor=actor)
+            source_instance_ref=str(fs.get("source_identity")), actor=actor)   # concrete frozen source id
     return outcome
 
 
@@ -340,6 +385,25 @@ def _spec_for_message(conn, message_id: str, transport: PostmarkTransport):
     return spec_id, venture_id
 
 
+def _frozen_postmark_for_spec(conn, spec_id) -> dict:
+    """The immutable Postmark contract block (frozen source + recipient_hash) for a market action."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT es.expected_output_contract FROM execution_spec es "
+                    "JOIN market_action_spec ms ON ms.action_request_id = es.action_request_id WHERE ms.id = %s",
+                    (spec_id,))
+        row = cur.fetchone()
+    return dict((row[0] or {}).get("postmark", {})) if row else {}
+
+
+def _observation_provider_state(transport, message_id, frozen_source):
+    """Trusted attestation for an observation, only if the attested provider server matches the
+    action's frozen approved source (a runtime source for another server cannot confer REAL)."""
+    ps = _trusted_provider_state(transport, message_id)
+    if ps is not None and str(getattr(ps, "server_id", "")) != str(frozen_source.get("server_id")):
+        return None
+    return ps
+
+
 def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth_header: str,
                           transport: PostmarkTransport, actor: str = "market"):
     """Authenticate a Postmark Delivery/Bounce webhook, reconcile its MessageID to the exact
@@ -355,12 +419,12 @@ def ingest_postmark_event(conn, raw_event: dict, *, source: PostmarkSource, auth
     res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type=otype,
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_event), actor=actor)
-    # attest via the real reconciliation of the event's MessageID (None for fake/subclass)
-    provider_state = _trusted_provider_state(transport, message_id)
+    # attest against the action's FROZEN source identity (None for fake/subclass/other-server)
+    fs = dict(_frozen_postmark_for_spec(conn, spec_id).get("source", {}))
+    provider_state = _observation_provider_state(transport, message_id, fs)
     origin_mod.record_observation_origin(
         conn, res.market_observation_id, provider_state=provider_state, provider_kind="postmark",
-        source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
-        provider_event_ref=external_event_id, actor=actor)
+        source_instance_ref=str(fs.get("source_identity")), provider_event_ref=external_event_id, actor=actor)
     return res
 
 
@@ -374,33 +438,31 @@ def _normalize_email(value) -> str:
 
 
 def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, auth_header: str,
-                          transport: PostmarkTransport, resolver: RecipientResolver, actor: str = "market"):
+                          transport: PostmarkTransport, actor: str = "market"):
     """Authenticate a Postmark Inbound reply, correlate it to exactly one market action by the
-    structural MailboxHash token, AND prove the inbound sender is the exact authorized outbound
-    recipient (a reply from any other sender to the unique address is rejected). Reply text is DATA."""
+    structural MailboxHash token, AND prove the inbound sender is the exact authorized recipient
+    FROZEN for the executed action (a later runtime resolver cannot redefine who the buyer was; a
+    reply from any other sender is rejected). Reply text remains untrusted DATA."""
     _authenticate(source, auth_header)
     mailbox_hash = str(raw_inbound.get("MailboxHash"))
     if not mailbox_hash or mailbox_hash == "None":
         raise MarketAuthorityError("inbound reply carries no MailboxHash correlation token")
     with conn.cursor() as cur:
-        cur.execute("SELECT id, venture_id, audience_ref FROM market_action_spec WHERE channel_kind = %s",
-                    (POSTMARK_CHANNEL,))
+        cur.execute("SELECT id, venture_id FROM market_action_spec WHERE channel_kind = %s", (POSTMARK_CHANNEL,))
         rows = cur.fetchall()
-    match = [(str(sid), str(vid), aud) for sid, vid, aud in rows if reply_mailbox_hash(vid, sid) == mailbox_hash]
+    match = [(str(sid), str(vid)) for sid, vid in rows if reply_mailbox_hash(vid, sid) == mailbox_hash]
     if len(match) != 1:
         raise MarketAuthorityError("inbound reply MailboxHash does not correlate to exactly one market action")
-    spec_id, venture_id, audience_ref = match[0]
-    # buyer attribution: the inbound sender must be the exact authorized outbound recipient
-    expected = _normalize_email(resolver.resolve(
-        venture_id, channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL), audience_ref))
-    if _normalize_email(raw_inbound.get("From")) != expected:
-        raise MarketAuthorityError("inbound reply sender is not the authorized outbound recipient")
+    spec_id, venture_id = match[0]
+    frozen = _frozen_postmark_for_spec(conn, spec_id)
+    # buyer attribution against the FROZEN recipient identity of the executed action (immutable)
+    if not frozen.get("recipient_hash") or _recipient_hash(raw_inbound.get("From")) != str(frozen["recipient_hash"]):
+        raise MarketAuthorityError("inbound reply sender is not the frozen authorized recipient")
     external_event_id = f"Inbound:{raw_inbound.get('MessageID')}"
     res = record_market_observation(
         conn, spec_id, external_event_id=external_event_id, observation_type="REPLIED",
         channel_kind=POSTMARK_CHANNEL, raw_evidence=dict(raw_inbound), actor=actor)
-    # attest by reconciling the OUTBOUND action's provider message (the inbound reply correlates
-    # to it via MailboxHash); None for a fake/subclass transport -> SIMULATED.
+    # attest by reconciling the OUTBOUND action's provider message against the frozen source
     with conn.cursor() as cur:
         cur.execute("SELECT er.external_result_id FROM execution_result er "
                     "JOIN proof_receipt pr ON pr.execution_result_id = er.id "
@@ -408,11 +470,11 @@ def ingest_postmark_reply(conn, raw_inbound: dict, *, source: PostmarkSource, au
                     "WHERE ms.id = %s AND pr.verification_type = 'MARKET_ACTION' AND pr.result = 'VERIFIED' "
                     "ORDER BY pr.created_at DESC, pr.id DESC LIMIT 1", (spec_id,))
         orow = cur.fetchone()
-    provider_state = _trusted_provider_state(transport, orow[0]) if orow else None
+    fs = dict(frozen.get("source", {}))
+    provider_state = _observation_provider_state(transport, orow[0], fs) if orow else None
     origin_mod.record_observation_origin(
         conn, res.market_observation_id, provider_state=provider_state, provider_kind="postmark",
-        source_instance_ref=channels_mod.source_instance_ref(venture_id, POSTMARK_CHANNEL),
-        provider_event_ref=external_event_id, actor=actor)
+        source_instance_ref=str(fs.get("source_identity")), provider_event_ref=external_event_id, actor=actor)
     return res
 
 

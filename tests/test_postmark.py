@@ -542,12 +542,37 @@ def test_attestation_carries_actual_server_and_stream(migrated, monkeypatch):
 def test_real_action_wrong_server_stays_simulated(migrated, monkeypatch):
     from postmark_fakes import install_real_postmark
     from aidan_core.market import origin as origin_mod
-    # a genuine transport whose token belongs to server B cannot even send action frozen for A
+    # A genuine transport whose token belongs to server B cannot execute an action frozen for
+    # server A: the worker's pre-send authority check (GET /server != frozen postmark_server_id)
+    # fails BEFORE any provider send, so the runtime records a FAILED attempt with NO POST /email
+    # and NO captured worker result. The boundary is the pre-send rejection — there is deliberately
+    # nothing for the verifier to inspect — and the action therefore stays SIMULATED.
     setup = operating_setup(migrated, "rsimu")
     a, spec = postmark_action(migrated, setup, key="rsimu")
-    transport, store = install_real_postmark(monkeypatch, server_id="server-B")
+    transport, store = install_real_postmark(monkeypatch, server_id="server-B")   # runtime token -> server B
     pm.execute_postmark_action(migrated, a, registry=registry_with(
         pm.PostmarkEmailWorker(transport, FakeRecipientResolver(), default_source("server-A"))),
         source=default_source("server-A"), resolver=FakeRecipientResolver())
-    assert pm.verify_postmark_action(migrated, a, transport=transport).verified is False   # blocked
-    assert origin_mod.action_reality(migrated, a) == "SIMULATED"
+
+    assert store.get("_n", 0) == 0                       # blocked BEFORE the consequential POST /email
+    assert not [k for k in store if k != "_n"]           # no provider MessageID created
+    with migrated.cursor() as cur:
+        # canonical history: the runtime recorded a FAILED attempt (worker fault), never SUCCEEDED
+        cur.execute("SELECT status FROM action_request WHERE id = %s", (a,))
+        assert cur.fetchone()[0] == "FAILED"
+        # no captured worker result exists — so verification has nothing to inspect (by design)
+        cur.execute("SELECT count(*) FROM execution_result WHERE action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0
+        # no VERIFIED MARKET_ACTION proof receipt
+        cur.execute("SELECT count(*) FROM proof_receipt WHERE action_request_id = %s "
+                    "AND verification_type = 'MARKET_ACTION' AND result = 'VERIFIED'", (a,))
+        assert cur.fetchone()[0] == 0
+        # no evidence origin (REAL or otherwise) from the blocked execution
+        cur.execute("SELECT count(*) FROM external_evidence_origin eo "
+                    "JOIN proof_receipt pr ON pr.id = eo.proof_receipt_id "
+                    "WHERE pr.action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0
+        # no market observation created from the blocked execution
+        cur.execute("SELECT count(*) FROM market_observation WHERE action_request_id = %s", (a,))
+        assert cur.fetchone()[0] == 0
+    assert origin_mod.action_reality(migrated, a) == "SIMULATED"   # no REAL proof exists

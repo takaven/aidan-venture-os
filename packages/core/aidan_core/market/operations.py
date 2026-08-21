@@ -24,10 +24,11 @@ IP range is hard-coded. HTTPS and POST-only at the network edge remain the DEPLO
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional
 
-from ..errors import MarketAuthorityError
+from ..errors import ConfigError, MarketAuthorityError
 from . import postmark as pm
 
 # A Postmark webhook body is small JSON; bound it well below any reasonable event to reject abuse.
@@ -123,3 +124,77 @@ def handle_webhook(conn, *, method, headers, body, source, transport, actor: str
     except MarketAuthorityError as exc:                # authenticated, but provenance/reconciliation failed
         raise WebhookRejected(422, "unprocessable") from exc
     return IngressResult(202, record_type, getattr(res, "market_observation_id", None))
+
+
+# ==========================================================================
+# operational entrypoint: runtime env -> real GET /server identity check (no send)
+# ==========================================================================
+# Non-secret expected config (owner-recorded) + the ONE secret, all from the runtime environment.
+ENV_SERVER_TOKEN = "POSTMARK_SERVER_TOKEN"          # SECRET — the server API token (never logged/persisted)
+ENV_SERVER_ID = "POSTMARK_SERVER_ID"                # non-secret — expected actual Postmark Server ID
+ENV_MESSAGE_STREAM = "POSTMARK_MESSAGE_STREAM"      # non-secret — configured/expected MessageStream
+ENV_SENDER = "POSTMARK_SENDER"                      # non-secret — intended From (optional here)
+ENV_INBOUND_DOMAIN = "POSTMARK_INBOUND_DOMAIN"      # non-secret — inbound Reply-To domain (optional here)
+ENV_SUBJECT = "POSTMARK_SUBJECT"                    # non-secret — default subject (optional here)
+ENV_CREDENTIAL_REF = "POSTMARK_CREDENTIAL_REF"      # non-secret — opaque canonical handle (not the token)
+
+
+def _source_from_env(env: dict, *, server_id: str, message_stream: str) -> pm.PostmarkSource:
+    return pm.PostmarkSource(
+        postmark_server_id=server_id, message_stream=message_stream,
+        sender=env.get(ENV_SENDER, ""), default_subject=env.get(ENV_SUBJECT, ""),
+        inbound_domain=env.get(ENV_INBOUND_DOMAIN, ""),
+        credential_ref=env.get(ENV_CREDENTIAL_REF, "secret://postmark/alpha"))
+
+
+def resolve_identity_from_env(env=None, *, transport_factory=None, source=None) -> dict:
+    """Read the approved runtime environment, construct the real ``PostmarkHttpTransport`` from the
+    token, and run the NON-CONSEQUENTIAL identity check (GET /server only). Fails CLOSED: a missing
+    token or missing expected Server ID raises ``ConfigError`` (non-secret message); a provider/network
+    fault returns a non-ready result classified by exception TYPE only. The raw token is passed to the
+    transport factory and is NEVER placed in the result, an exception message, or a log. Sends nothing.
+
+    ``transport_factory``/``source`` are test seams (default: the real transport and an env-built
+    source); tests inject a stub so no real network or token is required.
+    """
+    env = os.environ if env is None else env
+    token = env.get(ENV_SERVER_TOKEN)
+    if not token:
+        raise ConfigError(f"{ENV_SERVER_TOKEN} is not set")   # fail closed; no token to leak
+    expected_server_id = env.get(ENV_SERVER_ID)
+    if not expected_server_id:
+        raise ConfigError(f"{ENV_SERVER_ID} is not set")
+    expected_message_stream = env.get(ENV_MESSAGE_STREAM) or "outbound"
+    if source is None:
+        source = _source_from_env(env, server_id=expected_server_id, message_stream=expected_message_stream)
+    factory = transport_factory or pm.PostmarkHttpTransport
+    transport = factory(token)                                # token used ONLY to build the transport
+    try:
+        result = check_provider_identity(transport, source, expected_server_id=expected_server_id,
+                                         expected_message_stream=expected_message_stream)
+    except Exception as exc:                                  # network/provider fault -> fail closed
+        # classify by exception TYPE only; never echo the message (defense against token/URL leakage)
+        return {"ready": False, "reason": f"provider_error:{type(exc).__name__}",
+                "expected_server_id": str(expected_server_id),
+                "expected_message_stream": str(expected_message_stream)}
+    result["expected_server_id"] = str(expected_server_id)
+    result["expected_message_stream"] = str(expected_message_stream)
+    return result
+
+
+def main(argv=None, *, env=None, transport_factory=None, out=None) -> int:
+    """CLI shim: print the operational readiness result as JSON (NO secret) and return an exit code —
+    0 ready, 1 not ready, 2 configuration error. Not a market Proof Receipt; operational evidence only."""
+    import sys
+    out = sys.stdout if out is None else out
+    try:
+        result = resolve_identity_from_env(env=env, transport_factory=transport_factory)
+    except ConfigError as exc:
+        print(json.dumps({"ready": False, "error": f"config:{type(exc).__name__}", "detail": str(exc)}), file=out)
+        return 2
+    print(json.dumps(result, sort_keys=True), file=out)
+    return 0 if result.get("ready") else 1
+
+
+if __name__ == "__main__":   # pragma: no cover - manual operational invocation
+    raise SystemExit(main())

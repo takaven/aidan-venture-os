@@ -60,11 +60,23 @@ provider account and a deployed ingress. They are proven with **real operational
 CI, and are explicitly out of scope for the frozen code. Operational configuration/connectivity is
 never treated as REAL MARKET evidence.
 
+### Operational identity entrypoint (env → GET /server, no send)
+
+`operations.resolve_identity_from_env` / `operations.main` read the approved runtime environment
+(`POSTMARK_SERVER_TOKEN` secret; `POSTMARK_SERVER_ID` / `POSTMARK_MESSAGE_STREAM` and other non-secret
+expected config), construct the real `PostmarkHttpTransport` from the token, and run
+`check_provider_identity` — the ONLY missing wiring between owner-provided credentials and the existing
+identity check. It fails closed (`ConfigError`) on a missing token/Server ID, classifies a
+provider/network fault by exception TYPE only, and **never** sends, never writes canonical state, and
+never places the token in the result, an exception message, or the printed JSON. The opaque canonical
+`credential_ref` stays separate from the raw token. `main` returns 0 (ready) / 1 (not ready) / 2
+(config error) — operational readiness evidence, never a market Proof Receipt.
+
 ## Consequences
 
 - No migration (0001–0025 unchanged), no dependency/capability change, no new service/platform.
-  Production change is confined to a new `market/operations.py` plus a constant-time/`WebhookAuthError`
-  hardening of `market/postmark.py::_authenticate`. Adversarial tests cover identity (Live/Sandbox/
+  Production change is confined to `market/operations.py` (ingress guard + identity check + env
+  entrypoint) plus a constant-time/`WebhookAuthError` hardening of `market/postmark.py::_authenticate`. Adversarial tests cover identity (Live/Sandbox/
   wrong-server/wrong-stream, zero send), ingress rejections (method/content-type/size/auth/JSON/
   RecordType/IP), accepted routing to REAL observation, provenance rejections (wrong MessageID, no
   hardened proof, foreign/forged reply), and secret non-leakage. Real customer send remains a later

@@ -124,7 +124,7 @@ def _drive_deploy_to_operating(migrated, slug, vid, mid):
     target = deploy_target.register_deployment_target(
         migrated, vid, environment="staging", provider_kind="fake-a", target_ref=f"deploy://{slug}/staging")
     deploy_release.create_release_candidate(
-        migrated, da, build_manifest_id=mid, deployment_target_id=target.target_id)
+        migrated, da, build_manifest_id=mid, deployment_target_id=target.deployment_target_id)
     lifecycle.transition(migrated, vid, "VALIDATING", actor="op")   # governed lifecycle authority
     lifecycle.transition(migrated, vid, "BUILDING", actor="op")
     dw = DeployBundleWorker(mode="compliant")

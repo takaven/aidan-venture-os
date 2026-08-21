@@ -192,17 +192,24 @@ def _decide(cur, venture_id, opportunity_id):
             return ("HOLD", "VALIDATION_CONTRADICTORY", None, considered_assumptions, considered_tests, all_result_ids, [], [])
 
     # 4. BUILD consideration (structurally complete + positive evidence + all key assumptions resolved).
+    #    BUILD is a PRE-operational action: once the venture is OPERATING it has already been built and
+    #    deployed, so BUILD is never the highest-value next action again — the venture's own durable
+    #    lifecycle_state suppresses it, letting an OPERATING venture reach the MARKET loop (step 5). A
+    #    not-yet-operating venture (DISCOVERED/VALIDATING/BUILDING) stays build-eligible, and a
+    #    failed/incomplete BUILD stays non-OPERATING so it can never falsely jump to MARKET.
     cur.execute("SELECT status FROM opportunity WHERE id = %s", (opportunity_id,))
     row = cur.fetchone()
     if row is None:
         raise NotFoundError(f"opportunity {opportunity_id} does not exist")
     status = row[0]
+    cur.execute("SELECT lifecycle_state FROM venture WHERE id = %s", (venture_id,))
+    lifecycle_state = cur.fetchone()[0]
     any_pass = any(s["has_pass"] for s in state.values())
     key_resolved = all(
         (s["has_pass"] and not s["has_inconclusive"] and not s["has_fail"])
         for aid, s in state.items() if s["importance"] in ("CRITICAL", "HIGH")
     )
-    if status == "CANDIDATE" and any_pass and key_resolved and state:
+    if lifecycle_state != "OPERATING" and status == "CANDIDATE" and any_pass and key_resolved and state:
         return ("BUILD", "BUILD_CONSIDERATION_READY", None, considered_assumptions, considered_tests, all_result_ids, [], [])
 
     # 5. No classic high-value action. For an OPERATING venture with unresolved, market-tested

@@ -39,6 +39,11 @@ from typing import Any, Callable, Optional
 
 from ..errors import ConfigError, InvalidAcquisitionError
 from .adapters import AcquiredSource
+from .assumptions import CONFIDENCE as _KERNEL_CONFIDENCE
+from .assumptions import IMPORTANCE as _KERNEL_IMPORTANCE
+from .killcase import ASSESSMENTS as _KERNEL_ASSESSMENTS
+from .killcase import DISPOSITIONS as _KERNEL_DISPOSITIONS
+from .killcase import REQUIRED_DIMENSIONS as _KERNEL_DIMENSIONS
 from .proposals import (
     AssumptionProposal,
     ClaimProposal,
@@ -286,9 +291,12 @@ _PROPOSE_TOOL = {
                 "claim_keys": {"type": "array", "items": {"type": "string"}}},
                 "required": ["key", "statement"]}},
             "assumptions": {"type": "array", "items": {"type": "object", "properties": {
-                "key": {"type": "string"}, "proposition": {"type": "string"}, "importance": {"type": "string"},
-                "confidence": {"type": "string"}, "consequence_if_false": {"type": "string"},
-                "cheapest_test": {"type": "string"},
+                "key": {"type": "string"}, "proposition": {"type": "string"},
+                # Defence-in-depth only: enums mirror the authoritative kernel constants. The
+                # provider-neutral pre-flight validator remains the trust boundary.
+                "importance": {"type": "string", "enum": sorted(_KERNEL_IMPORTANCE)},
+                "confidence": {"type": "string", "enum": sorted(_KERNEL_CONFIDENCE)},
+                "consequence_if_false": {"type": "string"}, "cheapest_test": {"type": "string"},
                 "claim_keys": {"type": "array", "items": {"type": "string"}},
                 "interpretation_keys": {"type": "array", "items": {"type": "string"}}},
                 "required": ["key", "proposition", "importance", "confidence", "consequence_if_false", "cheapest_test"]}},
@@ -299,7 +307,15 @@ _PROPOSE_TOOL = {
                 "claim_keys": {"type": "array", "items": {"type": "string"}},
                 "assumption_keys": {"type": "array", "items": {"type": "string"}},
                 "interpretation_keys": {"type": "array", "items": {"type": "string"}},
-                "kill_case": {"type": "object"}},
+                "kill_case": {"type": "object", "properties": {
+                    "disposition": {"type": "string", "enum": sorted(_KERNEL_DISPOSITIONS)},
+                    "dimensions": {"type": "array", "items": {"type": "object", "properties": {
+                        "dimension": {"type": "string", "enum": sorted(_KERNEL_DIMENSIONS)},
+                        "assessment": {"type": "string", "enum": sorted(_KERNEL_ASSESSMENTS)},
+                        "rationale": {"type": "string"},
+                        "claim_keys": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["dimension", "assessment", "rationale"]}}},
+                    "required": ["disposition"]}},
                 "required": ["key", "buyer_hypothesis", "problem_hypothesis", "critical_unknown"]}},
         },
     },

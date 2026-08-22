@@ -11,7 +11,8 @@ provider keys. It fails closed: unconfigured or any provider failure/refusal/mal
 produces no fabricated evidence and no false success (non-zero exit), never a repaired run.
 
 Exit codes: 0 PASS · 2 CONFIG (missing DATABASE_URL or provider config) · 3 PROVIDER_FAILED_CLOSED
-· 4 ACCEPTANCE_FAILED (bounds/governance/secret/outcome check failed).
+(provider failure or a rejected malformed proposal) · 4 ACCEPTANCE_FAILED (bounds/governance/secret/
+outcome check failed) · 5 UNEXPECTED_ERROR (a sanitized last-resort catch; never a raw traceback).
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import os
 import sys
 import time
 
-from ..errors import ConfigError, InvalidAcquisitionError
+from ..errors import ConfigError, InvalidAcquisitionError, InvalidProposalError
 from . import http_providers as hp
 
 _MAX_TAVILY = 2
@@ -152,12 +153,15 @@ def main() -> int:
             _emit({"smoke": "gate8-research", "result": "CONFIG_ERROR",
                    "tavily_calls": counter["tavily"], "anthropic_calls": counter["anthropic"]})
             return 2
-        except InvalidAcquisitionError as exc:  # provider failure/refusal/malformed/bound -> fail closed
+        except (InvalidAcquisitionError, InvalidProposalError) as exc:  # provider/proposal -> fail closed
             facts = _facts(vid, counter, outcome=None)
             facts["result"] = "PROVIDER_FAILED_CLOSED"
             facts["reason"] = type(exc).__name__
             # sanitized, static classification of the exact failing branch (never a response body/secret)
             facts["provider_failure_code"] = getattr(exc, "provider_failure_code", "UNCLASSIFIED")
+            proposal_code = getattr(exc, "proposal_code", None)
+            if proposal_code is not None:
+                facts["proposal_validation_code"] = proposal_code  # static field/enum class, no model value
             http_status = getattr(exc, "provider_http_status", None)
             if http_status is not None:
                 facts["provider_http_status"] = http_status        # safe integer only
@@ -170,6 +174,13 @@ def main() -> int:
                 facts["failed_operation"] = failed[-1]["operation"]
             _emit(facts)
             return 3
+        except Exception as exc:  # defence-in-depth: never emit a raw traceback — sanitized class only
+            facts = _facts(vid, counter, outcome=None)
+            facts["result"] = "UNEXPECTED_ERROR"
+            facts["error_type"] = type(exc).__name__               # static class name only, no message/content
+            facts["anthropic_calls_detail"] = proposer.records
+            _emit(facts)
+            return 5
 
         facts = _facts(vid, counter, outcome=run.outcome, run=run)
         facts["anthropic_calls_detail"] = proposer.records         # <=2 records: operation + duration_ms

@@ -78,6 +78,13 @@ class InvalidAcquisitionError(AidanCoreError):
     """An acquired source (untrusted external input) failed validation."""
 
 
+class InvalidProposalError(AidanCoreError):
+    """A provider-neutral ResearchProposal (untrusted agent output) violates a kernel invariant
+    (a categorical enum or a required field) and is rejected deterministically BEFORE any
+    proposal-derived canonical write. Carries a static, content-free ``.proposal_code`` — never a
+    model value, prompt, or source content."""
+
+
 class EvidenceRelationConflictError(AidanCoreError):
     """The same claim/observation pair was asserted with a conflicting stance.
 

@@ -320,6 +320,22 @@ def test_tavily_timeout_unchanged_uses_http_json_default():
     assert seen["timeout"] == "DEFAULT"                 # Tavily passes NO timeout -> _http_json default (30s)
 
 
+def test_propose_tool_schema_enums_align_with_kernel_constants():
+    # Defence-in-depth: the tool schema's categorical enums must mirror the authoritative kernel sets.
+    from aidan_core.research import http_providers as hp
+    from aidan_core.research.assumptions import CONFIDENCE, IMPORTANCE
+    from aidan_core.research.killcase import ASSESSMENTS, DISPOSITIONS, REQUIRED_DIMENSIONS
+    props = hp._PROPOSE_TOOL["input_schema"]["properties"]
+    assum = props["assumptions"]["items"]["properties"]
+    assert assum["importance"]["enum"] == sorted(IMPORTANCE)
+    assert assum["confidence"]["enum"] == sorted(CONFIDENCE)
+    kc = props["opportunities"]["items"]["properties"]["kill_case"]["properties"]
+    assert kc["disposition"]["enum"] == sorted(DISPOSITIONS)
+    dim = kc["dimensions"]["items"]["properties"]
+    assert dim["dimension"]["enum"] == sorted(REQUIRED_DIMENSIONS)
+    assert dim["assessment"]["enum"] == sorted(ASSESSMENTS)
+
+
 def test_http_error_type_not_allowlisted_is_dropped(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen",
                         _raise_exc(_httperror(400, b'{"error":{"type":"some_unlisted_future_type"}}')))
@@ -418,3 +434,25 @@ def test_composition_second_replaceable_adapter_same_kernel_path(migrated):
         adapter=ReplayAdapter({"How burdensome is SMB reconciliation?": [acquired(_RAW, key="s1")]}),
         proposer=ScriptedProposer(["How burdensome is SMB reconciliation?"], build_credible))
     assert r.outcome == "OPPORTUNITIES_FOUND" and r.candidate_ids
+
+
+def test_composition_invalid_importance_rejected_no_partial_persistence(migrated):
+    # The live defect: a completed proposal with a bad assumption importance is rejected by the
+    # pre-flight BEFORE any proposal-derived write. Nothing partial persists; the pre-proposal source
+    # receipt legitimately remains.
+    from aidan_core.errors import InvalidProposalError
+    payload = _candidate_payload(_RAW[:24])
+    payload["assumptions"][0]["importance"] = "MODERATE"   # not in {CRITICAL,HIGH,LOW,MEDIUM}
+    vid, ver, mandate = make_mandate(migrated, "g8-prov-badenum")
+    with pytest.raises(InvalidProposalError) as ei:
+        orchestration.run_research(
+            migrated, venture_id=vid, mandate_version=ver, mandate_content=mandate, run_key="rr",
+            adapter=_adapter(), proposer=_proposer(payload))
+    assert ei.value.proposal_code == "ASSUMPTION_IMPORTANCE"
+    f = _fresh()
+    try:
+        for t in ("observation", "claim", "interpretation", "assumption", "opportunity", "kill_case"):
+            assert _count(f, f"SELECT count(*) FROM {t} WHERE venture_id=%s", vid) == 0, t
+        assert _count(f, "SELECT count(*) FROM source_receipt WHERE venture_id=%s", vid) == 1   # pre-proposal
+    finally:
+        f.close()

@@ -1,0 +1,63 @@
+name: Gate 8 Live Research Smoke
+
+# Manual-only. This workflow is NEVER triggered by push/PR — only by an explicit
+# workflow_dispatch with confirm=RUN. It runs exactly one bounded live research smoke
+# (<=2 Tavily calls, <=2 Anthropic calls, <=US$1.00) against real providers using
+# GitHub Actions' PostgreSQL 16 service. Secrets come from the protected environment
+# `gate8-live-smoke`; provider keys are never printed. No deploy, no Postmark, no send.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN to authorize the bounded live smoke (<=2 Tavily, <=2 Anthropic, <=$1.00)'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: ${{ github.event.inputs.confirm == 'RUN' }}
+    runs-on: ubuntu-latest
+    environment: gate8-live-smoke
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aidan
+          POSTGRES_PASSWORD: aidan
+          POSTGRES_DB: aidan_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aidan"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_test
+      RESEARCH_TAVILY_API_KEY: ${{ secrets.RESEARCH_TAVILY_API_KEY }}
+      RESEARCH_ANTHROPIC_API_KEY: ${{ secrets.RESEARCH_ANTHROPIC_API_KEY }}
+      RESEARCH_ANTHROPIC_MODEL: ${{ vars.RESEARCH_ANTHROPIC_MODEL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core[test]"
+
+      - name: Apply migrations (bootstrap)
+        run: python -m aidan_core.migrate
+
+      - name: Run bounded live research smoke
+        run: python -m aidan_core.research.live_smoke

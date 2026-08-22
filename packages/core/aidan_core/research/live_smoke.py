@@ -144,6 +144,12 @@ def main() -> int:
             facts["reason"] = type(exc).__name__
             # sanitized, static classification of the exact failing branch (never a response body/secret)
             facts["provider_failure_code"] = getattr(exc, "provider_failure_code", "UNCLASSIFIED")
+            http_status = getattr(exc, "provider_http_status", None)
+            if http_status is not None:
+                facts["provider_http_status"] = http_status        # safe integer only
+            error_type = getattr(exc, "provider_error_type", None)
+            if error_type is not None:
+                facts["provider_error_type"] = error_type          # allowlisted static id only
             _emit(facts)
             return 3
 

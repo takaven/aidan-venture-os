@@ -11,7 +11,10 @@ providers never write canonical state or authorize decisions, and secrets never 
 from __future__ import annotations
 
 import inspect
+import io
 import json
+import socket
+import urllib.error
 from datetime import datetime, timezone
 
 import pytest
@@ -230,6 +233,74 @@ def test_anthropic_failure_code_taxonomy_static_and_secret_free():
     # every emitted code is a fixed literal that equals its own name — static and secret/content-free
     assert all(isinstance(c, str) and c == c.upper() and " " not in c for c in codes)
     assert "TOP-SECRET" not in "".join(codes)
+
+
+# ==========================================================================
+# HTTP-response vs genuine transport failure — REAL _http_json boundary
+# (urlopen raises HTTPError on non-2xx; a non-HTTP URLError/timeout is a network fault)
+# ==========================================================================
+def _raise_exc(exc):
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
+def _httperror(code, body=b""):
+    return urllib.error.HTTPError("https://api.anthropic.com/v1/messages", code, "err", {}, io.BytesIO(body))
+
+
+def test_http_error_is_http_status_with_safe_diagnostics(monkeypatch):
+    from aidan_core.research import http_providers as hp
+    body = b'{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens 8192 > 4096"},"request_id":"req_x"}'
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(_httperror(400, body)))
+    with pytest.raises(InvalidAcquisitionError) as ei:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")   # REAL _http_json path
+    assert ei.value.provider_failure_code == hp.ANTHROPIC_HTTP_STATUS      # NOT network
+    assert ei.value.provider_http_status == 400
+    assert ei.value.provider_error_type == "invalid_request_error"        # allowlisted static id
+    # the free-text message / body / request_id never leak into the exception diagnostics
+    assert str(ei.value) == hp.ANTHROPIC_HTTP_STATUS and "max_tokens" not in str(ei.value)
+
+
+def test_http_error_429_and_500_are_http_status(monkeypatch):
+    from aidan_core.research import http_providers as hp
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(_httperror(429, b'{"error":{"type":"rate_limit_error"}}')))
+    with pytest.raises(InvalidAcquisitionError) as ei:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+    assert ei.value.provider_failure_code == hp.ANTHROPIC_HTTP_STATUS and ei.value.provider_http_status == 429
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(_httperror(500, b"not-json")))
+    with pytest.raises(InvalidAcquisitionError) as ei2:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+    assert ei2.value.provider_failure_code == hp.ANTHROPIC_HTTP_STATUS and ei2.value.provider_http_status == 500
+    assert ei2.value.provider_error_type is None   # non-JSON error body -> no type surfaced
+
+
+def test_genuine_transport_failures_stay_network(monkeypatch):
+    from aidan_core.research import http_providers as hp
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(urllib.error.URLError("dns failure")))
+    with pytest.raises(InvalidAcquisitionError) as ei:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+    assert ei.value.provider_failure_code == hp.ANTHROPIC_NETWORK_FAILURE
+    assert getattr(ei.value, "provider_http_status", None) is None
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(socket.timeout("timed out")))
+    with pytest.raises(InvalidAcquisitionError) as ei2:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+    assert ei2.value.provider_failure_code == hp.ANTHROPIC_NETWORK_FAILURE
+
+
+def test_http_error_type_not_allowlisted_is_dropped(monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen",
+                        _raise_exc(_httperror(400, b'{"error":{"type":"some_unlisted_future_type"}}')))
+    with pytest.raises(InvalidAcquisitionError) as ei:
+        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+    assert ei.value.provider_http_status == 400 and ei.value.provider_error_type is None
+
+
+def test_tavily_http_error_still_fails_closed(monkeypatch):
+    # _http_json is shared with Tavily: a non-2xx must still fail closed (now via the returned status).
+    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(_httperror(500, b'{}')))
+    with pytest.raises(InvalidAcquisitionError):
+        TavilySearchAdapter(env=_TAV_ENV).acquire("q")
 
 
 # ==========================================================================

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -67,13 +68,32 @@ Transport = Callable[..., "tuple[int, Any]"]
 
 
 def _http_json(method: str, url: str, *, headers: dict, body: Optional[dict] = None,
-               timeout: float = 30.0):  # pragma: no cover - real network boundary (stubbed in tests)
-    """The single real network boundary: one JSON request via stdlib urllib. No SDK."""
+               timeout: float = 30.0):
+    """The single real network boundary: one JSON request via stdlib urllib. No SDK.
+
+    Returns ``(status, payload_or_None)``. A non-2xx HTTP RESPONSE (which ``urlopen`` raises as
+    ``HTTPError``) is normalized here into a returned ``(status, parsed_body_or_None)`` so callers can
+    distinguish an HTTP response from a genuine transport failure. A true transport failure
+    (DNS/TLS/socket/timeout — a non-HTTP ``URLError`` etc.) propagates as an exception.
+    """
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=dict(headers))
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - operator-configured endpoint
-        status = getattr(resp, "status", 200)
-        payload = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - operator-configured endpoint
+            status = getattr(resp, "status", 200)
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:   # a real HTTP response carrying a non-2xx status
+        status = int(exc.code)
+        try:
+            raw = exc.read().decode("utf-8")
+        except Exception:
+            raw = ""
+    payload = None
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = None
     return status, payload
 
 
@@ -306,6 +326,31 @@ def _anthropic_fail(code: str):
     raise exc
 
 
+# Documented Anthropic error `type` enum (static, machine-readable identifiers — never the message).
+# Only these allowlisted literals may be surfaced; the free-text `message` is never read or emitted.
+_ANTHROPIC_ERROR_TYPES = frozenset({
+    "invalid_request_error", "authentication_error", "billing_error", "permission_error",
+    "not_found_error", "request_too_large", "rate_limit_error", "timeout_error",
+    "api_error", "overloaded_error",
+})
+
+
+def _anthropic_http_fail(status, data):
+    """An HTTP response was received (non-2xx, or an unusable 2xx): classify as ANTHROPIC_HTTP_STATUS
+    and attach ONLY safe diagnostics — the numeric status and, if present and allowlisted, the static
+    provider error `type`. Never the error message, body, prompt, key, or any content."""
+    exc = InvalidAcquisitionError(ANTHROPIC_HTTP_STATUS)
+    exc.provider_failure_code = ANTHROPIC_HTTP_STATUS
+    exc.provider_http_status = int(status) if isinstance(status, int) else None
+    etype = None
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("type") in _ANTHROPIC_ERROR_TYPES:
+            etype = err["type"]
+    exc.provider_error_type = etype
+    raise exc
+
+
 class AnthropicResearchProposer:
     """Ask the Anthropic Messages API to PROPOSE typed artifacts via forced tool use. Never touches the DB.
 
@@ -338,9 +383,11 @@ class AnthropicResearchProposer:
         except (ConfigError, InvalidAcquisitionError):
             raise
         except Exception:
-            _anthropic_fail(ANTHROPIC_NETWORK_FAILURE)                 # redacted: no exception detail
+            # A genuine transport failure (non-HTTP URLError / DNS / TLS / socket / timeout). An HTTP
+            # response with a non-2xx status is NOT here — _http_json normalizes it to a returned status.
+            _anthropic_fail(ANTHROPIC_NETWORK_FAILURE)
         if status != 200 or not isinstance(data, dict):
-            _anthropic_fail(ANTHROPIC_HTTP_STATUS)                     # redacted: no status/body
+            _anthropic_http_fail(status, data)                        # HTTP response received (safe status/type only)
         stop = data.get("stop_reason")
         if stop == "refusal":
             _anthropic_fail(ANTHROPIC_REFUSAL)                         # fail closed

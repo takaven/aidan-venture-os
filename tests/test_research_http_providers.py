@@ -193,6 +193,45 @@ def test_anthropic_no_secret_in_error():
     assert "sk-ant-TOP-SECRET" not in str(ei.value)
 
 
+def test_anthropic_failure_code_taxonomy_static_and_secret_free():
+    from aidan_core.research import http_providers as hp
+
+    def resp(payload):
+        return lambda *a, **k: (200, payload)
+
+    cases = [
+        (_raising("net"), "research_questions", hp.ANTHROPIC_NETWORK_FAILURE),
+        (lambda *a, **k: (429, {}), "research_questions", hp.ANTHROPIC_HTTP_STATUS),
+        (resp({"content": [], "stop_reason": "refusal"}), "research_questions", hp.ANTHROPIC_REFUSAL),
+        (resp(_anthropic_tool("emit_research_questions", {}, stop_reason="max_tokens")),
+         "research_questions", hp.ANTHROPIC_MAX_TOKENS),
+        (resp({"content": [{"type": "text", "text": "prose only"}], "stop_reason": "end_turn"}),
+         "research_questions", hp.ANTHROPIC_TOOL_MISSING),
+        (resp(_anthropic_tool("some_other_tool", {"questions": ["q"]})),
+         "research_questions", hp.ANTHROPIC_TOOL_NAME_MISMATCH),
+        (resp(_anthropic_tool("emit_research_questions", "not-an-object")),
+         "research_questions", hp.ANTHROPIC_TOOL_INPUT_INVALID),
+        (resp(_anthropic_tool("emit_research_questions", {"questions": "nope"})),
+         "research_questions", hp.ANTHROPIC_QUESTIONS_INVALID),
+    ]
+    codes = set()
+    for transport, method, code in cases:
+        with pytest.raises(InvalidAcquisitionError) as ei:
+            getattr(AnthropicResearchProposer(env=_ANTH_ENV, transport=transport), method)("m")
+        assert ei.value.provider_failure_code == code
+        codes.add(code)
+    # a structurally-bad tool input (dict, but a non-int source_index) -> proposal-invalid
+    bad = {"observations": [{"source_index": "not-int", "excerpt": "x", "statement": "s", "key": "o"}]}
+    with pytest.raises(InvalidAcquisitionError) as ei:
+        AnthropicResearchProposer(env=_ANTH_ENV, transport=resp(_anthropic_tool("emit_research_proposal", bad))
+                                  ).propose("m", [{"index": 0, "content": "x", "locator": "L"}])
+    assert ei.value.provider_failure_code == hp.ANTHROPIC_PROPOSAL_INVALID
+    codes.add(hp.ANTHROPIC_PROPOSAL_INVALID)
+    # every emitted code is a fixed literal that equals its own name — static and secret/content-free
+    assert all(isinstance(c, str) and c == c.upper() and " " not in c for c in codes)
+    assert "TOP-SECRET" not in "".join(codes)
+
+
 # ==========================================================================
 # Composition through the deterministic kernel (run_research) — DB-backed
 # ==========================================================================

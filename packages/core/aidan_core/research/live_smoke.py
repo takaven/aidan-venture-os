@@ -19,6 +19,9 @@ import json
 import os
 import sys
 
+from ..errors import ConfigError, InvalidAcquisitionError
+from . import http_providers as hp
+
 _MAX_TAVILY = 2
 _MAX_ANTHROPIC = 2
 _SPEND_CEILING_USD = 1.00
@@ -27,6 +30,39 @@ _MANDATE = (
     "MANDATE: Build a venture that removes the burden of costly, error-prone manual financial "
     "reconciliation for small and mid-sized business finance and operations teams.")
 _LEGIT_OUTCOMES = ("OPPORTUNITIES_FOUND", "NO_CREDIBLE_OPPORTUNITY", "INSUFFICIENT_EVIDENCE")
+
+
+class BoundedTavily(hp.TavilySearchAdapter):
+    """TavilySearchAdapter that counts and hard-bounds live acquisition calls, failing closed on the
+    over-bound call BEFORE it reaches the network. ``counter`` is a shared ``{"tavily","anthropic"}`` dict."""
+
+    def __init__(self, counter: dict, **kw):
+        super().__init__(**kw)
+        self._counter = counter
+
+    def acquire(self, query):
+        self._counter["tavily"] += 1
+        if self._counter["tavily"] > _MAX_TAVILY:
+            raise InvalidAcquisitionError("tavily call bound exceeded")   # before super().acquire's transport
+        return super().acquire(query)
+
+
+class BoundedAnthropic(hp.AnthropicResearchProposer):
+    """AnthropicResearchProposer that counts and hard-bounds live Messages calls at the REAL network
+    boundary ``_tool_call`` — so BOTH research_questions() and propose() are counted, and an over-bound
+    call fails closed before transport."""
+
+    def __init__(self, counter: dict, **kw):
+        super().__init__(**kw)
+        self._counter = counter
+
+    def _tool_call(self, prompt, tool):
+        self._counter["anthropic"] += 1
+        if self._counter["anthropic"] > _MAX_ANTHROPIC:
+            exc = InvalidAcquisitionError("anthropic call bound exceeded")   # before super()._tool_call
+            exc.provider_failure_code = "ANTHROPIC_CALL_BOUND"
+            raise exc
+        return super()._tool_call(prompt, tool)
 
 
 def _emit(obj: dict) -> None:
@@ -85,32 +121,15 @@ def main() -> int:
     import psycopg
 
     from aidan_core import ventures
-    from aidan_core.errors import ConfigError, InvalidAcquisitionError
-    from aidan_core.research import http_providers as hp
     from aidan_core.research import orchestration, sources
 
     counter = {"tavily": 0, "anthropic": 0}
-
-    class _BoundedTavily(hp.TavilySearchAdapter):
-        def acquire(self, query):
-            counter["tavily"] += 1
-            if counter["tavily"] > _MAX_TAVILY:            # fail closed BEFORE the over-bound network call
-                raise InvalidAcquisitionError("tavily call bound exceeded")
-            return super().acquire(query)
-
-    class _BoundedAnthropic(hp.AnthropicResearchProposer):
-        def _message(self, prompt):
-            counter["anthropic"] += 1
-            if counter["anthropic"] > _MAX_ANTHROPIC:
-                raise InvalidAcquisitionError("anthropic call bound exceeded")
-            return super()._message(prompt)
-
     conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
     try:
         vid = ventures.create_venture(conn, slug="gate8-live-smoke")
         ventures.append_mandate_version(conn, vid, content_hash=sources.content_hash(_MANDATE))
-        adapter = _BoundedTavily(max_results=2)
-        proposer = _BoundedAnthropic(max_questions=2)
+        adapter = BoundedTavily(counter, max_results=2)
+        proposer = BoundedAnthropic(counter, max_questions=2)
         try:
             run = orchestration.run_research(
                 conn, venture_id=vid, mandate_version=1, mandate_content=_MANDATE,
@@ -123,6 +142,8 @@ def main() -> int:
             facts = _facts(vid, counter, outcome=None)
             facts["result"] = "PROVIDER_FAILED_CLOSED"
             facts["reason"] = type(exc).__name__
+            # sanitized, static classification of the exact failing branch (never a response body/secret)
+            facts["provider_failure_code"] = getattr(exc, "provider_failure_code", "UNCLASSIFIED")
             _emit(facts)
             return 3
 

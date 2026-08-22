@@ -294,6 +294,32 @@ def test_transport_timeout_vs_network_discriminator(monkeypatch):
     assert _run(_httperror(400, b"{}")).provider_failure_code == hp.ANTHROPIC_HTTP_STATUS        # HTTP still HTTP
 
 
+def test_anthropic_operation_specific_timeouts_reach_transport():
+    seen = {}
+
+    def transport(method, url, *, headers, body=None, timeout=None):
+        name = body["tool_choice"]["name"]
+        seen[name] = timeout                       # capture the timeout the real _tool_call passes down
+        if name == "emit_research_questions":
+            return 200, _anthropic_tool(name, {"questions": ["q"]})
+        return 200, _anthropic_tool(name, {})
+    p = AnthropicResearchProposer(env=_ANTH_ENV, transport=transport)
+    p.research_questions("m")
+    p.propose("m", [])
+    assert seen["emit_research_questions"] == 30.0      # QUESTIONS stays 30s
+    assert seen["emit_research_proposal"] == 120.0      # PROPOSE bounded longer at 120s
+
+
+def test_tavily_timeout_unchanged_uses_http_json_default():
+    seen = {}
+
+    def transport(method, url, *, headers, body=None, timeout="DEFAULT"):
+        seen["timeout"] = timeout
+        return 200, {"results": [{"url": "https://x", "content": "c"}]}
+    TavilySearchAdapter(env=_TAV_ENV, now=lambda: _FIXED, transport=transport).acquire("q")
+    assert seen["timeout"] == "DEFAULT"                 # Tavily passes NO timeout -> _http_json default (30s)
+
+
 def test_http_error_type_not_allowlisted_is_dropped(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen",
                         _raise_exc(_httperror(400, b'{"error":{"type":"some_unlisted_future_type"}}')))

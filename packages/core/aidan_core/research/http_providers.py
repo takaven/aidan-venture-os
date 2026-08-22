@@ -63,6 +63,15 @@ ENV_ANTHROPIC_VERSION = "RESEARCH_ANTHROPIC_VERSION"     # non-secret — anthro
 _ANTHROPIC_DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_DEFAULT_VERSION = "2023-06-01"
 _ANTHROPIC_MAX_TOKENS = 8192
+# Operation-specific client read timeouts (seconds). PROPOSE generates a large structured tool_use
+# output and is live-proven to exceed 30s; QUESTIONS is small and fast. This changes ONLY the client
+# read timeout — never max_tokens, model, schema, prompts, retries, or _http_json's default (Tavily).
+_ANTHROPIC_TIMEOUT_QUESTIONS = 30.0
+_ANTHROPIC_TIMEOUT_PROPOSE = 120.0
+_ANTHROPIC_TOOL_TIMEOUTS = {
+    "emit_research_questions": _ANTHROPIC_TIMEOUT_QUESTIONS,
+    "emit_research_proposal": _ANTHROPIC_TIMEOUT_PROPOSE,
+}
 
 Transport = Callable[..., "tuple[int, Any]"]
 
@@ -387,13 +396,15 @@ class AnthropicResearchProposer:
             raise ConfigError(f"{ENV_ANTHROPIC_API_KEY}/{ENV_ANTHROPIC_MODEL} not configured")  # fail closed
         endpoint = self._env.get(ENV_ANTHROPIC_ENDPOINT) or _ANTHROPIC_DEFAULT_ENDPOINT
         version = self._env.get(ENV_ANTHROPIC_VERSION) or _ANTHROPIC_DEFAULT_VERSION
+        timeout = _ANTHROPIC_TOOL_TIMEOUTS.get(tool["name"], _ANTHROPIC_TIMEOUT_QUESTIONS)
         try:
             status, data = self._http(
                 "POST", endpoint,
                 headers={"x-api-key": token, "anthropic-version": version, "content-type": "application/json"},
                 body={"model": model, "max_tokens": _ANTHROPIC_MAX_TOKENS,
                       "tools": [tool], "tool_choice": {"type": "tool", "name": tool["name"]},
-                      "messages": [{"role": "user", "content": prompt}]})
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=timeout)
         except (ConfigError, InvalidAcquisitionError):
             raise
         except Exception as exc:

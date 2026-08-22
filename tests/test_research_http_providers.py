@@ -449,10 +449,9 @@ def test_composition_invalid_importance_rejected_no_partial_persistence(migrated
             migrated, venture_id=vid, mandate_version=ver, mandate_content=mandate, run_key="rr",
             adapter=_adapter(), proposer=_proposer(payload))
     assert ei.value.proposal_code == "ASSUMPTION_IMPORTANCE"
-    f = _fresh()
-    try:
+    with migrated.cursor() as cur:
         for t in ("observation", "claim", "interpretation", "assumption", "opportunity", "kill_case"):
-            assert _count(f, f"SELECT count(*) FROM {t} WHERE venture_id=%s", vid) == 0, t
-        assert _count(f, "SELECT count(*) FROM source_receipt WHERE venture_id=%s", vid) == 1   # pre-proposal
-    finally:
-        f.close()
+            cur.execute(f"SELECT count(*) FROM {t} WHERE venture_id = %s", (vid,))
+            assert cur.fetchone()[0] == 0, t                     # no proposal-derived write survived
+        cur.execute("SELECT count(*) FROM source_receipt WHERE venture_id = %s", (vid,))
+        assert cur.fetchone()[0] == 1                            # the pre-proposal source receipt legitimately remains

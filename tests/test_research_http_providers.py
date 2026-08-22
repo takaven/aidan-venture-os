@@ -43,15 +43,15 @@ def _tavily_ok(results):
     return _t
 
 
-def _anthropic_msg(text_obj):
-    # The real Anthropic Messages API shape: JSON returned as text inside a content block.
+def _anthropic_tool(tool_name, input_obj, *, stop_reason="tool_use"):
+    # Real Anthropic Messages tool-use shape: the structured payload is the tool_use block's `input`.
     return {"id": "msg_x", "type": "message", "role": "assistant", "model": "claude-x",
-            "content": [{"type": "text", "text": json.dumps(text_obj)}],
-            "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 20}}
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": tool_name, "input": input_obj}],
+            "stop_reason": stop_reason, "usage": {"input_tokens": 10, "output_tokens": 20}}
 
 
-def _anthropic_ok(text_obj):
-    return lambda *a, **k: (200, _anthropic_msg(text_obj))
+def _anthropic_ok(tool_name, input_obj):
+    return lambda *a, **k: (200, _anthropic_tool(tool_name, input_obj))
 
 
 def _raising(message):
@@ -128,28 +128,62 @@ def _candidate_payload(excerpt):
     }
 
 
-def test_anthropic_questions_and_propose_to_typed():
-    p = AnthropicResearchProposer(env=_ANTH_ENV, transport=_anthropic_ok({"questions": ["q1", "q2"]}))
+def test_anthropic_forced_tool_use_to_typed():
+    # research_questions: the request forces a single tool call; the tool_use input IS the payload.
+    captured = {}
+
+    def qtransport(method, url, *, headers, body=None, timeout=30):
+        captured["body"] = body
+        return 200, _anthropic_tool("emit_research_questions", {"questions": ["q1", "q2"]})
+
+    p = AnthropicResearchProposer(env=_ANTH_ENV, transport=qtransport)
     assert p.research_questions("mandate") == ["q1", "q2"]
-    p2 = AnthropicResearchProposer(env=_ANTH_ENV, transport=_anthropic_ok(_candidate_payload("hello")))
+    assert captured["body"]["tool_choice"] == {"type": "tool", "name": "emit_research_questions"}
+    assert captured["body"]["tools"][0]["name"] == "emit_research_questions"
+    # propose: forced tool call -> typed proposal (no free-text JSON parsing anywhere)
+    p2 = AnthropicResearchProposer(env=_ANTH_ENV,
+                                   transport=_anthropic_ok("emit_research_proposal", _candidate_payload("hello")))
     proposal = p2.propose("mandate", [{"index": 0, "content": "hello world", "locator": "L"}])
     assert proposal.observations[0].excerpt == "hello" and proposal.claims[0].supports == ("o1",)
     assert proposal.opportunities[0].kill_case.disposition == "PROCEED_WITH_RISKS"
 
 
-def test_anthropic_malformed_and_refusal_fail_closed():
-    with pytest.raises(InvalidAcquisitionError):   # content text is not JSON
+def test_anthropic_free_text_without_tool_use_fails_closed():
+    # THE DEFECT CLASS (reproduced): a legitimate text block with preamble is no longer trusted as
+    # evidence — the proposer requires the structured tool_use block and fails closed otherwise.
+    with pytest.raises(InvalidAcquisitionError):
         AnthropicResearchProposer(env=_ANTH_ENV, transport=lambda *a, **k: (
-            200, {"content": [{"type": "text", "text": "sorry, here is prose"}], "stop_reason": "end_turn"})
-        ).research_questions("m")
-    with pytest.raises(InvalidAcquisitionError):   # safety refusal fails closed
-        AnthropicResearchProposer(env=_ANTH_ENV, transport=lambda *a, **k: (
-            200, {"content": [], "stop_reason": "refusal"})).propose("m", [])
+            200, {"content": [{"type": "text", "text": 'Here is the JSON:\n{"questions": ["q"]}'}],
+                  "stop_reason": "end_turn"})).research_questions("m")
+
+
+def test_anthropic_refusal_truncation_and_bad_input_fail_closed():
+    def _resp(payload):
+        return lambda *a, **k: (200, payload)
+    with pytest.raises(InvalidAcquisitionError):   # safety refusal
+        AnthropicResearchProposer(env=_ANTH_ENV, transport=_resp({"content": [], "stop_reason": "refusal"})).propose("m", [])
+    with pytest.raises(InvalidAcquisitionError):   # truncated output (max_tokens)
+        AnthropicResearchProposer(env=_ANTH_ENV, transport=_resp(
+            _anthropic_tool("emit_research_proposal", {}, stop_reason="max_tokens"))).propose("m", [])
+    with pytest.raises(InvalidAcquisitionError):   # tool_use input is not an object
+        AnthropicResearchProposer(env=_ANTH_ENV, transport=_resp(
+            _anthropic_tool("emit_research_questions", "not-an-object"))).research_questions("m")
+    with pytest.raises(InvalidAcquisitionError):   # provider HTTP error
+        AnthropicResearchProposer(env=_ANTH_ENV, transport=lambda *a, **k: (429, {})).research_questions("m")
+
+
+def test_anthropic_missing_required_field_item_dropped():
+    # A structured item missing a required field never becomes a proposal artifact (fail closed at item level).
+    payload = {"observations": [{"source_index": 0, "statement": "no excerpt here", "key": "o1"}]}  # missing 'excerpt'
+    p = AnthropicResearchProposer(env=_ANTH_ENV, transport=_anthropic_ok("emit_research_proposal", payload))
+    proposal = p.propose("m", [{"index": 0, "content": "x", "locator": "L"}])
+    assert proposal.observations == ()
 
 
 def test_anthropic_unconfigured_fails_closed():
     with pytest.raises(ConfigError):
-        AnthropicResearchProposer(env={ENV_ANTHROPIC_API_KEY: "k"}, transport=_anthropic_ok({"questions": ["x"]})).research_questions("m")
+        AnthropicResearchProposer(env={ENV_ANTHROPIC_API_KEY: "k"},
+                                  transport=_anthropic_ok("emit_research_questions", {"questions": ["x"]})).research_questions("m")
 
 
 def test_anthropic_no_secret_in_error():
@@ -169,10 +203,10 @@ def _adapter(content=_RAW):
 
 def _proposer(propose_payload, questions=("How burdensome is SMB reconciliation?",)):
     def tport(method, url, *, headers, body=None, timeout=30):
-        prompt = body["messages"][0]["content"]
-        if "TASK: research_questions" in prompt:
-            return 200, _anthropic_msg({"questions": list(questions)})
-        return 200, _anthropic_msg(propose_payload)
+        name = body["tool_choice"]["name"]   # route by the forced tool
+        if name == "emit_research_questions":
+            return 200, _anthropic_tool("emit_research_questions", {"questions": list(questions)})
+        return 200, _anthropic_tool("emit_research_proposal", propose_payload)
     return AnthropicResearchProposer(env=_ANTH_ENV, transport=tport)
 
 

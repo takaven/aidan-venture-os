@@ -18,12 +18,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 from ..errors import ConfigError, InvalidAcquisitionError
 from . import http_providers as hp
 
 _MAX_TAVILY = 2
 _MAX_ANTHROPIC = 2
+# Map the forced tool to a static operation label (never any prompt/content).
+_OPERATION = {"emit_research_questions": "RESEARCH_QUESTIONS", "emit_research_proposal": "RESEARCH_PROPOSE"}
 _SPEND_CEILING_USD = 1.00
 _REQUIRED = ("RESEARCH_TAVILY_API_KEY", "RESEARCH_ANTHROPIC_API_KEY", "RESEARCH_ANTHROPIC_MODEL")
 _MANDATE = (
@@ -55,6 +58,7 @@ class BoundedAnthropic(hp.AnthropicResearchProposer):
     def __init__(self, counter: dict, **kw):
         super().__init__(**kw)
         self._counter = counter
+        self.records = []   # at most 2: [{"operation","duration_ms","failure_code"}] — no content/keys
 
     def _tool_call(self, prompt, tool):
         self._counter["anthropic"] += 1
@@ -62,7 +66,17 @@ class BoundedAnthropic(hp.AnthropicResearchProposer):
             exc = InvalidAcquisitionError("anthropic call bound exceeded")   # before super()._tool_call
             exc.provider_failure_code = "ANTHROPIC_CALL_BOUND"
             raise exc
-        return super()._tool_call(prompt, tool)
+        op = _OPERATION.get(tool.get("name"), "UNKNOWN")
+        started = time.monotonic()
+        try:
+            result = super()._tool_call(prompt, tool)
+        except InvalidAcquisitionError as exc:
+            self.records.append({"operation": op, "duration_ms": int((time.monotonic() - started) * 1000),
+                                 "failure_code": getattr(exc, "provider_failure_code", None)})
+            raise
+        self.records.append({"operation": op, "duration_ms": int((time.monotonic() - started) * 1000),
+                             "failure_code": None})
+        return result
 
 
 def _emit(obj: dict) -> None:
@@ -150,10 +164,15 @@ def main() -> int:
             error_type = getattr(exc, "provider_error_type", None)
             if error_type is not None:
                 facts["provider_error_type"] = error_type          # allowlisted static id only
+            facts["anthropic_calls_detail"] = proposer.records     # <=2 records: operation + duration_ms + code
+            failed = [r for r in proposer.records if r["failure_code"]]
+            if failed:
+                facts["failed_operation"] = failed[-1]["operation"]
             _emit(facts)
             return 3
 
         facts = _facts(vid, counter, outcome=run.outcome, run=run)
+        facts["anthropic_calls_detail"] = proposer.records         # <=2 records: operation + duration_ms
         # secret-leak check: values read in-process, never printed, only tested for absence in evidence.
         blob = json.dumps(facts)
         leaked = any(os.environ.get(n) and os.environ[n] in blob

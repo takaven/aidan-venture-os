@@ -309,6 +309,7 @@ _PROPOSE_INSTRUCTION = (
 # ``.provider_failure_code`` on the raised (public) InvalidAcquisitionError so a caller can classify a
 # failure without inspecting any sensitive detail.
 ANTHROPIC_NETWORK_FAILURE = "ANTHROPIC_NETWORK_FAILURE"
+ANTHROPIC_TIMEOUT = "ANTHROPIC_TIMEOUT"
 ANTHROPIC_HTTP_STATUS = "ANTHROPIC_HTTP_STATUS"
 ANTHROPIC_REFUSAL = "ANTHROPIC_REFUSAL"
 ANTHROPIC_MAX_TOKENS = "ANTHROPIC_MAX_TOKENS"
@@ -324,6 +325,19 @@ def _anthropic_fail(code: str):
     exc = InvalidAcquisitionError(code)
     exc.provider_failure_code = code
     raise exc
+
+
+def _classify_transport(exc: BaseException) -> str:
+    """Classify a genuine (non-HTTP) transport failure into a static code, never reading its text.
+
+    A read/connect timeout surfaces either as a ``TimeoutError`` (``socket.timeout`` is an alias in
+    Python 3.10+) or as a ``URLError`` whose ``reason`` is a ``TimeoutError``. Everything else
+    (DNS/TLS/connection/other ``URLError``) is a generic network failure.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return ANTHROPIC_TIMEOUT
+    return ANTHROPIC_NETWORK_FAILURE
 
 
 # Documented Anthropic error `type` enum (static, machine-readable identifiers — never the message).
@@ -382,10 +396,10 @@ class AnthropicResearchProposer:
                       "messages": [{"role": "user", "content": prompt}]})
         except (ConfigError, InvalidAcquisitionError):
             raise
-        except Exception:
-            # A genuine transport failure (non-HTTP URLError / DNS / TLS / socket / timeout). An HTTP
-            # response with a non-2xx status is NOT here — _http_json normalizes it to a returned status.
-            _anthropic_fail(ANTHROPIC_NETWORK_FAILURE)
+        except Exception as exc:
+            # A genuine transport failure (an HTTP non-2xx is NOT here — _http_json normalizes it to a
+            # returned status). Distinguish a client TIMEOUT from other network faults, statically.
+            _anthropic_fail(_classify_transport(exc))
         if status != 200 or not isinstance(data, dict):
             _anthropic_http_fail(status, data)                        # HTTP response received (safe status/type only)
         stop = data.get("stop_reason")

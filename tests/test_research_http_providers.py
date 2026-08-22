@@ -275,17 +275,23 @@ def test_http_error_429_and_500_are_http_status(monkeypatch):
     assert ei2.value.provider_error_type is None   # non-JSON error body -> no type surfaced
 
 
-def test_genuine_transport_failures_stay_network(monkeypatch):
+def test_transport_timeout_vs_network_discriminator(monkeypatch):
     from aidan_core.research import http_providers as hp
-    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(urllib.error.URLError("dns failure")))
-    with pytest.raises(InvalidAcquisitionError) as ei:
-        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
-    assert ei.value.provider_failure_code == hp.ANTHROPIC_NETWORK_FAILURE
-    assert getattr(ei.value, "provider_http_status", None) is None
-    monkeypatch.setattr("urllib.request.urlopen", _raise_exc(socket.timeout("timed out")))
-    with pytest.raises(InvalidAcquisitionError) as ei2:
-        AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
-    assert ei2.value.provider_failure_code == hp.ANTHROPIC_NETWORK_FAILURE
+
+    def _run(exc):
+        monkeypatch.setattr("urllib.request.urlopen", _raise_exc(exc))
+        with pytest.raises(InvalidAcquisitionError) as ei:
+            AnthropicResearchProposer(env=_ANTH_ENV).research_questions("m")
+        assert str(ei.value) == ei.value.provider_failure_code            # no arbitrary exception text
+        return ei.value
+
+    assert _run(TimeoutError("read timed out")).provider_failure_code == hp.ANTHROPIC_TIMEOUT
+    assert _run(socket.timeout("timed out")).provider_failure_code == hp.ANTHROPIC_TIMEOUT       # alias
+    assert _run(urllib.error.URLError(TimeoutError("timed out"))).provider_failure_code == hp.ANTHROPIC_TIMEOUT
+    net = _run(urllib.error.URLError("dns failure"))                                             # non-timeout
+    assert net.provider_failure_code == hp.ANTHROPIC_NETWORK_FAILURE
+    assert getattr(net, "provider_http_status", None) is None                                    # not an HTTP response
+    assert _run(_httperror(400, b"{}")).provider_failure_code == hp.ANTHROPIC_HTTP_STATUS        # HTTP still HTTP
 
 
 def test_http_error_type_not_allowlisted_is_dropped(monkeypatch):

@@ -57,3 +57,37 @@ def test_bounded_tavily_counts_and_blocks_third_before_transport():
     with pytest.raises(InvalidAcquisitionError):
         a.acquire("q3")
     assert counter["tavily"] == 3 and net["calls"] == 2      # blocked before transport
+
+
+def test_bounded_anthropic_records_operation_and_timing():
+    counter = {"tavily": 0, "anthropic": 0}
+
+    def transport(method, url, *, headers, body=None, timeout=30):
+        name = body["tool_choice"]["name"]
+        if name == "emit_research_questions":
+            return 200, _tool_resp(name, {"questions": ["q"]})
+        return 200, _tool_resp(name, {})
+    p = BoundedAnthropic(counter, env=_ANTH_ENV, transport=transport)
+    p.research_questions("m")
+    p.propose("m", [])
+    assert [r["operation"] for r in p.records] == ["RESEARCH_QUESTIONS", "RESEARCH_PROPOSE"]
+    assert all(isinstance(r["duration_ms"], int) and r["duration_ms"] >= 0 for r in p.records)
+    assert all(r["failure_code"] is None for r in p.records)
+    # records carry only static operation + integer duration + code (no prompt/content/keys)
+    assert set().union(*[set(r) for r in p.records]) == {"operation", "duration_ms", "failure_code"}
+
+
+def test_bounded_anthropic_records_failed_operation_and_code():
+    counter = {"tavily": 0, "anthropic": 0}
+
+    def transport(method, url, *, headers, body=None, timeout=30):
+        name = body["tool_choice"]["name"]
+        if name == "emit_research_questions":
+            return 200, _tool_resp(name, {"questions": ["q"]})
+        raise TimeoutError("propose slow")   # PROPOSE times out -> production classifies ANTHROPIC_TIMEOUT
+    p = BoundedAnthropic(counter, env=_ANTH_ENV, transport=transport)
+    p.research_questions("m")
+    with pytest.raises(InvalidAcquisitionError):
+        p.propose("m", [])
+    assert p.records[-1]["operation"] == "RESEARCH_PROPOSE"
+    assert p.records[-1]["failure_code"] == "ANTHROPIC_TIMEOUT"

@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 import psycopg
 import pytest
 
-from aidan_core import budget, execution, ventures, validation
+from aidan_core import budget, commitment, execution, nextaction, ventures, validation
 from aidan_core.build import quality as build_quality
 from aidan_core.deploy import state as deploy_state
 from aidan_core.errors import (
@@ -51,7 +51,7 @@ from aidan_core.errors import (
 )
 from aidan_core.factory import runtime
 from aidan_core.market.observation import record_market_observation
-from aidan_core.research import claims, observations, sources
+from aidan_core.research import assumptions, claims, observations, opportunities, sources
 from aidan_core.research.adapters import AcquiredSource
 
 from build_fakes import build_authority, full_eval
@@ -412,5 +412,71 @@ def test_isolation_foreign_evidence_rejected_no_contamination(migrated):
     try:  # neither venture's canonical truth was contaminated; reconstructable from PostgreSQL alone.
         assert _count(f, "SELECT count(*) FROM market_observation WHERE market_action_spec_id=%s", a_spec) == 1
         assert _count(f, "SELECT count(*) FROM market_observation WHERE market_action_spec_id=%s", b_spec) == 0
+    finally:
+        f.close()
+
+
+# ==========================================================================
+# SLICE-2 CLOSURE: durable uncertainty is CONSUMED by the allocator into a
+# COMMITTED governed decision (legitimate authority; no manual reconciliation).
+# These weld the durable-state proofs (modes 5/7 above) to nextaction.recommend
+# -> commitment.commit_recommendation -> investment_decision_record.
+# ==========================================================================
+def _opp_with_assumption(conn, *, slug, importance):
+    vid = ventures.create_venture(conn, slug=slug)
+    opp = opportunities.create_opportunity(conn, vid, opportunity_key="o", buyer_hypothesis="B",
+                                           problem_hypothesis="P", critical_unknown="U").opportunity_id
+    aid = assumptions.create_assumption(conn, vid, proposition="p", assumption_key="a1",
+                                        importance=importance, confidence="LOW",
+                                        consequence_if_false="c", cheapest_test="t").assumption_id
+    opportunities.link_assumption(conn, opportunity_id=opp, assumption_id=aid)
+    hid = validation.create_hypothesis(conn, vid, opportunity_id=opp, statement="s",
+                                       hypothesis_key="h", assumption_id=aid).hypothesis_id
+    tid = validation.create_test(conn, vid, validation_hypothesis_id=hid, test_key="t",
+                                 test_type="INTERVIEW", method="m", success_criterion="score>=1",
+                                 evidence_required="notes", success_metric="score",
+                                 success_comparator="GTE", success_threshold=1).test_id
+    return vid, opp, tid
+
+
+def _decision_count(conn, vid, rec_id):
+    return _count(conn, "SELECT count(*) FROM investment_decision_record "
+                        "WHERE venture_id=%s AND source_recommendation_id=%s", vid, rec_id)
+
+
+def test_mode7_inconclusive_converts_to_committed_validate(migrated):
+    # A materialized INCONCLUSIVE result (durable uncertainty) is consumed by the allocator into a
+    # governed VALIDATE recommendation and COMMITTED to a canonical decision — no manual transcription.
+    vid, opp, tid = _opp_with_assumption(migrated, slug="g9-inc-commit", importance="CRITICAL")
+    res = validation.record_result(migrated, validation_test_id=tid, result_key="ri", observed_value={"score": 0})
+    assert res.outcome == "INCONCLUSIVE"
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+    assert rec.action_type == "VALIDATE"                     # uncertainty routed to the cheapest discriminating test
+    cres = commitment.commit_recommendation(migrated, rec.recommendation_id)
+    assert cres.decision == "VALIDATE"
+    f = _fresh()
+    try:  # the governed decision is reconstructable from PostgreSQL alone.
+        assert _decision_count(f, vid, rec.recommendation_id) == 1
+        assert _count(f, "SELECT count(*) FROM validation_result WHERE validation_test_id=%s "
+                         "AND outcome='PASS'", tid) == 0     # no fabricated success carried into the decision
+    finally:
+        f.close()
+
+
+def test_mode5_contradiction_consumed_into_committed_decision(migrated):
+    # A preserved PASS+INCONCLUSIVE contradiction on a non-blocking assumption is consumed by the
+    # allocator (VALIDATION_CONTRADICTORY) and COMMITTED to a governed decision, WITHOUT anyone first
+    # manually reconciling the contradictory results (both remain preserved).
+    vid, opp, tid = _opp_with_assumption(migrated, slug="g9-contra-commit", importance="MEDIUM")
+    validation.record_result(migrated, validation_test_id=tid, result_key="rp", observed_value={"score": 2})  # PASS
+    validation.record_result(migrated, validation_test_id=tid, result_key="ri", observed_value={"score": 0})  # INCONCLUSIVE
+    rec = nextaction.recommend(migrated, vid, opp, recommendation_key="r1")
+    assert rec.action_type in ("VALIDATE", "HOLD") and rec.reason_code == "VALIDATION_CONTRADICTORY"
+    cres = commitment.commit_recommendation(migrated, rec.recommendation_id)
+    assert cres.decision == rec.action_type                  # legitimate governed conversion, not BUILD
+    f = _fresh()
+    try:
+        assert _decision_count(f, vid, rec.recommendation_id) == 1
+        assert _count(f, "SELECT count(*) FROM validation_result WHERE validation_test_id=%s", tid) == 2  # both retained
     finally:
         f.close()

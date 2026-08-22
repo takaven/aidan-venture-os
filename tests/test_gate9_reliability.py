@@ -25,8 +25,9 @@ Evidence matrix (claim | injected failure | expected canonical outcome | Gate-9 
   6  budget exhaustion      | reserve > grant / retry                 | InsufficientBudgetError; single RESERVE                   | no overspend; ledger invariant on fresh conn
   7  inconclusive experiment| unmet success criterion                | outcome INCONCLUSIVE (never auto-PASS)                    | no manufactured success; durable
   8  negative demand        | BOUNCED / UNSUBSCRIBE observation       | negative evidence retained                                | authors NO investment decision; absence not ingestible
-  9  duplicate execution    | re-dispatch / replayed external id      | ExecutionBlockedError / IdempotencyConflictError          | one attempt, one VERIFIED proof, one effect
+  9  duplicate execution    | re-dispatch / replayed external id      | ExecutionBlockedError / IdempotencyConflictError          | one attempt, one VERIFIED proof, one effect — survives restart (fresh conn)
  10  restart                | crashed claim / process restart         | resume from durable state                                 | reconstructed from PostgreSQL alone via fresh conn
+ --  venture isolation      | foreign source/channel identity         | MarketAuthorityError                                      | no cross-venture contamination; reconstructable via fresh conn
 """
 from __future__ import annotations
 
@@ -335,6 +336,23 @@ def test_mode9_duplicate_execution_no_duplicate_effect(migrated):
         execution.record_execution_result(migrated, aid, external_result_id=f"fake-a:{aid}:1",
                                           reported_outcome="success", raw_payload={"x": 999})
 
+    # RESTART: a brand-new process (fresh connection, fresh worker/registry) cannot re-issue the
+    # completed consequential effect — canonical state alone excludes the duplicate, from PostgreSQL.
+    f = _fresh()
+    try:
+        assert execution.get_status(f, aid) == "SUCCEEDED"
+        assert _attempts(f, aid) == 1 and _verified_proofs(f, aid) == 1
+        fresh_worker = FakeWorkerA(structured_output={"status": "done"})   # never dispatched
+        with pytest.raises(ExecutionBlockedError):
+            runtime.execute_action(f, aid, registry=registry_with(fresh_worker))
+        assert fresh_worker.calls == 0                                     # blocked before dispatch by canonical state
+        with pytest.raises(IdempotencyConflictError):                     # replay conflict survives restart
+            execution.record_execution_result(f, aid, external_result_id=f"fake-a:{aid}:1",
+                                              reported_outcome="success", raw_payload={"x": 12345})
+        assert _attempts(f, aid) == 1 and _verified_proofs(f, aid) == 1   # unchanged; no manual repair required
+    finally:
+        f.close()
+
 
 # ==========================================================================
 # 10. RESTART
@@ -363,5 +381,36 @@ def test_mode10_unsafe_crash_requires_explicit_recovery(migrated):
         res = runtime.resume_action(f, aid, registry=registry_with(FakeWorkerA()), actual_cost=10)
         assert res["outcome"] == "recovery_required"
         assert execution.get_status(f, aid) == "RECOVERY_REQUIRED"
+    finally:
+        f.close()
+
+
+# ==========================================================================
+# CROSS-CUTTING: VENTURE ISOLATION (foreign evidence in a consequential path)
+# ==========================================================================
+def test_isolation_foreign_evidence_rejected_no_contamination(migrated):
+    # Two independently OPERATING ventures, each with its own VERIFIED market action. Foreign
+    # identity (another venture's source instance / a wrong channel) MUST NOT be able to attribute
+    # a consequential market outcome to this venture's action — the reliability guarantee that a
+    # failure/observation in one venture can never rewrite another's canonical truth.
+    a = market_run(migrated, "g9-iso-a")
+    b = market_run(migrated, "g9-iso-b")
+    a_spec, b_spec = a.spec.market_action_spec_id, b.spec.market_action_spec_id
+    # a legitimate, correctly-bound observation on A is accepted.
+    assert record_market_observation(migrated, a_spec, external_event_id="a-ok",
+                                     observation_type="DELIVERED", channel_kind="fake-local").created is True
+    # foreign VENTURE's source instance cannot attribute an outcome to A's action.
+    with pytest.raises(MarketAuthorityError):
+        record_market_observation(migrated, a_spec, external_event_id="foreign-src",
+                                  observation_type="DELIVERED", channel_kind="fake-local",
+                                  source_instance_ref=f"fake-local:{b.setup.venture_id}")
+    # foreign CHANNEL identity is likewise rejected.
+    with pytest.raises(MarketAuthorityError):
+        record_market_observation(migrated, a_spec, external_event_id="foreign-chan",
+                                  observation_type="DELIVERED", channel_kind="other-channel")
+    f = _fresh()
+    try:  # neither venture's canonical truth was contaminated; reconstructable from PostgreSQL alone.
+        assert _count(f, "SELECT count(*) FROM market_observation WHERE market_action_spec_id=%s", a_spec) == 1
+        assert _count(f, "SELECT count(*) FROM market_observation WHERE market_action_spec_id=%s", b_spec) == 0
     finally:
         f.close()

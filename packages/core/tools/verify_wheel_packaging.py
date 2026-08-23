@@ -27,20 +27,18 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-# Package directories that MUST be present inside the built wheel.
-REQUIRED_WHEEL_PKG = (
-    "aidan_core",
-    "aidan_core/research",
-    "aidan_core/factory",
-    "aidan_core/build",
-    "aidan_core/deploy",
-    "aidan_core/market",
-)
+# The set of packages that MUST be present inside the built wheel is NOT a
+# hand-maintained list (which silently drifts — an earlier version omitted
+# ``aidan_core.alpha`` and still reported PASS). It is discovered dynamically from
+# the source tree: every directory under ``<project_dir>/aidan_core`` that contains
+# an ``__init__.py`` is an intended package and must ship in the wheel.
 
-# Representative runtime modules that MUST import from the installed wheel.
+# Representative runtime modules that MUST import from the installed wheel. This is
+# a spot-check that complements — never replaces — the dynamic completeness check.
 REQUIRED_IMPORT = (
     "aidan_core",
     "aidan_core.research",
+    "aidan_core.alpha",
     "aidan_core.factory.workers",
     "aidan_core.factory.runtime",
     "aidan_core.factory.spec",
@@ -50,6 +48,30 @@ REQUIRED_IMPORT = (
     "aidan_core.deploy.runtime",
     "aidan_core.market.postmark",
 )
+
+
+def discover_source_packages(project_dir) -> set[str]:
+    """Every intended package under ``<project_dir>/aidan_core``, as wheel paths.
+
+    A package is a directory containing ``__init__.py`` (namespace dirs without one
+    are excluded); ``__pycache__`` and build artifacts are ignored. The root package
+    ``aidan_core`` is included. Returns forward-slash names matching wheel layout,
+    e.g. ``{"aidan_core", "aidan_core/alpha", ...}``.
+    """
+    project_dir = Path(project_dir)
+    root = project_dir / "aidan_core"
+    pkgs: set[str] = set()
+    for init in root.rglob("__init__.py"):
+        parts = init.parent.relative_to(project_dir).parts
+        if "__pycache__" in parts:
+            continue
+        pkgs.add("/".join(parts))
+    return pkgs
+
+
+def missing_packages(intended, present) -> list[str]:
+    """Intended packages absent from the built wheel (sorted)."""
+    return sorted(set(intended) - set(present))
 
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -94,14 +116,17 @@ def main() -> int:
         whl = built[0]
         print(f"built wheel = {whl.name}")
 
-        # 2. Inspect wheel contents.
+        # 2. Inspect wheel contents against the COMPLETE dynamically-discovered
+        #    source-package tree (not a hand-maintained list).
+        intended = discover_source_packages(project_dir)
+        print("intended source packages (discovered):\n  " + "\n  ".join(sorted(intended)))
         pkg_dirs = _wheel_packages(whl)
         print("wheel package dirs:\n  " + "\n  ".join(sorted(p for p in pkg_dirs if p)))
-        missing_pkgs = [p for p in REQUIRED_WHEEL_PKG if p not in pkg_dirs]
+        missing_pkgs = missing_packages(intended, pkg_dirs)
         if missing_pkgs:
-            print(f"FAIL: wheel is MISSING packages: {missing_pkgs}")
+            print(f"FAIL: wheel is MISSING source packages: {missing_pkgs}")
             return 1
-        print("OK: wheel contains every required package")
+        print(f"OK: wheel contains every discovered source package ({len(intended)} packages)")
 
         # 3. Clean isolated venv + install exactly that wheel.
         venv_dir = tmp / "venv"

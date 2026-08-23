@@ -49,3 +49,23 @@ jobs:
 
       - name: Check Git whitespace
         run: git diff --check
+
+  # Independent artifact-level proof: the normal `gate1` job source-shadows the
+  # wheel (tests/conftest.py injects packages/core onto sys.path), so its green
+  # result does NOT prove the built/installed artifact is complete. This job builds
+  # the wheel, installs it into a clean venv, and imports the representative runtime
+  # packages from a neutral directory — failing if any aidan_core[.*] package is
+  # omitted from the installed artifact. It needs no database.
+  packaging-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify installed-wheel completeness (no source shadowing)
+        run: python packages/core/tools/verify_wheel_packaging.py packages/core

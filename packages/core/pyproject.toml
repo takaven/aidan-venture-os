@@ -14,5 +14,11 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
-[tool.setuptools]
-packages = ["aidan_core", "aidan_core.research"]
+# Discover the COMPLETE aidan_core package tree automatically. An explicit list
+# silently omitted subpackages (factory/build/deploy/market) from the built wheel;
+# discovery includes every intended aidan_core[.*] package and no test/unrelated
+# content (tests live at the repo root, outside this project dir).
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aidan_core*"]
+namespaces = false

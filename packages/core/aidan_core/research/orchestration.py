@@ -19,9 +19,84 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .. import audit, db
-from ..errors import IdempotencyConflictError, MandateMismatchError, NotFoundError, OpportunityNotReadyError
+from ..errors import (
+    IdempotencyConflictError,
+    InvalidProposalError,
+    MandateMismatchError,
+    NotFoundError,
+    OpportunityNotReadyError,
+)
 from . import assumptions, claims, interpretations, killcase, observations, opportunities, sources
 from .proposals import ObservationProposal, ResearchProposal
+
+
+def _fail_proposal(code: str):
+    """Reject a malformed provider-neutral proposal with a static, content-free code."""
+    exc = InvalidProposalError(code)
+    exc.provider_failure_code = "PROPOSAL_INVALID"
+    exc.proposal_code = code
+    raise exc
+
+
+def _nonempty(v) -> bool:
+    return isinstance(v, str) and v.strip() != ""
+
+
+def validate_proposal(proposal: ResearchProposal) -> None:
+    """Deterministically validate the COMPLETE provider-neutral proposal against kernel invariants
+    (categorical enums + required fields) BEFORE any proposal-derived canonical write, so malformed
+    agent output fails closed atomically instead of raising a late ValueError mid-pipeline after
+    earlier artifacts have persisted. Provider-neutral: this is the authoritative trust boundary, not
+    any provider's JSON schema. Codes are static literals — never a model value/prompt/source content.
+    """
+    for op in proposal.observations:
+        if not isinstance(op.source_index, int):
+            _fail_proposal("OBSERVATION_SOURCE_INDEX")
+        if not isinstance(op.excerpt, str):
+            _fail_proposal("OBSERVATION_EXCERPT")
+        if not _nonempty(op.statement):
+            _fail_proposal("OBSERVATION_STATEMENT")
+        if not _nonempty(op.key):
+            _fail_proposal("OBSERVATION_KEY")
+    for cp in proposal.claims:
+        if not _nonempty(cp.key):
+            _fail_proposal("CLAIM_KEY")
+        if not _nonempty(cp.statement):
+            _fail_proposal("CLAIM_STATEMENT")
+    for ip in proposal.interpretations:
+        if not _nonempty(ip.key):
+            _fail_proposal("INTERPRETATION_KEY")
+        if not _nonempty(ip.statement):
+            _fail_proposal("INTERPRETATION_STATEMENT")
+        if not _nonempty(ip.produced_by):
+            _fail_proposal("INTERPRETATION_PRODUCED_BY")
+    for ap in proposal.assumptions:
+        if not _nonempty(ap.key):
+            _fail_proposal("ASSUMPTION_KEY")
+        if not _nonempty(ap.proposition):
+            _fail_proposal("ASSUMPTION_PROPOSITION")
+        if ap.importance not in assumptions.IMPORTANCE:
+            _fail_proposal("ASSUMPTION_IMPORTANCE")
+        if ap.confidence not in assumptions.CONFIDENCE:
+            _fail_proposal("ASSUMPTION_CONFIDENCE")
+        if not _nonempty(ap.consequence_if_false):
+            _fail_proposal("ASSUMPTION_CONSEQUENCE")
+        if not _nonempty(ap.cheapest_test):
+            _fail_proposal("ASSUMPTION_CHEAPEST_TEST")
+    for opp in proposal.opportunities:
+        if not _nonempty(opp.key):
+            _fail_proposal("OPPORTUNITY_KEY")
+        kc = opp.kill_case
+        if kc is not None:
+            if kc.disposition not in killcase.DISPOSITIONS:
+                _fail_proposal("KILLCASE_DISPOSITION")
+            for dp in kc.dimensions:
+                if dp.dimension not in killcase.REQUIRED_DIMENSIONS:
+                    _fail_proposal("KILLCASE_DIMENSION")
+                if dp.assessment not in killcase.ASSESSMENTS:
+                    _fail_proposal("KILLCASE_ASSESSMENT")
+                if not _nonempty(dp.rationale):
+                    _fail_proposal("KILLCASE_RATIONALE")
 
 
 @dataclass(frozen=True)
@@ -155,6 +230,11 @@ def _execute_pipeline(conn, run_id, venture_id, mandate_content, adapter, propos
     # --- proposals over acquired data (proposer never gets a connection/ids) ---
     src_data = [{"index": i, "content": c, "locator": loc} for i, (_r, c, loc) in enumerate(acquired)]
     proposal = proposer.propose(mandate_content, src_data) if acquired else ResearchProposal()
+
+    # --- deterministic provider-neutral pre-flight: reject a malformed proposal (bad enum/required
+    #     field) BEFORE the first proposal-derived write, so nothing partial persists and no late
+    #     ValueError can crash mid-pipeline. This is the authoritative trust boundary. ---
+    validate_proposal(proposal)
 
     # --- verify + persist Observations (exact-substring anchoring) ---
     obs_key_to_id: dict = {}

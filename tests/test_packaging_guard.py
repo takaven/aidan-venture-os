@@ -22,6 +22,7 @@ EXPECTED_PACKAGES = {
     "aidan_core/deploy",
     "aidan_core/factory",
     "aidan_core/market",
+    "aidan_core/migrations",
     "aidan_core/research",
 }
 

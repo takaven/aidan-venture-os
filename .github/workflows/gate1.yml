@@ -69,3 +69,43 @@ jobs:
 
       - name: Verify installed-wheel completeness (no source shadowing)
         run: python packages/core/tools/verify_wheel_packaging.py packages/core
+
+  # Load-bearing installed-RUNTIME proof: package imports are not enough — the
+  # installed artifact must perform real runtime operations with no checkout / cwd
+  # dependence. From a clean wheel installed into a fresh venv, run from a neutral
+  # directory, this proves: migrations 0001-0025 discover from packaged resources
+  # AND apply against a real PostgreSQL; and the canonical OS repository is rejected
+  # as a venture workspace via installation-independent trusted identity. Cannot be
+  # satisfied by source shadowing.
+  installed-runtime:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aidan
+          POSTGRES_PASSWORD: aidan
+          POSTGRES_DB: aidan_runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aidan"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_runtime_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify installed runtime (migrations apply + OS-repo isolation, clean wheel)
+        run: python packages/core/tools/verify_installed_runtime.py packages/core "$GITHUB_WORKSPACE" --require-db

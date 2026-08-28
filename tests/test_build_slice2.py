@@ -155,7 +155,10 @@ def test_12_symlink_escape_rejected(tmp_path):
 
 
 def test_os_workspace_rejected():
-    os_root = substrate_mod.default_substrate_root().parent  # the OS repo root
+    # Use the trusted, installation-independent canonical identity (not the substrate
+    # location, which now lives inside the package as a resource).
+    os_root = ws.canonical_os_repo_root()
+    assert os_root is not None  # from a source checkout the fallback identifies the repo
     with pytest.raises(BuildAuthorityError):
         ws.assert_isolated_workspace(str(os_root))
 

@@ -14,10 +14,16 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS_DIR = REPO_ROOT / "migrations"
 
 # Make the in-repo package importable without an install (local dev).
 sys.path.insert(0, str(REPO_ROOT / "packages" / "core"))
+
+# Canonical migrations are a single packaged source (aidan_core/migrations); expose
+# their resolved directory for tests that apply migrations explicitly. Resolved via
+# the runtime's own default so tests and the installed artifact share one source.
+from aidan_core import migrate as _migrate  # noqa: E402
+
+MIGRATIONS_DIR = _migrate.default_migrations_dir()
 
 
 def database_url() -> str | None:
@@ -149,7 +155,7 @@ def migrated(clean_db):
     """A clean database with all migrations applied."""
     from aidan_core import migrate
 
-    migrate.apply(clean_db, MIGRATIONS_DIR)
+    migrate.apply(clean_db)   # default: canonical migrations shipped as package resources
     return clean_db
 
 

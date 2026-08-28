@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from importlib import resources
 from pathlib import Path
 from typing import Optional
 
@@ -30,15 +31,19 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def default_migrations_dir() -> Path:
-    """Resolve the migrations directory.
+    """Resolve the migrations directory, installation-independently.
 
-    Order: ``MIGRATIONS_DIR`` env var, else ``<cwd>/migrations`` (CI and the
-    CLI both run from the repository root).
+    Order: explicit ``MIGRATIONS_DIR`` override, else the canonical migrations
+    shipped as package resources inside ``aidan_core.migrations`` (the single
+    source of truth). Resolving via ``importlib.resources`` means the installed
+    wheel bootstraps canonical state with no repository checkout and no reliance
+    on the caller's cwd. In an ordinary (unpacked) install these resources are a
+    real directory on disk, so ``Path.glob`` over them works unchanged.
     """
     env = os.environ.get("MIGRATIONS_DIR")
     if env:
         return Path(env)
-    return Path.cwd() / "migrations"
+    return Path(resources.files("aidan_core.migrations"))
 
 
 def _checksum(raw: bytes) -> str:

@@ -22,3 +22,14 @@ test = ["pytest>=8"]
 where = ["."]
 include = ["aidan_core*"]
 namespaces = false
+
+# Ship non-Python runtime resources inside the installed artifact. The canonical
+# SQL migrations are the single source of truth (aidan_core/migrations/*.sql) and
+# must travel with the wheel so `python -m aidan_core.migrate` works from a clean
+# install with no repository checkout or cwd convention.
+[tool.setuptools.package-data]
+"aidan_core.migrations" = ["*.sql"]
+# Substrate infrastructure inputs (config-boundary / test-harness contracts) are
+# the single source of truth and must ship so the installed build/deploy runtime
+# can materialize them without a repository checkout.
+"aidan_core.substrate" = ["config_boundary/*", "test_harness/*"]

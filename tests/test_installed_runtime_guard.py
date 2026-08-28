@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from aidan_core import migrate
+from aidan_core.build import substrate as substrate_mod
 from aidan_core.build import workspace as ws
 from aidan_core.errors import BuildAuthorityError
 
@@ -59,6 +60,31 @@ def test_migrations_dir_override_is_honoured(tmp_path, monkeypatch):
     monkeypatch.setenv("MIGRATIONS_DIR", str(tmp_path))
     versions = [v for v, *_ in migrate.discover()]
     assert versions == ["0001", "0002"]
+
+
+# ---- A2. substrate infrastructure inputs as packaged resources --------------
+
+def test_substrate_root_is_a_single_packaged_source():
+    # Moved INTO the package; the old repo-root dir is gone (single source).
+    assert not (REPO_ROOT / "substrate").exists()
+    root = Path(substrate_mod.default_substrate_root())
+    assert root.name == "substrate" and root.parent.name == "aidan_core"
+    assert root.is_dir()
+
+
+def test_substrate_component_files_resolve_from_resources():
+    root = substrate_mod.default_substrate_root()
+    for component in ("CONFIG_BOUNDARY", "TEST_HARNESS"):
+        files = substrate_mod._component_files(root, component)
+        assert files, component
+        for rel, content in files:
+            assert content  # non-empty canonical bytes
+
+
+def test_substrate_discovery_independent_of_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    files = substrate_mod._component_files(substrate_mod.default_substrate_root(), "CONFIG_BOUNDARY")
+    assert files
 
 
 # ---- B. installation-independent canonical-repo identity --------------------

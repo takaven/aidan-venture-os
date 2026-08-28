@@ -129,6 +129,25 @@ except BuildAuthorityError:
     disp = False
 check("D_accepts_disposable", disp)
 
+# F: substrate infrastructure inputs available from the installed runtime, and the
+# SAME canonical bytes as the single source (build/deploy materialize them).
+import hashlib
+from aidan_core.build import substrate as sub
+sroot = sub.default_substrate_root()
+check("F_substrate_resource_origin", "site-packages/aidan_core/substrate" in norm(sroot), norm(sroot))
+found = {}
+try:
+    for comp in ("CONFIG_BOUNDARY", "TEST_HARNESS"):
+        for rel, content in sub._component_files(sroot, comp):
+            found[rel] = hashlib.sha256(content).hexdigest()
+except Exception as e:  # noqa: BLE001
+    out["errors"].append(f"F substrate lookup: {type(e).__name__}: {e}")
+check("F_substrate_found", len(found) >= 4, f"{len(found)} files")
+src = Path(checkout) / "packages" / "core" / "aidan_core" / "substrate"
+mismatch = [rel for rel, h in found.items()
+            if not (src / rel).is_file() or hashlib.sha256((src / rel).read_bytes()).hexdigest() != h]
+check("F_substrate_bytes_match_source", not mismatch, str(mismatch))
+
 print("PROBE_JSON=" + json.dumps(out))
 '''
 

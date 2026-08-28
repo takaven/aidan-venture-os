@@ -16,6 +16,7 @@ validation — NOT the Slice 3 AntiGeneric product decision.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 from typing import Optional
 
@@ -43,8 +44,16 @@ _ALLOWED_SUBSTRATE_SUFFIXES = (".json", ".md", ".toml", ".ini", ".cfg", ".txt")
 
 
 def default_substrate_root() -> Path:
-    """The canonical OS-monorepo substrate source directory."""
-    return Path(__file__).resolve().parents[4] / "substrate"
+    """The canonical substrate source directory, installation-independently.
+
+    The substrate infrastructure inputs are the single source of truth shipped as
+    package resources (``aidan_core/substrate/<component>/``), resolved via
+    ``importlib.resources`` so the installed runtime (build/deploy) locates them
+    with no repository checkout and no cwd/``__file__``-location dependence. In an
+    ordinary (unpacked) install these are a real directory, so the existing
+    ``Path`` traversal in :func:`_component_files` works unchanged.
+    """
+    return Path(resources.files("aidan_core.substrate"))
 
 
 @dataclass(frozen=True)

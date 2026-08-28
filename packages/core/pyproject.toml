@@ -29,3 +29,7 @@ namespaces = false
 # install with no repository checkout or cwd convention.
 [tool.setuptools.package-data]
 "aidan_core.migrations" = ["*.sql"]
+# Substrate infrastructure inputs (config-boundary / test-harness contracts) are
+# the single source of truth and must ship so the installed build/deploy runtime
+# can materialize them without a repository checkout.
+"aidan_core.substrate" = ["config_boundary/*", "test_harness/*"]

@@ -35,6 +35,8 @@ from ..errors import (
 )
 from . import artifacts as artifacts_mod
 from . import spec as spec_mod
+from . import test_execution
+from . import verifiers as verifiers_mod
 from .verifiers import VerificationRequest, VerifierRegistry, default_registry
 from .workers import WorkerRegistry, WorkerRequest
 
@@ -333,6 +335,25 @@ def verify_and_complete(
         cur.execute("SELECT attempt_number FROM execution_attempt WHERE id = %s", (attempt_id,))
         attempt_number = cur.fetchone()[0]
 
+    # TRUSTED evidence collection for the TEST_EXECUTION verifier: BEFORE the pure verifier
+    # runs, the trusted kernel (this phase, which holds the DB) executes the FROZEN harness
+    # against the durable candidate inside the bwrap sandbox and produces machine-owned
+    # evidence. subprocess stays OUT of the verifier; the worker supplies no part of this.
+    test_evidence = None
+    candidate_content_hash = ""
+    if verifier_kind == verifiers_mod.TestExecutionVerifier.kind:
+        tx = dict((expected_output_contract or {}).get("test_execution", {}))
+        candidate_files = {a.get("artifact_key"): a.get("content")
+                           for a in durable_artifacts
+                           if a.get("artifact_key") and isinstance(a.get("content"), str)}
+        candidate_content_hash = test_execution.canonical_candidate_hash(candidate_files)
+        evidence = test_execution.run_frozen_tests(
+            candidate_files=candidate_files,
+            harness_source=str(tx.get("harness_source", "")),
+            timeout_seconds=int(tx.get("timeout_seconds", 30)),
+        )
+        test_evidence = evidence.to_dict()
+
     # Resolve + run the spec's verifier ONCE over durable data (deterministic).
     request = VerificationRequest(
         action_request_id=str(action_request_id), execution_attempt_id=str(attempt_id),
@@ -341,6 +362,7 @@ def verify_and_complete(
         # The canonical captured result identity the proof will bind to — the verifier proves THIS
         # object, so it can never verify provider object B while the proof is attached to result A.
         external_result_id=("" if external_result_id is None else str(external_result_id)),
+        test_evidence=test_evidence, candidate_content_hash=candidate_content_hash,
     )
     vr = registry.get(verifier_kind).verify(request)  # KeyError on unknown kind -> no receipt, no completion
 

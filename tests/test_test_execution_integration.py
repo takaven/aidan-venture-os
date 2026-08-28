@@ -1,0 +1,77 @@
+"""End-to-end: TEST_EXECUTION spec -> worker candidate -> trusted sandbox evidence ->
+pure verifier -> canonical Proof Receipt (DB + bwrap). Proves canonical SUCCESS follows
+behavioural correctness, never worker self-report. Skipped without bwrap.
+"""
+from __future__ import annotations
+
+import pytest
+
+from aidan_core import execution
+from aidan_core.factory import runtime, test_execution as te
+from aidan_core.factory.verifiers import default_registry
+
+from factory_fakes import FakeWorkerA, registry_with, spec_action
+
+pytestmark = pytest.mark.skipif(not te.bwrap_available(), reason="bwrap not available (non-Linux/dev)")
+
+HARNESS = '''
+import json, sys
+sys.path.insert(0, "/candidate")
+import candidate
+total = passed = 0
+for a, b in [(1, 2), (0, 0), (5, 7), (-3, 3)]:
+    total += 1
+    try:
+        if candidate.add(a, b) == a + b:
+            passed += 1
+    except Exception:
+        pass
+print(json.dumps({"result": "PASS" if passed == total else "FAIL", "total": total, "passed": passed}))
+'''
+
+CONTRACT = {"test_execution": {
+    "harness_source": HARNESS, "test_sha256": te._sha256_text(HARNESS), "min_tests": 4,
+    "runner_kind": te.RUNNER_KIND, "runner_version": te.RUNNER_VERSION, "timeout_seconds": 25,
+}}
+
+
+def _drive(migrated, slug, *, candidate_src, worker_outcome="success", structured=None):
+    vid, aid, _ = spec_action(migrated, slug, verifier_kind="test-execution", expected_output_contract=CONTRACT)
+    decl = {"artifact_key": "candidate.py", "artifact_type": "FILE", "ref": "candidate.py", "content": candidate_src}
+    runtime.execute_action(migrated, aid, registry=registry_with(
+        FakeWorkerA(reported_outcome=worker_outcome, structured_output=structured or {}, artifacts=[decl])))
+    out = runtime.verify_and_complete(migrated, aid, verifier_registry=default_registry(), actual_cost=10)
+    return aid, out
+
+
+def test_correct_candidate_reaches_canonical_success(migrated):
+    aid, out = _drive(migrated, "tx-ok", candidate_src="def add(a, b):\n    return a + b\n")
+    assert out.status == "SUCCEEDED" and out.verified is True
+    assert execution.get_status(migrated, aid) == "SUCCEEDED"
+
+
+def test_different_bytes_correct_candidate_also_succeeds(migrated):
+    aid, out = _drive(migrated, "tx-ok2", candidate_src="def add(a, b):\n    return b + a  # different bytes\n")
+    assert out.status == "SUCCEEDED" and out.verified is True
+
+
+def test_wrong_candidate_never_succeeds(migrated):
+    aid, out = _drive(migrated, "tx-wrong", candidate_src="def add(a, b):\n    return a * b\n")
+    assert out.status != "SUCCEEDED"
+    assert execution.get_status(migrated, aid) != "SUCCEEDED"
+
+
+def test_worker_self_report_cannot_buy_success_for_wrong_code(migrated):
+    # Worker lies maximally: reported_outcome=success + tests_pass=true, but code is WRONG.
+    aid, out = _drive(migrated, "tx-liar", candidate_src="def add(a, b):\n    return a - b\n",
+                      worker_outcome="success", structured={"tests_pass": True, "status": "SUCCEEDED"})
+    assert out.status != "SUCCEEDED"
+
+
+def test_proof_receipt_records_test_execution_type(migrated):
+    aid, out = _drive(migrated, "tx-proof", candidate_src="def add(a, b):\n    return a + b\n")
+    with migrated.cursor() as cur:
+        cur.execute("SELECT verification_type, result FROM proof_receipt WHERE action_request_id = %s "
+                    "ORDER BY created_at DESC LIMIT 1", (aid,))
+        vtype, result = cur.fetchone()
+    assert vtype == "TEST_EXECUTION" and result == "VERIFIED"

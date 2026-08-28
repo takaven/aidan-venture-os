@@ -38,6 +38,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Bubblewrap enables the deterministic coding-verification sandbox tests to
+      # actually execute (they skip without it). See the sandbox-contract job.
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Install package (with test extras)
         run: pip install "./packages/core[test]"
 
@@ -107,7 +115,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify installed runtime (migrations apply + OS-repo isolation, clean wheel)
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Verify installed runtime (migrations apply + OS-repo isolation + sandbox verify, clean wheel)
         run: python packages/core/tools/verify_installed_runtime.py packages/core "$GITHUB_WORKSPACE" --require-db
 
   # Bubblewrap sandbox CONTRACT proof (Gate 8 deterministic coding verification):

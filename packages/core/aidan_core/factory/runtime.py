@@ -366,6 +366,28 @@ def verify_and_complete(
     )
     vr = registry.get(verifier_kind).verify(request)  # KeyError on unknown kind -> no receipt, no completion
 
+    # Durably persist the TRANSIENT sandbox execution evidence so a Proof Receipt is
+    # historically auditable WITHOUT re-execution: the dynamic fields (terminal/timeout
+    # state, exit code, test counts, runner identity/version) survive only in this
+    # in-memory evidence, so record them as a kernel-authored, append-only audit event
+    # bound to the action/attempt and the receipt's evidence_hash. Bounded safe fields
+    # only — never candidate content, prompt, or raw logs. Written for BOTH verdicts so
+    # rejected runs are auditable too.
+    if test_evidence is not None:
+        with db.transaction(conn) as cur:
+            audit.record_event(
+                cur, event_type="factory.test_execution_evidence", actor=actor,
+                action_id=action_request_id,
+                payload={
+                    "attempt_id": str(attempt_id), "verdict": vr.verdict,
+                    "evidence_hash": vr.evidence_hash,
+                    **{k: test_evidence.get(k) for k in (
+                        "terminal_state", "exit_code", "harness_result", "tests_total",
+                        "tests_passed", "candidate_sha256", "test_sha256", "runner_kind",
+                        "runner_version", "bwrap_version", "timeout_seconds")},
+                },
+            )
+
     if vr.verdict == "VERIFIED":
         def _record_proof(cur, aid, rid):
             proof_id = proof._write_receipt(

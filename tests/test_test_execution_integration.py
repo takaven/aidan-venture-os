@@ -75,3 +75,33 @@ def test_proof_receipt_records_test_execution_type(migrated):
                     "ORDER BY created_at DESC LIMIT 1", (aid,))
         vtype, result = cur.fetchone()
     assert vtype == "TEST_EXECUTION" and result == "VERIFIED"
+
+
+def _evidence_event(conn, aid):
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM audit_event WHERE action_id = %s "
+                    "AND event_type = 'factory.test_execution_evidence' ORDER BY created_at DESC LIMIT 1",
+                    (aid,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def test_dynamic_execution_evidence_is_durably_auditable(migrated):
+    # The transient sandbox fields must be READABLE from durable state after the process
+    # exits, WITHOUT re-executing the sandbox.
+    aid, out = _drive(migrated, "tx-audit", candidate_src="def add(a, b):\n    return a + b\n")
+    ev = _evidence_event(migrated, aid)
+    assert ev is not None
+    assert ev["verdict"] == "VERIFIED"
+    assert ev["terminal_state"] == "COMPLETED" and ev["exit_code"] == 0 and ev["harness_result"] == "PASS"
+    assert ev["tests_total"] == 4 and ev["tests_passed"] == 4
+    assert ev["runner_kind"] == te.RUNNER_KIND and ev["runner_version"] == te.RUNNER_VERSION
+    assert len(ev["candidate_sha256"]) == 64 and len(ev["test_sha256"]) == 64
+    assert ev.get("evidence_hash")
+
+
+def test_rejected_run_also_leaves_durable_evidence(migrated):
+    aid, out = _drive(migrated, "tx-audit-rej", candidate_src="def add(a, b):\n    return a * b\n")
+    ev = _evidence_event(migrated, aid)
+    assert ev is not None and ev["verdict"] == "REJECTED"
+    assert ev["terminal_state"] == "COMPLETED" and ev["harness_result"] == "FAIL"

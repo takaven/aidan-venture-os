@@ -19,6 +19,13 @@ Load-bearing boundaries:
 Scope (deliberately narrow, first proof): Linux + ``bwrap`` only; a single Python
 stdlib-only candidate module + a frozen stdlib harness; no package install; no network.
 On non-Linux / no-bwrap hosts :func:`bwrap_available` is False and callers must skip.
+
+Supported-host contract (NOT generic Linux portability): a Linux host with bubblewrap
+installed AND unprivileged user namespaces usable by bwrap — i.e. one of
+``kernel.apparmor_restrict_unprivileged_userns=0`` (Ubuntu 23.10+ defaults it to 1,
+which blocks bwrap's netns setup), an AppArmor profile permitting bwrap, or a setuid
+bwrap. Where the sandbox cannot spawn, the runner returns ``SPAWN_FAILED`` and the
+verifier fails closed (never a false success).
 """
 from __future__ import annotations
 

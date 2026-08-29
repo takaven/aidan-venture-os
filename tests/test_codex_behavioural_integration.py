@@ -54,8 +54,9 @@ class FakeCodexProc:
 
 
 def _drive(migrated, tmp_path, slug, src, monkeypatch):
-    monkeypatch.setenv("WORKER_OPENAI_API_KEY", "sk-test-not-real")
+    monkeypatch.setenv("WORKER_CODEX_API_KEY", "codex-test-not-real")
     monkeypatch.setattr("aidan_core.factory.codex_worker.codex_bin", lambda: "/usr/bin/codex")
+    (tmp_path / ".git").mkdir(exist_ok=True)   # isolated venture git repo required by the adapter
     vid, aid, _ = spec_action(
         migrated, slug, worker_kind="codex-exec", verifier_kind="test-execution",
         capabilities=("WRITE_ISOLATED_WORKSPACE", "PRODUCE_PATCH"),

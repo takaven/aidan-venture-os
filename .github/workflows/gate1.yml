@@ -159,3 +159,30 @@ jobs:
 
       - name: Prove sandbox containment contract
         run: python packages/core/tools/verify_sandbox_contract.py "$GITHUB_WORKSPACE"
+
+  # Codex CLI contract proof for the CodexExecWorker adapter: installs an actual codex
+  # binary and verifies the exact command surface the adapter depends on really exists
+  # (fail-closed on capability drift). NO authentication and NO `codex exec` model call —
+  # only `codex --version` / `--help`. This is fast-moving CLI, so the check pins the
+  # contract at CI time rather than trusting documentation alone.
+  codex-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Verify Codex CLI command-surface contract (no auth, no model call)
+        run: python packages/core/tools/verify_codex_cli_contract.py

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..build import workspace as ws
-from ..errors import WorkerTimeoutError
+from ..errors import AmbiguousExternalEffectError, WorkerTimeoutError
 from .workers import WorkerRequest, WorkerResult
 
 WORKER_KIND = "codex-exec"
@@ -149,6 +149,7 @@ class CodexExecWorker:
             raise CodexAdapterError("CODEX_MODEL_MISSING")   # model must be explicitly frozen
         if not artifact_paths:
             raise CodexAdapterError("CODEX_ARTIFACT_PATHS_MISSING")
+        self._assert_artifact_path_formats(artifact_paths)   # frozen-input format check (pre-invocation)
 
         workspace = request.workspace_ref
         if not workspace or not os.path.isdir(workspace):
@@ -163,6 +164,13 @@ class CodexExecWorker:
         if not bin_path:
             raise CodexAdapterError("CODEX_BINARY_MISSING")
 
+        # Everything ABOVE this point is a pre-invocation guard: the provider was never
+        # invoked, so a failure here is a plain WORKER_ERROR and the reservation may be safely
+        # released (no billable effect). Everything from the transport call onward is
+        # POST-invocation: the paid provider may already have consumed tokens, so ANY failure
+        # (timeout, non-zero exit, malformed/absent terminal, bad artifact) is treated as an
+        # ambiguous external effect -> the factory records RECOVERY_REQUIRED and HOLDS the
+        # reservation (UNKNOWN COST != ZERO COST); it is never released as if cost were zero.
         with tempfile.TemporaryDirectory(prefix="codex-iso-") as base:
             home = os.path.join(base, "home")
             tmpdir = os.path.join(base, "tmp")
@@ -171,22 +179,31 @@ class CodexExecWorker:
                 os.mkdir(d)
             env = self._child_env(home=home, tmpdir=tmpdir, codex_home=codex_home)
             argv = self._argv(bin_path, model, workspace)
-            result = self._transport(argv, prompt, env, workspace, int(request.timeout_seconds or 120))
-            # WorkerTimeoutError from the transport propagates untouched -> factory records TIMEOUT.
+            try:
+                result = self._transport(argv, prompt, env, workspace, int(request.timeout_seconds or 120))
+            except WorkerTimeoutError as exc:
+                # Timed out AFTER invocation: tokens may already be spent -> conservative.
+                raise AmbiguousExternalEffectError("CODEX_TIMEOUT_AFTER_INVOCATION") from exc
 
-            if result.exit_code != 0:
-                raise CodexAdapterError("CODEX_NONZERO_EXIT")   # sanitized; no stderr/secret
-
-            session_id, terminal_ok = self._parse_events(result.stdout)
-            if not terminal_ok:
-                raise CodexAdapterError("CODEX_NO_TERMINAL_EVENT")
-
-            artifacts = self._capture_artifacts(workspace, artifact_paths)
+            try:
+                if result.exit_code != 0:
+                    raise CodexAdapterError("CODEX_NONZERO_EXIT")   # sanitized; no stderr/secret
+                session_id, terminal_ok, usage = self._parse_events(result.stdout)
+                if not terminal_ok:
+                    raise CodexAdapterError("CODEX_NO_TERMINAL_EVENT")
+                artifacts = self._capture_artifacts(workspace, artifact_paths)
+            except CodexAdapterError as exc:
+                # The provider ran; its cost is unknown -> do NOT let capital be released as zero.
+                raise AmbiguousExternalEffectError(str(exc)) from exc
 
         external_result_id = self._result_id(request, session_id, artifacts)
         structured = {"exit_code": 0, "terminal": "completed", "artifact_count": len(artifacts)}
         if session_id is not None:
             structured["provider_thread_id"] = session_id   # only when actually present
+        if usage is not None:
+            # Bounded provider-reported token usage — the ONLY input the kernel's trusted,
+            # frozen-pricing cost estimator consumes (a self-reported dollar cost is never used).
+            structured["token_usage"] = usage
         return WorkerResult(
             worker_kind=self.kind, worker_version=WORKER_VERSION,
             external_result_id=external_result_id,
@@ -197,6 +214,7 @@ class CodexExecWorker:
     # ---- documented JSONL event parsing (only documented Codex event types) -----------
     def _parse_events(self, stdout: str):
         session_id = None
+        usage = None
         saw_terminal_success = False
         saw_terminal_failure = False
         any_event = False
@@ -220,18 +238,29 @@ class CodexExecWorker:
                     session_id = sid
             elif etype == "turn.completed":
                 saw_terminal_success = True
+                usage = self._extract_usage(ev.get("usage"))
             elif etype in ("turn.failed", "error"):
                 saw_terminal_failure = True
         if not any_event:
             raise CodexAdapterError("CODEX_NO_EVENTS")
         if saw_terminal_failure:
             raise CodexAdapterError("CODEX_TURN_FAILED")
-        return session_id, saw_terminal_success
+        return session_id, saw_terminal_success, usage
 
-    # ---- artifact capture (only frozen paths; strict safety) -------------------------
-    def _capture_artifacts(self, workspace: str, artifact_paths: list) -> list:
-        root = Path(workspace).resolve()
-        out = []
+    @staticmethod
+    def _extract_usage(raw):
+        """Bounded, safe token usage: only non-negative int input/output token counts."""
+        if not isinstance(raw, dict):
+            return None
+        inp = raw.get("input_tokens")
+        out = raw.get("output_tokens")
+        if isinstance(inp, int) and isinstance(out, int) and inp >= 0 and out >= 0:
+            return {"input_tokens": inp, "output_tokens": out}
+        return None
+
+    # ---- artifact path FORMAT check (pre-invocation; frozen inputs, no provider effect) ---
+    @staticmethod
+    def _assert_artifact_path_formats(artifact_paths: list) -> None:
         for rel in artifact_paths:
             if not isinstance(rel, str) or not rel:
                 raise CodexAdapterError("CODEX_ARTIFACT_PATH_INVALID")
@@ -240,6 +269,13 @@ class CodexExecWorker:
                 raise CodexAdapterError("CODEX_ARTIFACT_ABSOLUTE")
             if ".." in norm.split("/"):
                 raise CodexAdapterError("CODEX_ARTIFACT_TRAVERSAL")
+
+    # ---- artifact capture (post-invocation; depends on provider output) ---------------
+    def _capture_artifacts(self, workspace: str, artifact_paths: list) -> list:
+        root = Path(workspace).resolve()
+        out = []
+        for rel in artifact_paths:
+            norm = rel.replace("\\", "/")
             target = (root / norm)
             real = Path(os.path.realpath(target))
             if real != root and root not in real.parents:

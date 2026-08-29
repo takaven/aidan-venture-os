@@ -381,6 +381,12 @@ def verify_and_complete(
                 payload={
                     "attempt_id": str(attempt_id), "verdict": vr.verdict,
                     "evidence_hash": vr.evidence_hash,
+                    "candidate_content_hash": candidate_content_hash,
+                    # The FULL machine-owned evidence (bounded safe fields only — no candidate
+                    # content, prompt, or raw logs), so the exact evidence-hash preimage is
+                    # reconstructable from PostgreSQL alone, with no re-execution.
+                    "evidence": dict(test_evidence),
+                    # Flat mirror of the key fields for direct human/query auditing.
                     **{k: test_evidence.get(k) for k in (
                         "terminal_state", "exit_code", "harness_result", "tests_total",
                         "tests_passed", "candidate_sha256", "test_sha256", "runner_kind",

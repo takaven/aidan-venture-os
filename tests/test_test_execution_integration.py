@@ -105,3 +105,47 @@ def test_rejected_run_also_leaves_durable_evidence(migrated):
     ev = _evidence_event(migrated, aid)
     assert ev is not None and ev["verdict"] == "REJECTED"
     assert ev["terminal_state"] == "COMPLETED" and ev["harness_result"] == "FAIL"
+
+
+def test_evidence_hash_reconstructs_from_durable_state_without_reexecution(migrated):
+    # Rebuild the EXACT evidence-hash preimage from canonical PostgreSQL state alone (no
+    # sandbox re-run) and prove it equals BOTH the durable audit-event hash AND the Proof
+    # Receipt hash.
+    from aidan_core.factory.verifiers import VerificationRequest, _evidence_hash
+
+    aid, out = _drive(migrated, "tx-recon", candidate_src="def add(a, b):\n    return a + b\n")
+    with migrated.cursor() as cur:
+        cur.execute("SELECT verifier_kind, spec_hash, expected_output_contract FROM execution_spec "
+                    "WHERE action_request_id = %s", (aid,))
+        verifier_kind, spec_hash, contract = cur.fetchone()
+        cur.execute("SELECT execution_attempt_id, evidence_hash FROM proof_receipt "
+                    "WHERE action_request_id = %s ORDER BY created_at DESC LIMIT 1", (aid,))
+        pr_attempt, pr_hash = cur.fetchone()
+    ev = _evidence_event(migrated, aid)
+    full = ev["evidence"]                       # full machine-owned evidence, durable
+    # Reconstruct the request the verifier used — every field from durable state.
+    req = VerificationRequest(
+        action_request_id=str(aid), execution_attempt_id=ev["attempt_id"],
+        verifier_kind=verifier_kind, expected_output_contract=contract,
+        worker_structured_output={}, artifacts=(), spec_hash=spec_hash,
+        test_evidence=full, candidate_content_hash=ev["candidate_content_hash"])
+    recomputed = _evidence_hash(req, {"evidence": full, "candidate": ev["candidate_content_hash"]})
+    assert recomputed == ev["evidence_hash"] == pr_hash
+    assert str(pr_attempt) == ev["attempt_id"]
+
+
+def test_executed_candidate_bytes_are_the_durable_captured_candidate(migrated):
+    # Candidate-execution binding: the bytes the sandbox executed are content-addressed to
+    # the DURABLE captured candidate (execution_result), not any external/mutated workspace —
+    # verify_and_complete rebuilds the ephemeral workspace from canonical state every run.
+    from aidan_core.factory.test_execution import canonical_candidate_hash
+
+    aid, out = _drive(migrated, "tx-bind", candidate_src="def add(a, b):\n    return a + b\n")
+    with migrated.cursor() as cur:
+        cur.execute("SELECT raw_payload FROM execution_result WHERE action_request_id = %s "
+                    "ORDER BY received_at DESC LIMIT 1", (aid,))
+        raw = cur.fetchone()[0]
+    candidate_files = {a["artifact_key"]: a["content"] for a in raw.get("artifacts", [])
+                       if isinstance(a.get("content"), str)}
+    ev = _evidence_event(migrated, aid)["evidence"]
+    assert ev["candidate_sha256"] == canonical_candidate_hash(candidate_files)

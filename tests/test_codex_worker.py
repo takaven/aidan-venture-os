@@ -217,6 +217,18 @@ def test_absent_provider_thread_uses_kernel_derived_id(tmp_path):
     assert "provider_thread_id" not in res.structured_output
 
 
+def test_bounded_token_usage_captured_when_present(tmp_path):
+    events = [{"type": "thread.started", "thread_id": "th"},
+              {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 340, "cost": 99}}]
+    res = _run(FakeCodex(writes={"candidate.py": "x=1\n"}, events=events), tmp_path)
+    assert res.structured_output["token_usage"] == {"input_tokens": 1200, "output_tokens": 340}  # only bounded ints
+
+
+def test_token_usage_absent_when_not_reported(tmp_path):
+    res = _run(FakeCodex(writes={"candidate.py": "x=1\n"}), tmp_path)   # GOOD_EVENTS carry no usage
+    assert "token_usage" not in res.structured_output
+
+
 def test_undocumented_event_aliases_are_not_terminal(tmp_path):
     # session.created / response.completed are NOT documented codex-exec events -> no terminal.
     fake = FakeCodex(writes={"candidate.py": "x=1\n"},

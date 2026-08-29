@@ -177,7 +177,7 @@ class CodexExecWorker:
             if result.exit_code != 0:
                 raise CodexAdapterError("CODEX_NONZERO_EXIT")   # sanitized; no stderr/secret
 
-            session_id, terminal_ok = self._parse_events(result.stdout)
+            session_id, terminal_ok, usage = self._parse_events(result.stdout)
             if not terminal_ok:
                 raise CodexAdapterError("CODEX_NO_TERMINAL_EVENT")
 
@@ -187,6 +187,10 @@ class CodexExecWorker:
         structured = {"exit_code": 0, "terminal": "completed", "artifact_count": len(artifacts)}
         if session_id is not None:
             structured["provider_thread_id"] = session_id   # only when actually present
+        if usage is not None:
+            # Bounded provider-reported token usage — the ONLY input the kernel's trusted,
+            # frozen-pricing cost estimator consumes (a self-reported dollar cost is never used).
+            structured["token_usage"] = usage
         return WorkerResult(
             worker_kind=self.kind, worker_version=WORKER_VERSION,
             external_result_id=external_result_id,
@@ -197,6 +201,7 @@ class CodexExecWorker:
     # ---- documented JSONL event parsing (only documented Codex event types) -----------
     def _parse_events(self, stdout: str):
         session_id = None
+        usage = None
         saw_terminal_success = False
         saw_terminal_failure = False
         any_event = False
@@ -220,13 +225,25 @@ class CodexExecWorker:
                     session_id = sid
             elif etype == "turn.completed":
                 saw_terminal_success = True
+                usage = self._extract_usage(ev.get("usage"))
             elif etype in ("turn.failed", "error"):
                 saw_terminal_failure = True
         if not any_event:
             raise CodexAdapterError("CODEX_NO_EVENTS")
         if saw_terminal_failure:
             raise CodexAdapterError("CODEX_TURN_FAILED")
-        return session_id, saw_terminal_success
+        return session_id, saw_terminal_success, usage
+
+    @staticmethod
+    def _extract_usage(raw):
+        """Bounded, safe token usage: only non-negative int input/output token counts."""
+        if not isinstance(raw, dict):
+            return None
+        inp = raw.get("input_tokens")
+        out = raw.get("output_tokens")
+        if isinstance(inp, int) and isinstance(out, int) and inp >= 0 and out >= 0:
+            return {"input_tokens": inp, "output_tokens": out}
+        return None
 
     # ---- artifact capture (only frozen paths; strict safety) -------------------------
     def _capture_artifacts(self, workspace: str, artifact_paths: list) -> list:

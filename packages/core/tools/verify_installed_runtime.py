@@ -148,6 +148,42 @@ mismatch = [rel for rel, h in found.items()
             if not (src / rel).is_file() or hashlib.sha256((src / rel).read_bytes()).hexdigest() != h]
 check("F_substrate_bytes_match_source", not mismatch, str(mismatch))
 
+# G: the deterministic coding-verification path ships in the wheel and works end to end
+# from the installed package (trusted sandbox run -> pure verifier) — correct verifies,
+# wrong is rejected. Requires bwrap (the installed-runtime CI job installs it).
+from aidan_core.factory import test_execution as _te
+from aidan_core.factory.verifiers import TestExecutionVerifier as _TEV, VerificationRequest as _VR
+check("G_test_execution_site_packages",
+      "site-packages/aidan_core/factory/test_execution" in norm(_te.__file__), norm(_te.__file__))
+_HARNESS = ("import json, sys\n"
+            "sys.path.insert(0, '/candidate')\n"
+            "import candidate\n"
+            "t = p = 0\n"
+            "for a, b in [(1, 2), (3, 4)]:\n"
+            "    t += 1\n"
+            "    try:\n"
+            "        p += 1 if candidate.add(a, b) == a + b else 0\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "print(json.dumps({'result': 'PASS' if p == t else 'FAIL', 'total': t, 'passed': p}))\n")
+if _te.bwrap_available():
+    _contract = {"test_execution": {"test_sha256": _te._sha256_text(_HARNESS), "min_tests": 2,
+                 "runner_kind": _te.RUNNER_KIND, "runner_version": _te.RUNNER_VERSION}}
+
+    def _verdict(src):
+        cf = {"candidate.py": src}
+        ev = _te.run_frozen_tests(candidate_files=cf, harness_source=_HARNESS, timeout_seconds=25)
+        req = _VR(action_request_id="a", execution_attempt_id="1", verifier_kind="test-execution",
+                  expected_output_contract=_contract, worker_structured_output={}, artifacts=(),
+                  spec_hash="s", test_evidence=ev.to_dict(),
+                  candidate_content_hash=_te.canonical_candidate_hash(cf))
+        return _TEV().verify(req).verdict
+
+    check("G_correct_candidate_verifies", _verdict("def add(a, b):\n    return a + b\n") == "VERIFIED")
+    check("G_wrong_candidate_rejected", _verdict("def add(a, b):\n    return a * b\n") == "REJECTED")
+else:
+    out["checks"]["G_skipped_no_bwrap"] = True
+
 print("PROBE_JSON=" + json.dumps(out))
 '''
 

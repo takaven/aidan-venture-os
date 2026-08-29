@@ -38,6 +38,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Bubblewrap enables the deterministic coding-verification sandbox tests to
+      # actually execute (they skip without it). See the sandbox-contract job.
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Install package (with test extras)
         run: pip install "./packages/core[test]"
 
@@ -107,5 +115,47 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify installed runtime (migrations apply + OS-repo isolation, clean wheel)
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Verify installed runtime (migrations apply + OS-repo isolation + sandbox verify, clean wheel)
         run: python packages/core/tools/verify_installed_runtime.py packages/core "$GITHUB_WORKSPACE" --require-db
+
+  # Bubblewrap sandbox CONTRACT proof (Gate 8 deterministic coding verification):
+  # experimentally proves the narrow bwrap profile actually contains untrusted
+  # candidate code — no network, no canonical-repo write, no host secrets/home,
+  # isolated writable scratch, and timeout kills the process tree. Linux-only; the
+  # sandbox is a sanctioned narrow OS-security primitive, not a generic platform.
+  sandbox-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: bwrap diagnostics (non-fatal)
+        run: |
+          bwrap --version || true
+          echo "unprivileged_userns_clone=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo n/a)"
+          echo "apparmor_restrict=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev --tmpfs /work --chdir /work /usr/bin/true && echo "SMOKE_OK" || echo "SMOKE_FAIL(exit=$?)"
+        continue-on-error: true
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Prove sandbox containment contract
+        run: python packages/core/tools/verify_sandbox_contract.py "$GITHUB_WORKSPACE"

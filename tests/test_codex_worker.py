@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from aidan_core.errors import BuildAuthorityError, WorkerTimeoutError
+from aidan_core.errors import AmbiguousExternalEffectError, BuildAuthorityError, WorkerTimeoutError
 from aidan_core.factory import codex_worker as cw
 from aidan_core.factory.codex_worker import CodexAdapterError, CodexExecWorker, CodexProcessResult
 from aidan_core.factory.workers import WorkerRequest
@@ -168,33 +168,30 @@ def test_non_git_workspace_rejected(tmp_path):
 
 # ---- artifact safety --------------------------------------------------------
 
+# Path FORMAT errors are frozen-input errors caught PRE-invocation (safe -> WORKER_ERROR).
 @pytest.mark.parametrize("paths,code", [
     (["/etc/passwd"], "CODEX_ARTIFACT_ABSOLUTE"),
     (["../escape.py"], "CODEX_ARTIFACT_TRAVERSAL"),
-    (["missing.py"], "CODEX_ARTIFACT_NOT_A_FILE"),
 ])
-def test_artifact_path_rejections(tmp_path, paths, code):
+def test_artifact_path_format_rejected_pre_invocation(tmp_path, paths, code):
+    fake = FakeCodex()
     with pytest.raises(CodexAdapterError) as ei:
-        _run(FakeCodex(), tmp_path, artifact_paths=paths)
+        _run(fake, tmp_path, artifact_paths=paths)
     assert str(ei.value) == code
+    assert fake.calls == []                       # provider never invoked
 
 
-def test_artifact_directory_rejected(tmp_path):
-    with pytest.raises(CodexAdapterError) as ei:
-        _run(FakeCodex(writes={"outdir/x": "y"}), tmp_path, artifact_paths=["outdir"])
-    assert str(ei.value) == "CODEX_ARTIFACT_NOT_A_FILE"
-
-
-def test_artifact_non_utf8_rejected(tmp_path):
-    with pytest.raises(CodexAdapterError) as ei:
-        _run(FakeCodex(writes={"candidate.py": b"\xff\xfe\x00binary"}), tmp_path)
-    assert str(ei.value) == "CODEX_ARTIFACT_NOT_UTF8"
-
-
-def test_artifact_oversized_rejected(tmp_path):
-    with pytest.raises(CodexAdapterError) as ei:
-        _run(FakeCodex(writes={"candidate.py": "#" * (cw._MAX_ARTIFACT_BYTES + 1)}), tmp_path)
-    assert str(ei.value) == "CODEX_ARTIFACT_TOO_LARGE"
+# Output-dependent artifact failures are POST-invocation -> ambiguous (reservation held).
+@pytest.mark.parametrize("fake,paths", [
+    (FakeCodex(), ["missing.py"]),                                  # provider produced no file
+    (FakeCodex(writes={"outdir/x": "y"}), ["outdir"]),             # a directory
+    (FakeCodex(writes={"candidate.py": b"\xff\xfe\x00bin"}), ["candidate.py"]),   # non-utf8
+    (FakeCodex(writes={"candidate.py": "#" * (cw._MAX_ARTIFACT_BYTES + 1)}), ["candidate.py"]),  # oversized
+])
+def test_output_dependent_artifact_failures_are_ambiguous(tmp_path, fake, paths):
+    with pytest.raises(AmbiguousExternalEffectError):
+        _run(fake, tmp_path, artifact_paths=paths)
+    assert fake.calls != []                       # provider WAS invoked (cost may exist)
 
 
 def test_undeclared_files_are_ignored(tmp_path):
@@ -231,32 +228,36 @@ def test_token_usage_absent_when_not_reported(tmp_path):
 
 def test_undocumented_event_aliases_are_not_terminal(tmp_path):
     # session.created / response.completed are NOT documented codex-exec events -> no terminal.
+    # This is POST-invocation, so it is ambiguous (the provider ran and may have billed).
     fake = FakeCodex(writes={"candidate.py": "x=1\n"},
                      events=[{"type": "session.created", "id": "s"}, {"type": "response.completed"}])
-    with pytest.raises(CodexAdapterError) as ei:
+    with pytest.raises(AmbiguousExternalEffectError):
         _run(fake, tmp_path)
-    assert str(ei.value) == "CODEX_NO_TERMINAL_EVENT"
 
 
-@pytest.mark.parametrize("fake,code", [
-    (FakeCodex(exit_code=1), "CODEX_NONZERO_EXIT"),
-    (FakeCodex(raw_stdout="not json at all"), "CODEX_MALFORMED_EVENT"),
-    (FakeCodex(raw_stdout=""), "CODEX_NO_EVENTS"),
-    (FakeCodex(events=[{"type": "thread.started", "thread_id": "t"}]), "CODEX_NO_TERMINAL_EVENT"),
-    (FakeCodex(events=[{"type": "turn.failed"}]), "CODEX_TURN_FAILED"),
-    (FakeCodex(events=[{"type": "error"}]), "CODEX_TURN_FAILED"),
+# Every POST-invocation failure is ambiguous -> RECOVERY_REQUIRED (reservation held), never a
+# zero-cost release, since the paid provider may already have consumed tokens.
+@pytest.mark.parametrize("fake", [
+    FakeCodex(exit_code=1),
+    FakeCodex(raw_stdout="not json at all"),
+    FakeCodex(raw_stdout=""),
+    FakeCodex(events=[{"type": "thread.started", "thread_id": "t"}]),
+    FakeCodex(events=[{"type": "turn.failed"}]),
+    FakeCodex(events=[{"type": "error"}]),
 ])
-def test_event_and_exit_rejections(tmp_path, fake, code):
+def test_post_invocation_failures_are_ambiguous(tmp_path, fake):
     fake.writes = {"candidate.py": "x=1\n"}
-    with pytest.raises(CodexAdapterError) as ei:
+    with pytest.raises(AmbiguousExternalEffectError):
         _run(fake, tmp_path)
-    assert str(ei.value) == code
+    assert fake.calls != []
 
 
 # ---- timeout ----------------------------------------------------------------
 
-def test_adapter_timeout_raises_typed_worker_timeout(tmp_path):
-    with pytest.raises(WorkerTimeoutError):
+def test_post_invocation_timeout_is_ambiguous_not_zero_cost(tmp_path):
+    # A timeout AFTER the provider was invoked may have billed tokens -> ambiguous (held),
+    # never a plain retryable TIMEOUT that releases capital as if unspent.
+    with pytest.raises(AmbiguousExternalEffectError):
         _run(FakeCodex(raise_exc=WorkerTimeoutError("CODEX_TIMEOUT")), tmp_path)
 
 

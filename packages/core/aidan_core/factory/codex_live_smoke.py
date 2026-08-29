@@ -117,7 +117,7 @@ def run_smoke(conn, *, transport=None, workspace_ref=None, actor="codex-smoke",
 
     from .. import budget, ventures
     from ..actions import submit_action_request as _submit
-    from ..errors import InsufficientBudgetError
+    from ..errors import ExecutionBlockedError, InsufficientBudgetError
     from . import provider_cost, runtime, spec as spec_mod
     from .codex_worker import CodexExecWorker
     from .verifiers import default_registry
@@ -157,8 +157,11 @@ def run_smoke(conn, *, transport=None, workspace_ref=None, actor="codex-smoke",
 
     try:
         r = runtime.execute_action(conn, aid, registry=reg, workspace_ref=workspace_ref, actor=actor)
-    except InsufficientBudgetError:
-        ev.update(result="RESERVATION_FAILED", provider_invocations=0)
+    except (InsufficientBudgetError, ExecutionBlockedError) as exc:
+        # Blocked BEFORE any provider dispatch (e.g. the reservation cannot be made) -> the paid
+        # provider is never reached. Report it; capital is untouched.
+        blocked = "RESERVATION_FAILED" if "BUDGET" in str(exc).upper() else "BLOCKED_BEFORE_DISPATCH"
+        ev.update(result=blocked, provider_invocations=0)
         return _finalize(conn, vid, aid, ev)
 
     ev["provider_invocations"] = counter["n"] if transport is not None else None

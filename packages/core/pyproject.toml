@@ -29,6 +29,9 @@ namespaces = false
 # install with no repository checkout or cwd convention.
 [tool.setuptools.package-data]
 "aidan_core.migrations" = ["*.sql"]
+# The frozen Codex live-smoke behavioural harness ships as a byte-exact resource so its
+# SHA-256 is verifiable from the installed artifact.
+"aidan_core.factory" = ["*.txt"]
 # Substrate infrastructure inputs (config-boundary / test-harness contracts) are
 # the single source of truth and must ship so the installed build/deploy runtime
 # can materialize them without a repository checkout.

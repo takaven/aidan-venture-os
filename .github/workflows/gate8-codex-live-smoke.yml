@@ -1,0 +1,74 @@
+name: Gate 8 Codex Live Smoke
+
+# MANUAL ONLY. One authorized dispatch -> at most one real Codex invocation. No push /
+# pull_request / schedule / workflow_run trigger, and no retry. The frozen spec + harness are
+# hash-checked before any provider access; a mismatch fails closed with zero invocation.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_FROZEN_CODEX_SMOKE to authorize the single bounded live smoke (<= USD 0.20)'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  codex-live-smoke:
+    if: ${{ github.event.inputs.confirm == 'RUN_FROZEN_CODEX_SMOKE' }}
+    runs-on: ubuntu-latest
+    environment: gate8-live-smoke
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aidan
+          POSTGRES_PASSWORD: aidan
+          POSTGRES_DB: aidan_codex_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aidan"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_codex_smoke
+      CONFIRM: ${{ github.event.inputs.confirm }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install pinned Codex CLI (0.151.0)
+        run: npm install -g @openai/codex@0.151.0
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Apply migrations
+        run: python -m aidan_core.migrate
+
+      - name: Run the frozen bounded live Codex smoke (exactly one attempt)
+        env:
+          WORKER_CODEX_API_KEY: ${{ secrets.WORKER_CODEX_API_KEY }}
+        run: python -m aidan_core.factory.codex_live_smoke

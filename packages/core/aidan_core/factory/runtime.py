@@ -32,9 +32,11 @@ from ..errors import (
     ApprovalRequiredError,
     ExecutionBlockedError,
     NotFoundError,
+    ProviderExecutionFailure,
     WorkerTimeoutError,
 )
 from . import artifacts as artifacts_mod
+from . import provider_cost
 from . import spec as spec_mod
 from . import test_execution
 from . import verifiers as verifiers_mod
@@ -99,6 +101,36 @@ def _record_ambiguous_recovery_required(conn, action_id, attempt_id, detail):
             payload={"attempt_id": str(attempt_id), **(detail or {})},
         )
     return "RECOVERY_REQUIRED"
+
+
+def _record_cost_bearing_failure(conn, action_id, attempt_id, exc, *, actor):
+    """Terminal failure of a PAID provider that WAS invoked: preserve the true FAILED/TIMEOUT
+    class while conservatively reconciling any possibly-incurred cost against the frozen action
+    ceiling — commit a kernel-derived bounded ESTIMATE when trusted usage exists, else the full
+    remaining ceiling. Capital is never released as zero here, and RECOVERY_REQUIRED is NOT used
+    (the outcome is known; only the exact bill is uncertain). Terminal: no paid retry."""
+    with db.transaction(conn) as cur:
+        cur.execute("SELECT requested_amount FROM action_request WHERE id = %s", (action_id,))
+        row = cur.fetchone()
+        ceiling = row[0] if row else None
+        state = budget._capital_state(cur, action_id)
+        committed_cost = None
+        if ceiling is not None and "RESERVE" in state and "COMMIT" not in state:
+            cost, classification = provider_cost.estimate_cost(exc.model, exc.usage, ceiling=ceiling)
+            budget.reconcile_completion(cur, action_id, cost, actor=actor)   # commit cost, release unused
+            committed_cost = str(cost)
+        cur.execute(
+            "UPDATE execution_attempt SET status = 'FAILED', failure_class = %s, "
+            "finished_at = now(), updated_at = now() WHERE id = %s",
+            (exc.failure_class, attempt_id),
+        )
+        execution._set_status(cur, action_id, "FAILED", actor=actor, reason=exc.failure_class)
+        audit.record_event(
+            cur, event_type="factory.provider_cost_bearing_failure", actor=actor, action_id=action_id,
+            payload={"attempt_id": str(attempt_id), "failure_class": exc.failure_class,
+                     "code": str(exc), "committed_cost": committed_cost},
+        )
+    return "FAILED"
 
 
 def request_dispatch_authorization(
@@ -224,6 +256,14 @@ def execute_action(
     started = clock()
     try:
         result = adapter.execute(request)
+    except ProviderExecutionFailure as exc:
+        # A paid provider was invoked and failed/timed out with a KNOWN outcome: keep the true
+        # FAILED/TIMEOUT class and conservatively reconcile possibly-incurred cost (never release
+        # to zero, never RECOVERY_REQUIRED for mere cost uncertainty). Terminal: no paid retry.
+        to_state = _record_cost_bearing_failure(
+            conn, action_request_id, handle.attempt_id, exc, actor=actor)
+        return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
+                             to_state, dispatched=True, failure_class=exc.failure_class)
     except AmbiguousExternalEffectError as exc:
         # The consequential external boundary was crossed ambiguously and could not be reconciled.
         # This must NEVER auto-retry: fail CLOSED into RECOVERY_REQUIRED (not auto-claimable), so a

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from aidan_core.errors import AmbiguousExternalEffectError, BuildAuthorityError, WorkerTimeoutError
+from aidan_core.errors import BuildAuthorityError, ProviderExecutionFailure, WorkerTimeoutError
 from aidan_core.factory import codex_worker as cw
 from aidan_core.factory.codex_worker import CodexAdapterError, CodexExecWorker, CodexProcessResult
 from aidan_core.factory.workers import WorkerRequest
@@ -181,16 +181,17 @@ def test_artifact_path_format_rejected_pre_invocation(tmp_path, paths, code):
     assert fake.calls == []                       # provider never invoked
 
 
-# Output-dependent artifact failures are POST-invocation -> ambiguous (reservation held).
+# Output-dependent artifact failures are POST-invocation -> known WORKER_ERROR + cost-bearing.
 @pytest.mark.parametrize("fake,paths", [
     (FakeCodex(), ["missing.py"]),                                  # provider produced no file
     (FakeCodex(writes={"outdir/x": "y"}), ["outdir"]),             # a directory
     (FakeCodex(writes={"candidate.py": b"\xff\xfe\x00bin"}), ["candidate.py"]),   # non-utf8
     (FakeCodex(writes={"candidate.py": "#" * (cw._MAX_ARTIFACT_BYTES + 1)}), ["candidate.py"]),  # oversized
 ])
-def test_output_dependent_artifact_failures_are_ambiguous(tmp_path, fake, paths):
-    with pytest.raises(AmbiguousExternalEffectError):
+def test_output_dependent_artifact_failures_are_cost_bearing_worker_error(tmp_path, fake, paths):
+    with pytest.raises(ProviderExecutionFailure) as ei:
         _run(fake, tmp_path, artifact_paths=paths)
+    assert ei.value.failure_class == "WORKER_ERROR" and ei.value.model == "gpt-5-mini"
     assert fake.calls != []                       # provider WAS invoked (cost may exist)
 
 
@@ -228,15 +229,16 @@ def test_token_usage_absent_when_not_reported(tmp_path):
 
 def test_undocumented_event_aliases_are_not_terminal(tmp_path):
     # session.created / response.completed are NOT documented codex-exec events -> no terminal.
-    # This is POST-invocation, so it is ambiguous (the provider ran and may have billed).
+    # POST-invocation known failure (WORKER_ERROR + cost-bearing), NOT RECOVERY_REQUIRED.
     fake = FakeCodex(writes={"candidate.py": "x=1\n"},
                      events=[{"type": "session.created", "id": "s"}, {"type": "response.completed"}])
-    with pytest.raises(AmbiguousExternalEffectError):
+    with pytest.raises(ProviderExecutionFailure) as ei:
         _run(fake, tmp_path)
+    assert ei.value.failure_class == "WORKER_ERROR"
 
 
-# Every POST-invocation failure is ambiguous -> RECOVERY_REQUIRED (reservation held), never a
-# zero-cost release, since the paid provider may already have consumed tokens.
+# Every POST-invocation failure is a KNOWN-outcome WORKER_ERROR that bears possible cost — never a
+# zero-cost release and never RECOVERY_REQUIRED for mere cost uncertainty.
 @pytest.mark.parametrize("fake", [
     FakeCodex(exit_code=1),
     FakeCodex(raw_stdout="not json at all"),
@@ -245,20 +247,32 @@ def test_undocumented_event_aliases_are_not_terminal(tmp_path):
     FakeCodex(events=[{"type": "turn.failed"}]),
     FakeCodex(events=[{"type": "error"}]),
 ])
-def test_post_invocation_failures_are_ambiguous(tmp_path, fake):
+def test_post_invocation_failures_are_cost_bearing_worker_error(tmp_path, fake):
     fake.writes = {"candidate.py": "x=1\n"}
-    with pytest.raises(AmbiguousExternalEffectError):
+    with pytest.raises(ProviderExecutionFailure) as ei:
         _run(fake, tmp_path)
+    assert ei.value.failure_class == "WORKER_ERROR"
     assert fake.calls != []
+
+
+def test_known_failure_preserves_trusted_usage_for_cost(tmp_path):
+    # turn.failed carrying usage -> the trusted usage survives to the factory for cost derivation.
+    fake = FakeCodex(writes={"candidate.py": "x=1\n"},
+                     events=[{"type": "turn.failed", "usage": {"input_tokens": 900, "output_tokens": 100}}])
+    with pytest.raises(ProviderExecutionFailure) as ei:
+        _run(fake, tmp_path)
+    assert ei.value.failure_class == "WORKER_ERROR"
+    assert ei.value.usage == {"input_tokens": 900, "output_tokens": 100} and ei.value.model == "gpt-5-mini"
 
 
 # ---- timeout ----------------------------------------------------------------
 
-def test_post_invocation_timeout_is_ambiguous_not_zero_cost(tmp_path):
-    # A timeout AFTER the provider was invoked may have billed tokens -> ambiguous (held),
-    # never a plain retryable TIMEOUT that releases capital as if unspent.
-    with pytest.raises(AmbiguousExternalEffectError):
+def test_post_invocation_timeout_is_cost_bearing_timeout(tmp_path):
+    # A timeout AFTER invocation keeps its TRUE TIMEOUT class and is cost-bearing (no usage) —
+    # never a zero-cost release, never RECOVERY_REQUIRED.
+    with pytest.raises(ProviderExecutionFailure) as ei:
         _run(FakeCodex(raise_exc=WorkerTimeoutError("CODEX_TIMEOUT")), tmp_path)
+    assert ei.value.failure_class == "TIMEOUT" and ei.value.usage is None and ei.value.model == "gpt-5-mini"
 
 
 # ---- behavioural candidates (unit-level: captured bytes verbatim) -----------

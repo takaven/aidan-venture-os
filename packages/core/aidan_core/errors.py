@@ -58,6 +58,23 @@ class AmbiguousExternalEffectError(AidanCoreError):
     eventually-consistent provider search is NOT proof the effect did not occur."""
 
 
+class ProviderExecutionFailure(AidanCoreError):
+    """A PAID provider was invoked and produced a KNOWN-outcome failure/timeout — NOT a genuinely
+    ambiguous *consequential* external effect. The action keeps its true FAILED/TIMEOUT
+    classification (it is never coerced into RECOVERY_REQUIRED merely because money may have been
+    spent), and the factory conservatively reconciles any possibly-incurred provider cost against
+    the frozen action ceiling BEFORE the failure transition: a kernel-derived bounded ESTIMATE when
+    trusted provider-reported usage is available, otherwise the full remaining ceiling — never
+    releasing possible spend as zero. It is terminal for the paid attempt (no paid retry after
+    invocation). Carries only bounded, trusted fields (no worker/task self-report authority)."""
+
+    def __init__(self, message, *, failure_class, model=None, usage=None):
+        super().__init__(message)
+        self.failure_class = failure_class    # "TIMEOUT" | "WORKER_ERROR" (the true outcome class)
+        self.model = model                    # frozen model, for kernel-owned pricing
+        self.usage = usage                    # provider-reported usage dict, or None
+
+
 class WorkerTimeoutError(AidanCoreError):
     """A worker adapter's own execution exceeded its bounded deadline and the adapter
     terminated the entire process tree WITHOUT capturing any result. The factory runtime

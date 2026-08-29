@@ -32,6 +32,7 @@ from ..errors import (
     ApprovalRequiredError,
     ExecutionBlockedError,
     NotFoundError,
+    WorkerTimeoutError,
 )
 from . import artifacts as artifacts_mod
 from . import spec as spec_mod
@@ -231,6 +232,17 @@ def execute_action(
             conn, action_request_id, handle.attempt_id, {"error_type": type(exc).__name__})
         return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
                              to_state, dispatched=True, failure_class="AMBIGUOUS_EXTERNAL_EFFECT")
+    except WorkerTimeoutError as exc:
+        # The adapter's own bounded execution timed out; it terminated its process tree and
+        # captured NO result. This is a canonical TIMEOUT (retryable under existing policy),
+        # NOT a generic WORKER_ERROR — a blocking/hung provider process is distinguishable and
+        # no timed-out output is captured. Retry authority stays with _decide_failure/policy.
+        to_state, final_class = _record_failure(
+            conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,
+            "TIMEOUT", {"error_type": type(exc).__name__},
+        )
+        return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
+                             to_state, dispatched=True, failure_class=final_class)
     except Exception as exc:  # a worker fault is a classified machine failure, not a crash
         to_state, final_class = _record_failure(
             conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,

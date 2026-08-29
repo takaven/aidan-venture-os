@@ -58,6 +58,15 @@ class AmbiguousExternalEffectError(AidanCoreError):
     eventually-consistent provider search is NOT proof the effect did not occur."""
 
 
+class WorkerTimeoutError(AidanCoreError):
+    """A worker adapter's own execution exceeded its bounded deadline and the adapter
+    terminated the entire process tree WITHOUT capturing any result. The factory runtime
+    classifies this as a canonical ``TIMEOUT`` attempt failure (retryable under existing
+    policy) — never a generic ``WORKER_ERROR`` — so a blocking/hung provider process is
+    distinguishable, and no timed-out output is ever captured. The adapter performs no
+    retries of its own; retry authority stays entirely with the factory/kernel."""
+
+
 class ApprovalRequiredError(AidanCoreError):
     """No valid, non-expired approval exists for the current policy state."""
 

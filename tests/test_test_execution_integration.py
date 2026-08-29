@@ -80,7 +80,7 @@ def test_proof_receipt_records_test_execution_type(migrated):
 def _evidence_event(conn, aid):
     with conn.cursor() as cur:
         cur.execute("SELECT payload FROM audit_event WHERE action_id = %s "
-                    "AND event_type = 'factory.test_execution_evidence' ORDER BY created_at DESC LIMIT 1",
+                    "AND event_type = 'factory.test_execution_evidence' ORDER BY occurred_at DESC LIMIT 1",
                     (aid,))
         row = cur.fetchone()
     return row[0] if row else None

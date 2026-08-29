@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..build import workspace as ws
-from ..errors import AmbiguousExternalEffectError, WorkerTimeoutError
+from ..errors import ProviderExecutionFailure, WorkerTimeoutError
 from .workers import WorkerRequest, WorkerResult
 
 WORKER_KIND = "codex-exec"
@@ -164,13 +164,15 @@ class CodexExecWorker:
         if not bin_path:
             raise CodexAdapterError("CODEX_BINARY_MISSING")
 
-        # Everything ABOVE this point is a pre-invocation guard: the provider was never
-        # invoked, so a failure here is a plain WORKER_ERROR and the reservation may be safely
-        # released (no billable effect). Everything from the transport call onward is
-        # POST-invocation: the paid provider may already have consumed tokens, so ANY failure
-        # (timeout, non-zero exit, malformed/absent terminal, bad artifact) is treated as an
-        # ambiguous external effect -> the factory records RECOVERY_REQUIRED and HOLDS the
-        # reservation (UNKNOWN COST != ZERO COST); it is never released as if cost were zero.
+        # Everything ABOVE this point is a pre-invocation guard: the provider was never invoked,
+        # so a failure here is a plain WORKER_ERROR (CodexAdapterError) and the reservation may be
+        # safely released (no billable effect). Everything from the transport call onward is
+        # POST-invocation: the paid provider may already have consumed tokens. A coding worker's
+        # effect (files in a disposable workspace) is NOT a consequential/ambiguous external
+        # effect, so a post-invocation failure keeps its TRUE outcome class (TIMEOUT/WORKER_ERROR)
+        # and is raised as ProviderExecutionFailure carrying the frozen model + any trusted usage;
+        # the factory then conservatively reconciles cost against the frozen ceiling instead of
+        # releasing it as zero. RECOVERY_REQUIRED is NOT used for mere cost uncertainty.
         with tempfile.TemporaryDirectory(prefix="codex-iso-") as base:
             home = os.path.join(base, "home")
             tmpdir = os.path.join(base, "tmp")
@@ -182,19 +184,23 @@ class CodexExecWorker:
             try:
                 result = self._transport(argv, prompt, env, workspace, int(request.timeout_seconds or 120))
             except WorkerTimeoutError as exc:
-                # Timed out AFTER invocation: tokens may already be spent -> conservative.
-                raise AmbiguousExternalEffectError("CODEX_TIMEOUT_AFTER_INVOCATION") from exc
+                raise ProviderExecutionFailure(
+                    "CODEX_TIMEOUT_AFTER_INVOCATION", failure_class="TIMEOUT", model=model, usage=None) from exc
 
+            session_id, usage, status = self._parse_events(result.stdout)
+            if result.exit_code != 0:
+                raise ProviderExecutionFailure(
+                    "CODEX_NONZERO_EXIT", failure_class="WORKER_ERROR", model=model, usage=usage)
+            if status != "SUCCESS":
+                code = {"FAILURE": "CODEX_TURN_FAILED", "NO_TERMINAL": "CODEX_NO_TERMINAL_EVENT",
+                        "MALFORMED": "CODEX_MALFORMED_EVENT", "NO_EVENTS": "CODEX_NO_EVENTS"}[status]
+                raise ProviderExecutionFailure(code, failure_class="WORKER_ERROR", model=model, usage=usage)
             try:
-                if result.exit_code != 0:
-                    raise CodexAdapterError("CODEX_NONZERO_EXIT")   # sanitized; no stderr/secret
-                session_id, terminal_ok, usage = self._parse_events(result.stdout)
-                if not terminal_ok:
-                    raise CodexAdapterError("CODEX_NO_TERMINAL_EVENT")
                 artifacts = self._capture_artifacts(workspace, artifact_paths)
             except CodexAdapterError as exc:
-                # The provider ran; its cost is unknown -> do NOT let capital be released as zero.
-                raise AmbiguousExternalEffectError(str(exc)) from exc
+                # The provider ran and produced bad/absent output: known failure with possible cost.
+                raise ProviderExecutionFailure(str(exc), failure_class="WORKER_ERROR",
+                                               model=model, usage=usage) from exc
 
         external_result_id = self._result_id(request, session_id, artifacts)
         structured = {"exit_code": 0, "terminal": "completed", "artifact_count": len(artifacts)}
@@ -213,10 +219,14 @@ class CodexExecWorker:
 
     # ---- documented JSONL event parsing (only documented Codex event types) -----------
     def _parse_events(self, stdout: str):
+        """Parse the documented Codex JSONL stream. Returns ``(session_id, usage, status)`` where
+        status is SUCCESS | FAILURE | NO_TERMINAL | MALFORMED | NO_EVENTS. Never raises — trusted
+        provider-reported usage (from EITHER terminal event, when present) survives to the caller
+        so cost can be reconciled even on a known failure."""
         session_id = None
         usage = None
-        saw_terminal_success = False
-        saw_terminal_failure = False
+        saw_success = False
+        saw_failure = False
         any_event = False
         for line in (stdout or "").splitlines():
             line = line.strip()
@@ -224,10 +234,10 @@ class CodexExecWorker:
                 continue
             try:
                 ev = json.loads(line)
-            except Exception as exc:
-                raise CodexAdapterError("CODEX_MALFORMED_EVENT") from exc
+            except Exception:
+                return session_id, usage, "MALFORMED"
             if not isinstance(ev, dict):
-                raise CodexAdapterError("CODEX_MALFORMED_EVENT")
+                return session_id, usage, "MALFORMED"
             any_event = True
             etype = ev.get("type")
             # Documented Codex exec event stream: thread.started, turn.started, turn.completed,
@@ -236,16 +246,23 @@ class CodexExecWorker:
                 sid = ev.get("thread_id")
                 if isinstance(sid, str) and sid:
                     session_id = sid
-            elif etype == "turn.completed":
-                saw_terminal_success = True
-                usage = self._extract_usage(ev.get("usage"))
-            elif etype in ("turn.failed", "error"):
-                saw_terminal_failure = True
+            elif etype in ("turn.completed", "turn.failed"):
+                u = self._extract_usage(ev.get("usage"))
+                if u is not None:
+                    usage = u
+                if etype == "turn.completed":
+                    saw_success = True
+                else:
+                    saw_failure = True
+            elif etype == "error":
+                saw_failure = True
         if not any_event:
-            raise CodexAdapterError("CODEX_NO_EVENTS")
-        if saw_terminal_failure:
-            raise CodexAdapterError("CODEX_TURN_FAILED")
-        return session_id, saw_terminal_success, usage
+            return session_id, usage, "NO_EVENTS"
+        if saw_failure:
+            return session_id, usage, "FAILURE"
+        if saw_success:
+            return session_id, usage, "SUCCESS"
+        return session_id, usage, "NO_TERMINAL"
 
     @staticmethod
     def _extract_usage(raw):

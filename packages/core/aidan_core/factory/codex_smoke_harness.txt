@@ -1,0 +1,25 @@
+import json
+import sys
+
+sys.path.insert(0, "/candidate")
+import candidate
+
+CASES = [
+    ("Hello, World!", "hello-world"),
+    ("  A__B  ", "a-b"),
+    ("Foo123Bar", "foo123bar"),
+    ("--already-slug--", "already-slug"),
+    ("Tabs\tand\nnewlines", "tabs-and-newlines"),
+]
+
+total = 0
+passed = 0
+for text, want in CASES:
+    total += 1
+    try:
+        if candidate.slugify(text) == want:
+            passed += 1
+    except Exception:
+        pass
+
+print(json.dumps({"result": "PASS" if passed == total else "FAIL", "total": total, "passed": passed}))

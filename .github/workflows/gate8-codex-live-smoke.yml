@@ -38,6 +38,12 @@ jobs:
     env:
       DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_codex_smoke
       CONFIRM: ${{ github.event.inputs.confirm }}
+      # Trusted canonical OS-repository identity for the INSTALLED runtime. Without this, a
+      # pip-installed package has no source sibling to fall back on, so the fail-closed
+      # workspace guard (require_canonical=True) refuses to run. It is host/runtime-owned here
+      # (never a workflow input / task payload / worker), and the disposable venture workspace
+      # is a system-temp dir OUTSIDE the checkout, so it is still accepted.
+      AIDAN_OS_REPO_ROOT: ${{ github.workspace }}
 
     steps:
       - name: Checkout

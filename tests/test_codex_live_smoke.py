@@ -113,6 +113,31 @@ def test_H_correct_candidate_verifies_and_reconciles(migrated, _codex):
     assert Decimal(ev["committed"]) <= cls.CEILING and Decimal(ev["reserved"]) == Decimal("0.0000")
 
 
+# ---- installed-runtime regression (the source dry-runs missed this class) ----
+# Live run #1 failed because, from a pip-installed package with no AIDAN_OS_REPO_ROOT,
+# canonical_os_repo_root() is None and the fail-closed guard refuses BEFORE the provider.
+
+def test_installed_condition_no_canonical_root_fails_before_provider(migrated, _codex, monkeypatch):
+    monkeypatch.delenv("AIDAN_OS_REPO_ROOT", raising=False)
+    monkeypatch.setattr("aidan_core.factory.codex_worker.ws.canonical_os_repo_root", lambda: None)
+    ev = cls.run_smoke(migrated, transport=FakeCodex(src=CORRECT), slug="cx-inst-red")
+    assert ev["result"] == "FAIL" and ev["provider_invocations"] == 0    # guard fired before transport
+    assert ev["committed"] == "0.0000"                                    # zero spend, released
+
+
+@pytest.mark.skipif(not te.bwrap_available(), reason="bwrap not available (non-Linux/dev)")
+def test_installed_condition_with_trusted_root_reaches_provider_and_verifies(migrated, _codex, monkeypatch, tmp_path):
+    canonical = tmp_path / "os-repo"
+    canonical.mkdir()
+    monkeypatch.setenv("AIDAN_OS_REPO_ROOT", str(canonical))              # host-supplied trusted root (the fix)
+    usage = {"input_tokens": 25000, "output_tokens": 8000}
+    ev = cls.run_smoke(migrated, transport=FakeCodex(
+        src=CORRECT, events=[{"type": "thread.started", "thread_id": "th"},
+                             {"type": "turn.completed", "usage": usage}]), slug="cx-inst-green")
+    assert ev["provider_invocations"] == 1 and ev["result"] == "PASS"
+    assert ev["test_execution_verdict"] == "VERIFIED" and ev["governance_deltas"] == 0
+
+
 @pytest.mark.skipif(not te.bwrap_available(), reason="bwrap not available (non-Linux/dev)")
 def test_I_wrong_candidate_rejected(migrated, _codex):
     ev = cls.run_smoke(migrated, transport=FakeCodex(

@@ -30,6 +30,7 @@ from .. import audit, budget, db, execution, policy, proof
 from ..errors import (
     AmbiguousExternalEffectError,
     ApprovalRequiredError,
+    DeployAdapterError,
     ExecutionBlockedError,
     NotFoundError,
     ProviderExecutionFailure,
@@ -278,6 +279,16 @@ def execute_action(
             conn, action_request_id, handle.attempt_id, {"error_type": type(exc).__name__})
         return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
                              to_state, dispatched=True, failure_class="AMBIGUOUS_EXTERNAL_EFFECT")
+    except DeployAdapterError as exc:
+        # A DEFINITIVE, no-effect deploy failure (pre-transport guard, definitive provider rejection,
+        # or a timeout proven to be before the request was sent): no external effect, no cost. Ordinary
+        # WORKER_ERROR (capital released), carrying only the bounded static code.
+        to_state, final_class = _record_failure(
+            conn, action_request_id, handle.attempt_id, handle.attempt_number, max_attempts,
+            "WORKER_ERROR", {"deploy_code": exc.code},
+        )
+        return RuntimeResult(str(action_request_id), str(handle.attempt_id), worker_kind,
+                             to_state, dispatched=True, failure_class=final_class)
     except WorkerTimeoutError as exc:
         # The adapter's own bounded execution timed out; it terminated its process tree and
         # captured NO result. This is a canonical TIMEOUT (retryable under existing policy),

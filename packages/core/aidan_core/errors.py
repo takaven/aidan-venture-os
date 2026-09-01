@@ -202,6 +202,20 @@ class DeployAuthorityError(AidanCoreError):
     """
 
 
+class DeployAdapterError(AidanCoreError):
+    """A deploy WorkerAdapter failed DEFINITIVELY with NO consequential external effect — a
+    pre-transport guard (missing credential/frozen digest/target), a definitive provider rejection
+    (e.g. a 4xx create rejection where no machine was created), or a timeout proven to be BEFORE the
+    request was transmitted. The factory maps it to an ordinary WORKER_ERROR (capital released; no
+    provider effect, no cost). It is NOT for ambiguous effects (use AmbiguousExternalEffectError ->
+    RECOVERY_REQUIRED) nor for a known outcome that MAY have incurred cost (use
+    ProviderExecutionFailure). Carries only a bounded, static code — never a raw provider response."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.code = str(message)      # bounded static code, e.g. FLY_AUTH_MISSING
+
+
 class MarketAuthorityError(AidanCoreError):
     """A Gate 7 market-action-authority boundary was violated.
 

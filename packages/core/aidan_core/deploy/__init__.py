@@ -25,9 +25,11 @@ from .state import (
     promote_verified_deployment,
     verified_deployment,
 )
+from .fly_worker import FlyMachinesWorker
 from .observe import (
     DeploymentObservation,
     DeploymentObserver,
+    FlyDeploymentObserver,
     LocalTargetObserver,
     ObservedFile,
     observed_tree_hash,
@@ -41,6 +43,8 @@ __all__ = [
     "get_deployment_target",
     "DeploymentObservation",
     "DeploymentObserver",
+    "FlyDeploymentObserver",
+    "FlyMachinesWorker",
     "LocalTargetObserver",
     "ObservedFile",
     "observed_tree_hash",

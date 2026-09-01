@@ -51,6 +51,10 @@ class DeploymentObservation:
     health_marker: Optional[str]            # observed health signal (marker/probe), or None if absent
     target_present: bool = True             # whether the deployment target could be read back at all
     contact: str = CONTACT_UNKNOWN          # OBSERVED | NOT_OBSERVED | UNKNOWN
+    # External-artifact read-back (digest mode): the immutable image digest actually running, and the
+    # observed runtime state. None on the local-tree path (which uses ``files`` instead).
+    artifact_identity: Optional[str] = None
+    running_state: Optional[str] = None
 
 
 @runtime_checkable
@@ -107,3 +111,55 @@ class LocalTargetObserver:
             target_present=present,
             contact=CONTACT_OBSERVED if present else CONTACT_UNKNOWN,
         )
+
+
+class FlyDeploymentObserver:
+    """Independent, READ-ONLY read-back of a Fly Machine (digest mode). It never consults the deploy
+    worker's result: it GETs the machine under the FROZEN venture-owned app and reports the observed
+    image digest + running state, and probes the external health endpoint. The verifier compares the
+    observed digest to the frozen ``expected_artifact_identity`` — Fly saying ``started`` is not by
+    itself Proof Receipt authority.
+
+    ``fly_transport(method, path, *, token, timeout) -> FlyResponse`` (raises ``FlyTransportError``)
+    and ``health_probe() -> Optional[str]`` are injectable seams; the real ones do read-only HTTP.
+    The bearer token is passed per call and never stored on the observation.
+    """
+
+    def __init__(self, *, fly_transport, token, app, machine_id, venture_id, deployment_target_id,
+                 health_probe=None, required_state="started", timeout=30.0):
+        self._transport = fly_transport
+        self._token = token
+        self._app = app
+        self._machine_id = machine_id
+        self._venture_id = venture_id
+        self._tid = deployment_target_id
+        self._health_probe = health_probe
+        self._required_state = required_state
+        self._timeout = timeout
+
+    def observe(self) -> DeploymentObservation:
+        from .fly_transport import FlyTransportError
+        identity = f"fly-machines/{self._venture_id}/{self._tid}/{self._app}"
+        try:
+            resp = self._transport(
+                "GET", f"/apps/{self._app}/machines/{self._machine_id}",
+                token=self._token, timeout=self._timeout)
+        except FlyTransportError:
+            # Could not reach Fly to read back -> contact UNKNOWN, nothing observed. Fail-closed.
+            return DeploymentObservation(identity, (), None, target_present=False,
+                                         contact=CONTACT_UNKNOWN)
+        # An HTTP status response is provider contact.
+        if resp.status != 200:
+            # 404 = machine not found under the frozen app (wrong/missing target); other 4xx/5xx too.
+            return DeploymentObservation(identity, (), None, target_present=False,
+                                         contact=CONTACT_OBSERVED)
+        body = resp.body or {}
+        state = body.get("state")
+        digest = ((body.get("image_ref") or {}).get("digest")) or None
+        present = bool(body.get("id"))
+        health = self._health_probe() if (present and state == self._required_state
+                                          and self._health_probe) else None
+        return DeploymentObservation(
+            isolation_identity=identity, files=(), health_marker=health,
+            target_present=present, contact=CONTACT_OBSERVED,
+            artifact_identity=digest, running_state=state)

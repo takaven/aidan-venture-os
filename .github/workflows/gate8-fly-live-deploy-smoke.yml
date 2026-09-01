@@ -1,0 +1,73 @@
+name: Gate 8 Fly Live Deploy Smoke
+
+# MANUAL ONLY. One authorized dispatch -> at most one real Fly machine create (max_attempts=1). No
+# push / pull_request / schedule / workflow_run trigger, and NO retry. The deploy governs an already
+# quality-qualified, frozen release_candidate whose immutable expected_artifact_identity (OCI digest)
+# is the release authority; the running digest is read back INDEPENDENTLY and promotion happens only
+# from a VERIFIED DEPLOYMENT_RELEASE proof. Spend is bounded to USD 0.05. Ambiguous effects fail
+# closed into RECOVERY_REQUIRED (never blind-retried). Sanitized evidence only — no credential, no
+# raw provider response. NOT auto-dispatched; requires the explicit confirmation token below.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_FROZEN_FLY_DEPLOY_SMOKE to authorize the single bounded live deploy (<= USD 0.05)'
+        required: true
+        default: ''
+      deploy_action_id:
+        description: 'The deploy ActionRequest id whose frozen fly-machines release_candidate is to be deployed'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  fly-live-deploy-smoke:
+    if: ${{ github.event.inputs.confirm == 'RUN_FROZEN_FLY_DEPLOY_SMOKE' }}
+    runs-on: ubuntu-latest
+    environment: gate8-fly-live-deploy
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aidan
+          POSTGRES_PASSWORD: aidan
+          POSTGRES_DB: aidan_fly_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aidan"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_fly_smoke
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      AIDAN_OS_REPO_ROOT: ${{ github.workspace }}
+      FLY_SMOKE_DEPLOY_ACTION_ID: ${{ github.event.inputs.deploy_action_id }}
+      FLY_SMOKE_HEALTH_PATH: healthz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Apply migrations
+        run: python -m aidan_core.migrate
+
+      - name: Run the frozen bounded live Fly deploy smoke (exactly one attempt)
+        env:
+          # Invocation-scoped, app-scoped Fly deploy token. Host-mapped into this step only; never
+          # persisted in canonical state and never printed.
+          DEPLOY_FLY_API_TOKEN: ${{ secrets.DEPLOY_FLY_API_TOKEN }}
+        run: python -m aidan_core.deploy.fly_live_smoke

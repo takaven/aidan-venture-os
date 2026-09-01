@@ -127,6 +127,48 @@ def evaluate_observation(observation: DeploymentObservation, *, venture_id, depl
     ]
 
 
+# ---- ARTIFACT-DIGEST mode (real external deploy; e.g. Fly image digest) --------------
+# When a release freezes an ``expected_artifact_identity`` (an immutable OCI digest), release
+# identity is proven by comparing the provider-read-back running digest to the frozen digest — the
+# deployed file tree cannot be re-hashed on a running-image provider. This is a PARALLEL 5-check set
+# to the local-tree one; the LOCAL path above is untouched (byte/evidence compatible).
+def _obs_target_present(observation: DeploymentObservation) -> CheckResult:
+    # Digest mode: the external target (machine) was read back and exists under the frozen app.
+    ok = bool(observation.target_present)
+    return CheckResult("TARGET_EXISTS", "PASS" if ok else "FAIL",
+                       {"target_present": bool(observation.target_present)})
+
+
+def _obs_runtime_state(observation: DeploymentObservation, required_state) -> CheckResult:
+    ok = observation.running_state is not None and observation.running_state == required_state
+    return CheckResult("RUNTIME_STATE", "PASS" if ok else "FAIL",
+                       {"required": required_state, "observed": observation.running_state})
+
+
+def _obs_artifact_identity(observation: DeploymentObservation, expected_artifact_identity) -> CheckResult:
+    from . import artifact as artifact_mod
+    ok = artifact_mod.identity_matches(expected_artifact_identity, observation.artifact_identity)
+    return CheckResult("ARTIFACT_IDENTITY", "PASS" if ok else "FAIL",
+                       {"expected": artifact_mod.expected_digest(expected_artifact_identity),
+                        "observed": observation.artifact_identity})
+
+
+def evaluate_artifact_observation(observation: DeploymentObservation, *, venture_id,
+                                  deployment_target_id, expected_artifact_identity,
+                                  release_contract, required_state="started") -> list:
+    """Digest-mode checks over an external read-back. VERIFIED requires ALL: venture/target
+    isolation, target exists, machine in the required running state, read-back digest equals the
+    frozen expected digest, and a bounded external health signal. Worker self-report is never used."""
+    rc = dict(release_contract or {})
+    return [
+        _obs_isolation(observation, venture_id, deployment_target_id),
+        _obs_target_present(observation),
+        _obs_runtime_state(observation, required_state),
+        _obs_artifact_identity(observation, expected_artifact_identity),
+        _obs_health(observation, rc.get("health_contract")),
+    ]
+
+
 # ---- backward-compatible LOCAL-path entry points (Slices 1-3) ------------------------
 def check_venture_isolation(target_path, venture_id, deployment_target_id) -> CheckResult:
     return _obs_isolation(LocalTargetObserver(target_path).observe(), venture_id, deployment_target_id)

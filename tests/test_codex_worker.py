@@ -112,11 +112,18 @@ def test_prompt_via_stdin_and_locked_flags(tmp_path):
     argv = call["argv"]
     assert call["stdin"] == "implement add(a,b)"
     assert "implement add(a,b)" not in " ".join(argv)
-    assert argv[1:4] == ["exec", "-", "--json"]
-    for tok in ("--model", "gpt-5-mini", "--sandbox", "workspace-write", "--ask-for-approval",
-                "never", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+    # --ask-for-approval is a GLOBAL codex option (not an `exec` option in 0.151.0) and MUST precede
+    # the subcommand; placing it after `exec` is rejected by clap (the live-smoke-#2 root cause).
+    assert argv[1:3] == ["--ask-for-approval", "never"]
+    ai = argv.index("--ask-for-approval")
+    ei = argv.index("exec")
+    assert ai < ei                                       # global flag strictly before the subcommand
+    assert argv[ei:ei + 3] == ["exec", "-", "--json"]    # exec options still follow the subcommand
+    for tok in ("--model", "gpt-5-mini", "--sandbox", "workspace-write",
+                "--ephemeral", "--ignore-user-config", "--ignore-rules",
                 "shell_environment_policy.ignore_default_excludes=false"):
         assert tok in argv
+        assert argv.index(tok) > ei                      # ...and after `exec`
     assert "--skip-git-repo-check" not in argv           # removed: git-repo safety kept
 
 
@@ -263,6 +270,29 @@ def test_known_failure_preserves_trusted_usage_for_cost(tmp_path):
         _run(fake, tmp_path)
     assert ei.value.failure_class == "WORKER_ERROR"
     assert ei.value.usage == {"input_tokens": 900, "output_tokens": 100} and ei.value.model == "gpt-5-mini"
+    assert ei.value.code == "CODEX_TURN_FAILED"
+
+
+# ---- HONEST provider-contact evidence + bounded diagnostic fields -----------
+# Crossing the subprocess boundary is NOT proof an OpenAI API request occurred. provider_contact
+# is OBSERVED only when a documented thread.started was actually parsed; else UNKNOWN.
+
+def test_nonzero_exit_without_thread_is_contact_unknown(tmp_path):
+    # The smoke-#2 shape: process exits non-zero with no terminal/thread event.
+    with pytest.raises(ProviderExecutionFailure) as ei:
+        _run(FakeCodex(writes={"candidate.py": "x=1\n"}, exit_code=4, events=[]), tmp_path)
+    assert ei.value.code == "CODEX_NONZERO_EXIT" and ei.value.process_exit_code == 4
+    assert ei.value.provider_contact == "UNKNOWN"      # boundary crossed, but no thread.started seen
+
+
+def test_nonzero_exit_after_thread_started_is_contact_observed(tmp_path):
+    # A thread WAS opened, then the process failed -> contact is genuinely OBSERVED.
+    fake = FakeCodex(writes={"candidate.py": "x=1\n"}, exit_code=7,
+                     events=[{"type": "thread.started", "thread_id": "th"}])
+    with pytest.raises(ProviderExecutionFailure) as ei:
+        _run(fake, tmp_path)
+    assert ei.value.code == "CODEX_NONZERO_EXIT" and ei.value.process_exit_code == 7
+    assert ei.value.provider_contact == "OBSERVED"
 
 
 # ---- timeout ----------------------------------------------------------------
@@ -273,6 +303,8 @@ def test_post_invocation_timeout_is_cost_bearing_timeout(tmp_path):
     with pytest.raises(ProviderExecutionFailure) as ei:
         _run(FakeCodex(raise_exc=WorkerTimeoutError("CODEX_TIMEOUT")), tmp_path)
     assert ei.value.failure_class == "TIMEOUT" and ei.value.usage is None and ei.value.model == "gpt-5-mini"
+    assert ei.value.code == "CODEX_TIMEOUT_AFTER_INVOCATION"
+    assert ei.value.provider_contact == "UNKNOWN" and ei.value.process_exit_code is None
 
 
 # ---- behavioural candidates (unit-level: captured bytes verbatim) -----------

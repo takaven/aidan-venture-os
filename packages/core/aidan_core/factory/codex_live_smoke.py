@@ -127,7 +127,13 @@ def run_smoke(conn, *, transport=None, workspace_ref=None, actor="codex-smoke",
 
     ev = {"smoke": "gate8-codex", "repo_sha": os.environ.get("GITHUB_SHA", "local"),
           "spec_hash": None, "harness_sha256": FROZEN_HARNESS_SHA256, "worker_kind": "codex-exec",
-          "codex_cli_version": CODEX_CLI_VERSION, "result": None, "provider_invocations": None}
+          "codex_cli_version": CODEX_CLI_VERSION, "result": None,
+          # HONEST OBSERVABILITY (do NOT conflate the two):
+          #   codex_process_invocations = times the Codex subprocess/transport boundary was crossed
+          #                               (proves the <=1 process invariant; NOT an API request).
+          #   provider_contact_evidence = OBSERVED only when a documented provider turn/session event
+          #                               was actually parsed; else NOT_OBSERVED / UNKNOWN.
+          "codex_process_invocations": None, "provider_contact_evidence": "UNKNOWN"}
 
     vid = ventures.create_venture(conn, slug=slug, autonomy_level=3)
     if grant:
@@ -147,13 +153,15 @@ def run_smoke(conn, *, transport=None, workspace_ref=None, actor="codex-smoke",
     reg.register(worker)
     workspace_ref = workspace_ref or _make_git_workspace()
 
+    # Count the Codex PROCESS/transport boundary on BOTH the real and fake paths. This proves the
+    # <=1 process invariant; it does NOT by itself prove an OpenAI API request occurred (see
+    # provider_contact_evidence, which is only OBSERVED when a documented thread.started is seen).
     counter = {"n": 0}
-    if transport is not None:
-        _orig = transport
-        def _counting(*a, **k):  # count real provider invocations for the <=1 invariant
-            counter["n"] += 1
-            return _orig(*a, **k)
-        reg.get("codex-exec")._transport = _counting
+    _orig = reg.get("codex-exec")._transport
+    def _counting(*a, **k):
+        counter["n"] += 1
+        return _orig(*a, **k)
+    reg.get("codex-exec")._transport = _counting
 
     try:
         r = runtime.execute_action(conn, aid, registry=reg, workspace_ref=workspace_ref, actor=actor)
@@ -161,10 +169,11 @@ def run_smoke(conn, *, transport=None, workspace_ref=None, actor="codex-smoke",
         # Blocked BEFORE any provider dispatch (e.g. the reservation cannot be made) -> the paid
         # provider is never reached. Report it; capital is untouched.
         blocked = "RESERVATION_FAILED" if "BUDGET" in str(exc).upper() else "BLOCKED_BEFORE_DISPATCH"
-        ev.update(result=blocked, provider_invocations=0)
+        # No transport call was ever made -> no process boundary crossed, no provider contact.
+        ev.update(result=blocked, codex_process_invocations=0, provider_contact_evidence="NOT_OBSERVED")
         return _finalize(conn, vid, aid, ev)
 
-    ev["provider_invocations"] = counter["n"] if transport is not None else None
+    ev["codex_process_invocations"] = counter["n"]
     ev["dispatch_status"] = r.action_status
     ev["failure_class"] = r.failure_class
 
@@ -194,10 +203,49 @@ def _finalize(conn, vid, aid, ev):
         # governance delta: research/factory smoke authors no investment/action/proof beyond its own
         cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (vid,))
         gov = cur.fetchone()[0]
+        # Surface the kernel-written provider-cost-bearing-failure audit event (bound to THIS action)
+        # BEFORE the ephemeral DB disappears. Only bounded, safe machine fields are lifted out; no raw
+        # stderr/transcript/secret is ever recorded there or here.
+        cur.execute("SELECT payload FROM audit_event WHERE action_id = %s "
+                    "AND event_type = 'factory.provider_cost_bearing_failure' "
+                    "ORDER BY occurred_at DESC LIMIT 1", (aid,))
+        cbf = cur.fetchone()
+        # A captured provider_thread_id is positive evidence the CLI opened a provider thread — even
+        # when the run later FAILs verification (terminal success, wrong candidate).
+        cur.execute("SELECT raw_payload FROM execution_result WHERE action_request_id = %s "
+                    "ORDER BY received_at DESC LIMIT 1", (aid,))
+        er = cur.fetchone()
+    thread_observed = bool(((er[0] or {}).get("structured_output", {}) if er else {}).get("provider_thread_id"))
     if pr is not None:
         ev["proof_receipt_id"], ev["proof_verification_type"] = str(pr[0]), pr[1]
         ev["proof_result"], ev["evidence_hash"] = pr[2], pr[3]
     ev["governance_deltas"] = gov
+
+    audit_contact = None
+    if cbf is not None:
+        p = cbf[0] or {}
+        ev["failure_code"] = p.get("code")
+        ev["process_exit_code"] = p.get("process_exit_code")
+        ev["usage_observed"] = bool(p.get("usage_observed"))
+        ev["cost_bearing_failure"] = True
+        audit_contact = p.get("provider_contact")
+    else:
+        ev["cost_bearing_failure"] = False
+
+    # Derive the honest provider_contact_evidence. OBSERVED requires a documented provider turn/session
+    # event: a cost-bearing failure that saw one, OR a genuine terminal SUCCEEDED (a terminal success
+    # event necessarily carried a session id + usage). Zero process crossings => NOT_OBSERVED. Anything
+    # else (process ran but no session/turn event parsed, e.g. an early nonzero exit) stays UNKNOWN —
+    # crossing the subprocess boundary is NOT proof an OpenAI API request occurred.
+    if ev.get("provider_contact_evidence") != "NOT_OBSERVED":
+        if audit_contact in ("OBSERVED", "NOT_OBSERVED", "UNKNOWN"):
+            ev["provider_contact_evidence"] = audit_contact
+        elif thread_observed or ev["final_status"] == "SUCCEEDED":
+            ev["provider_contact_evidence"] = "OBSERVED"
+        elif ev.get("codex_process_invocations") == 0:
+            ev["provider_contact_evidence"] = "NOT_OBSERVED"
+        else:
+            ev["provider_contact_evidence"] = "UNKNOWN"
     # secret-leak self check (values read in-process, only tested for absence)
     key = os.environ.get(API_KEY_ENV)
     ev["secret_leak_check"] = "FAIL" if (key and key in json.dumps(ev)) else "PASS"
@@ -238,9 +286,11 @@ def main() -> int:
         conn.close()
     print(json.dumps(ev, sort_keys=True))
     ok = (ev.get("result") == "PASS" and ev.get("secret_leak_check") == "PASS"
-          and ev.get("governance_deltas") == 0 and (ev.get("provider_invocations") or 0) <= 1)
-    sys.stderr.write(f"gate8 codex smoke: {ev.get('result')} verdict={ev.get('test_execution_verdict')} "
-                     f"committed={ev.get('committed')} invocations={ev.get('provider_invocations')}\n")
+          and ev.get("governance_deltas") == 0 and (ev.get("codex_process_invocations") or 0) <= 1)
+    sys.stderr.write(
+        f"gate8 codex smoke: {ev.get('result')} verdict={ev.get('test_execution_verdict')} "
+        f"committed={ev.get('committed')} codex_process_invocations={ev.get('codex_process_invocations')} "
+        f"provider_contact_evidence={ev.get('provider_contact_evidence')}\n")
     return 0 if ok else 4
 
 

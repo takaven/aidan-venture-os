@@ -139,3 +139,25 @@ def test_capital_isolated_per_venture(migrated, tmp_path):
     _dispatch(migrated, tmp_path, aidA, FakeTransport(events=[{"type": "turn.failed"}]))
     assert _budget(migrated, vidB) == (Decimal("0.0000"), Decimal("0.0000"))
     assert _budget(migrated, vidA) == (Decimal("0.0000"), CEIL)
+
+
+# (8) the cost-bearing-failure audit event persists ONLY bounded, safe machine fields, so a failed
+# live run stays diagnosable after the ephemeral DB is gone — no raw stderr/transcript/secret.
+def test_cost_bearing_failure_audit_event_carries_safe_fields(migrated, tmp_path):
+    vid, aid, _ = _codex_action(migrated, "cx-audit")
+    # exit 4 with no terminal/thread event: the smoke-#2 shape.
+    _dispatch(migrated, tmp_path, aid, FakeTransport(exit_code=4, events=[]))
+    with migrated.cursor() as cur:
+        cur.execute("SELECT payload FROM audit_event WHERE action_id = %s "
+                    "AND event_type = 'factory.provider_cost_bearing_failure' "
+                    "ORDER BY occurred_at DESC LIMIT 1", (aid,))
+        payload = cur.fetchone()[0]
+    assert payload["code"] == "CODEX_NONZERO_EXIT"
+    assert payload["failure_class"] == "WORKER_ERROR"
+    assert payload["provider_contact"] == "UNKNOWN"     # boundary crossed != provider request proven
+    assert payload["process_exit_code"] == 4
+    assert payload["usage_observed"] is False
+    assert payload["committed_cost"] == "1.0000"        # conservative full ceiling
+    # No unbounded/raw fields leaked into the audit payload.
+    assert set(payload) == {"attempt_id", "failure_class", "code", "committed_cost",
+                            "provider_contact", "process_exit_code", "usage_observed"}

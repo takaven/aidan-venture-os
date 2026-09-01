@@ -127,8 +127,14 @@ def _record_cost_bearing_failure(conn, action_id, attempt_id, exc, *, actor):
         execution._set_status(cur, action_id, "FAILED", actor=actor, reason=exc.failure_class)
         audit.record_event(
             cur, event_type="factory.provider_cost_bearing_failure", actor=actor, action_id=action_id,
-            payload={"attempt_id": str(attempt_id), "failure_class": exc.failure_class,
-                     "code": str(exc), "committed_cost": committed_cost},
+            payload={
+                "attempt_id": str(attempt_id), "failure_class": exc.failure_class,
+                "code": getattr(exc, "code", str(exc)), "committed_cost": committed_cost,
+                # Bounded, safe diagnostics — no raw stderr/transcript/secret.
+                "provider_contact": getattr(exc, "provider_contact", "UNKNOWN"),
+                "process_exit_code": getattr(exc, "process_exit_code", None),
+                "usage_observed": bool(getattr(exc, "usage", None)),
+            },
         )
     return "FAILED"
 

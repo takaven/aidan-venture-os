@@ -181,8 +181,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
+      - name: Install pinned Codex CLI (0.151.0)
+        run: npm install -g @openai/codex@0.151.0
+
+      - name: Assert pinned Codex version
+        run: |
+          v="$(codex --version | head -1)"
+          echo "codex version: $v"
+          test "$v" = "codex-cli 0.151.0" || { echo "FAIL: expected codex-cli 0.151.0"; exit 1; }
 
       - name: Verify Codex CLI command-surface contract (no auth, no model call)
         run: python packages/core/tools/verify_codex_cli_contract.py
+
+      - name: Falsify the EXACT production argv parses (no credential, no provider request)
+        run: python packages/core/tools/verify_codex_argv.py

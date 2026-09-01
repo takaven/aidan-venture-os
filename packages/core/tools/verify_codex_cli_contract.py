@@ -23,6 +23,7 @@ REQUIRED = [
     "--ephemeral",
     "--ignore-user-config",
     "--ignore-rules",
+    "-c",
 ]
 
 

@@ -59,20 +59,26 @@ class AmbiguousExternalEffectError(AidanCoreError):
 
 
 class ProviderExecutionFailure(AidanCoreError):
-    """A PAID provider was invoked and produced a KNOWN-outcome failure/timeout — NOT a genuinely
-    ambiguous *consequential* external effect. The action keeps its true FAILED/TIMEOUT
-    classification (it is never coerced into RECOVERY_REQUIRED merely because money may have been
-    spent), and the factory conservatively reconciles any possibly-incurred provider cost against
-    the frozen action ceiling BEFORE the failure transition: a kernel-derived bounded ESTIMATE when
-    trusted provider-reported usage is available, otherwise the full remaining ceiling — never
-    releasing possible spend as zero. It is terminal for the paid attempt (no paid retry after
-    invocation). Carries only bounded, trusted fields (no worker/task self-report authority)."""
+    """A paid provider's local process/transport boundary was crossed and produced a KNOWN-outcome
+    failure/timeout — NOT a genuinely ambiguous *consequential* external effect. IMPORTANT: crossing
+    the CLI/subprocess boundary does NOT by itself prove that a provider API request occurred (the
+    process can fail locally on argv/config/auth before any network call); ``provider_contact`` records
+    whether provider contact was actually observed. The action keeps its true FAILED/TIMEOUT class (it
+    is never coerced into RECOVERY_REQUIRED merely because money MAY have been spent), and the factory
+    conservatively reconciles any possibly-incurred cost against the frozen ceiling BEFORE the failure
+    transition (kernel-derived bounded ESTIMATE when trusted usage exists, else the full ceiling) —
+    never releasing possible spend as zero. Terminal for the attempt. Carries only bounded, trusted,
+    static fields (no worker/task self-report authority; no raw transcript/stderr)."""
 
-    def __init__(self, message, *, failure_class, model=None, usage=None):
+    def __init__(self, message, *, failure_class, model=None, usage=None,
+                 provider_contact="UNKNOWN", process_exit_code=None):
         super().__init__(message)
-        self.failure_class = failure_class    # "TIMEOUT" | "WORKER_ERROR" (the true outcome class)
-        self.model = model                    # frozen model, for kernel-owned pricing
-        self.usage = usage                    # provider-reported usage dict, or None
+        self.failure_class = failure_class          # "TIMEOUT" | "WORKER_ERROR" (true outcome class)
+        self.code = str(message)                    # static safe code, e.g. CODEX_NONZERO_EXIT
+        self.model = model                          # frozen model, for kernel-owned pricing
+        self.usage = usage                          # provider-reported usage dict, or None
+        self.provider_contact = provider_contact    # "OBSERVED" | "NOT_OBSERVED" | "UNKNOWN"
+        self.process_exit_code = process_exit_code   # bounded int, or None
 
 
 class WorkerTimeoutError(AidanCoreError):

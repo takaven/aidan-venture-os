@@ -39,13 +39,27 @@ class DeploymentReleaseVerifier:
     def verify(self, request: VerificationRequest) -> VerificationResult:
         contract: dict[str, Any] = dict((request.expected_output_contract or {}).get("deployment", {}))
         observation = self._observer_factory(contract).observe()
-        results = checks_mod.evaluate_observation(
-            observation,
-            venture_id=contract.get("venture_id"),
-            deployment_target_id=contract.get("deployment_target_id"),
-            expected_tree_hash=contract.get("candidate_tree_hash"),
-            release_contract=contract.get("release_contract", {}),
-        )
+        expected_artifact = contract.get("expected_artifact_identity")
+        if expected_artifact:
+            # Real external deploy: identity proven by comparing the provider read-back digest to the
+            # frozen expected digest (the running-image file tree cannot be re-hashed).
+            results = checks_mod.evaluate_artifact_observation(
+                observation,
+                venture_id=contract.get("venture_id"),
+                deployment_target_id=contract.get("deployment_target_id"),
+                expected_artifact_identity=expected_artifact,
+                release_contract=contract.get("release_contract", {}),
+                required_state=contract.get("required_state", "started"),
+            )
+        else:
+            # Local-tree path (Slices 1-3), unchanged.
+            results = checks_mod.evaluate_observation(
+                observation,
+                venture_id=contract.get("venture_id"),
+                deployment_target_id=contract.get("deployment_target_id"),
+                expected_tree_hash=contract.get("candidate_tree_hash"),
+                release_contract=contract.get("release_contract", {}),
+            )
         ok = all(r.result == "PASS" for r in results)
         # Hashed evidence identity is UNCHANGED from Slices 1-3 (read-back is a seam, not a new
         # proof field): the deployment proof_receipt.evidence_hash formula is preserved exactly.
@@ -64,8 +78,12 @@ class DeploymentReleaseVerifier:
         )
 
 
-def deploy_verifier_registry() -> VerifierRegistry:
-    """A verifier registry containing the deployment verifier (passed to verify_and_complete)."""
+def deploy_verifier_registry(observer_factory=None) -> VerifierRegistry:
+    """A verifier registry containing the deployment verifier (passed to verify_and_complete).
+
+    ``observer_factory`` defaults to the controlled LOCAL target observer (Slices 1-3). A real
+    external deploy passes a provider observer factory (e.g. a Fly read-back) — the verifier logic
+    is identical either way."""
     reg = VerifierRegistry()
-    reg.register(DeploymentReleaseVerifier())
+    reg.register(DeploymentReleaseVerifier(observer_factory=observer_factory))
     return reg

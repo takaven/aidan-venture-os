@@ -36,6 +36,9 @@ DEPLOY_CAPABILITIES = ("DEPLOY_CANDIDATE",)
 # The deploy verifier is forced: a deploy spec can only be completed by the
 # deterministic deployment verifier, never by a worker-self-report verifier.
 DEPLOY_VERIFIER_KIND = "deployment-release"
+# Provider kinds that deploy to a REAL external target (not the local controlled dir) and therefore
+# MUST freeze an immutable artifact identity (digest) as the release authority. Provider-neutral set.
+EXTERNAL_PROVIDER_KINDS = ("fly-machines",)
 
 
 def deploy_target_path(venture_id, deployment_target_id) -> str:
@@ -126,15 +129,25 @@ def _build_deploy_bundle(conn, rc_row) -> tuple:
 
 def _deploy_contract(rc_row, target_row, target_path, expected_tree_hash) -> dict:
     (_id, venture_id, _arid, _mid, _bsid, _tid, _tree, release_contract, release_hash, _created) = rc_row
-    return {
+    rc = dict(release_contract or {})
+    contract = {
         "target_path": target_path,
         "candidate_tree_hash": expected_tree_hash,
         "venture_id": str(venture_id),
         "deployment_target_id": str(_tid),
         "release_candidate_id": str(_id),
         "release_hash": release_hash,
-        "release_contract": dict(release_contract or {}),
+        "release_contract": rc,
     }
+    # Real external deploy: surface the frozen artifact identity + provider identity so the verifier
+    # runs digest-mode checks (compare provider read-back digest to the frozen expected digest). The
+    # LOCAL path carries no expected_artifact_identity and is byte/evidence-identical to Slices 1-3.
+    if rc.get("expected_artifact_identity"):
+        contract["expected_artifact_identity"] = rc["expected_artifact_identity"]
+        contract["required_state"] = rc.get("required_state", "started")
+        contract["provider_kind"] = target_row[3]
+        contract["target_ref"] = target_row[4]
+    return contract
 
 
 def prepare_deploy_execution(
@@ -163,6 +176,14 @@ def prepare_deploy_execution(
     target_row = target_mod.get_deployment_target(conn, rc_row[5])
     if target_row is None:
         raise DeployAuthorityError(f"deployment_target {rc_row[5]} does not exist")
+
+    # A real external provider deploy CANNOT be dispatched without a frozen immutable artifact
+    # identity bound into the release: the digest is the release authority the verifier reads back.
+    rc_contract = dict(rc_row[7] or {})
+    if target_row[3] in EXTERNAL_PROVIDER_KINDS and not rc_contract.get("expected_artifact_identity"):
+        raise DeployAuthorityError(
+            f"provider {target_row[3]!r} requires a frozen expected_artifact_identity in the "
+            "release_contract; a real external deploy cannot be prepared without it")
 
     bundle, expected_tree_hash = _build_deploy_bundle(conn, rc_row)
     target_path = deploy_target_path(rc_row[1], rc_row[5])
@@ -227,15 +248,18 @@ def execute_deploy(
     return dispatch, result
 
 
-def verify_deploy(conn, action_request_id: str, *, actual_cost, actor: str = "factory"):
+def verify_deploy(conn, action_request_id: str, *, actual_cost, actor: str = "factory",
+                  observer_factory=None):
     """Deterministically verify the deployed release and, only if VERIFIED, complete via
     the canonical proof-gated path — the ONE proof_receipt, no second proof system.
 
     Reuses ``factory.runtime.verify_and_complete`` with the deployment verifier registry;
     the deployment verifier independently inspects the actual target (a worker's
-    ``deployed=true`` claim is inert). No lifecycle transition occurs here.
+    ``deployed=true`` claim is inert). ``observer_factory`` selects the read-back — the controlled
+    LOCAL target by default, or a real provider read-back (e.g. Fly) for an external deploy. No
+    lifecycle transition occurs here.
     """
     return factory_runtime.verify_and_complete(
-        conn, action_request_id, verifier_registry=deploy_verifier_registry(),
+        conn, action_request_id, verifier_registry=deploy_verifier_registry(observer_factory),
         actual_cost=actual_cost, actor=actor,
     )

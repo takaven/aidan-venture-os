@@ -24,8 +24,15 @@ from ..build import quality as quality_mod
 from ..errors import DeployAuthorityError, IdempotencyConflictError, NotFoundError
 from . import target as target_mod
 
-# Bounded release-contract vocabulary (deployment-relevant intent only; no secrets).
-RELEASE_CONTRACT_KEYS = frozenset({"runtime_kind", "entry_artifact", "health_contract", "required_config"})
+# Bounded release-contract vocabulary (deployment-relevant intent only; no secrets). The
+# real-external-deploy keys freeze the immutable artifact identity + provider runtime intent into
+# release_hash: expected_artifact_identity (the trusted-tool-derived OCI digest — the release
+# authority a provider read-back is compared against), image_ref (the digest-pinned image the worker
+# deploys, nothing else), region, required_state. None of these is a secret.
+RELEASE_CONTRACT_KEYS = frozenset({
+    "runtime_kind", "entry_artifact", "health_contract", "required_config",
+    "expected_artifact_identity", "image_ref", "region", "required_state",
+})
 
 
 @dataclass(frozen=True)

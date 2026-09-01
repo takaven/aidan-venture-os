@@ -30,9 +30,10 @@ class StatefulFly:
     post-delete confirmation ambiguous."""
 
     def __init__(self, *, digest=DIGEST, state="started", post=None,
-                 get_after_delete_raises=False):
+                 get_after_delete_raises=False, list_raises=False):
         self.digest, self.state, self.post_override = digest, state, post
         self.get_after_delete_raises = get_after_delete_raises
+        self.list_raises = list_raises
         self.deleted = False
         self.calls = []
 
@@ -47,6 +48,8 @@ class StatefulFly:
                 raise self.post_override
             return self.post_override or FlyResponse(201, self._machine())
         if method == "GET" and path.endswith("/machines"):
+            if self.list_raises:                 # reconcile unreachable -> unresolved -> ambiguous
+                raise FlyTransportError("t", phase=PHASE_POST_SEND)
             return FlyResponse(200, {"machines": []})
         if method == "DELETE":
             self.deleted = True
@@ -119,13 +122,22 @@ def test_O_ambiguous_cleanup_not_clean_pass(migrated):
     assert "owner_reconciliation" in ev and ev["lifecycle_state"] == "BUILDING"
 
 
-# ---- RECOVERY_REQUIRED: ambiguous create -> held, no promote, no machine kept ---------
+# ---- RECOVERY_REQUIRED: ambiguous create + inconclusive reconcile -> held, no promote --
 def test_ambiguous_create_recovery_required(migrated):
-    fake = StatefulFly(post=FlyTransportError("t", phase=PHASE_POST_SEND))
+    # POST may have reached Fly (POST_SEND) AND the reconcile list is unreachable -> unresolved.
+    fake = StatefulFly(post=FlyTransportError("t", phase=PHASE_POST_SEND), list_raises=True)
     ev = _run(migrated, fake, slug="fly-ambigcreate")
     assert ev["result"] == "RECOVERY_REQUIRED"
     assert execution.get_status(migrated, ev["action_request_id"]) == "RECOVERY_REQUIRED"
     assert ev["lifecycle_state"] == "BUILDING"
+
+
+# ---- proven-absent create (reconcile finds nothing) -> FAILED, released ---------------
+def test_proven_absent_create_failed(migrated):
+    fake = StatefulFly(post=FlyTransportError("t", phase=PHASE_POST_SEND))   # list returns empty
+    ev = _run(migrated, fake, slug="fly-absent")
+    assert ev["result"] == "FAIL"
+    assert execution.get_status(migrated, ev["action_request_id"]) == "FAILED"
 
 
 # ---- definitive rejection -> FAIL, no effect, released -------------------------------

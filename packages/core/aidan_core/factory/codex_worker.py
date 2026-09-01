@@ -184,23 +184,33 @@ class CodexExecWorker:
             try:
                 result = self._transport(argv, prompt, env, workspace, int(request.timeout_seconds or 120))
             except WorkerTimeoutError as exc:
+                # Timed out with the process still running: provider contact is UNKNOWN.
                 raise ProviderExecutionFailure(
-                    "CODEX_TIMEOUT_AFTER_INVOCATION", failure_class="TIMEOUT", model=model, usage=None) from exc
+                    "CODEX_TIMEOUT_AFTER_INVOCATION", failure_class="TIMEOUT", model=model, usage=None,
+                    provider_contact="UNKNOWN", process_exit_code=None) from exc
 
             session_id, usage, status = self._parse_events(result.stdout)
+            # A documented ``thread.started`` is the only positive evidence that the CLI actually
+            # reached the provider and opened a thread; without it, provider contact is UNKNOWN
+            # (the process may have failed locally on argv/config/auth before any API request).
+            contact = "OBSERVED" if session_id is not None else "UNKNOWN"
             if result.exit_code != 0:
                 raise ProviderExecutionFailure(
-                    "CODEX_NONZERO_EXIT", failure_class="WORKER_ERROR", model=model, usage=usage)
+                    "CODEX_NONZERO_EXIT", failure_class="WORKER_ERROR", model=model, usage=usage,
+                    provider_contact=contact, process_exit_code=result.exit_code)
             if status != "SUCCESS":
                 code = {"FAILURE": "CODEX_TURN_FAILED", "NO_TERMINAL": "CODEX_NO_TERMINAL_EVENT",
                         "MALFORMED": "CODEX_MALFORMED_EVENT", "NO_EVENTS": "CODEX_NO_EVENTS"}[status]
-                raise ProviderExecutionFailure(code, failure_class="WORKER_ERROR", model=model, usage=usage)
+                raise ProviderExecutionFailure(
+                    code, failure_class="WORKER_ERROR", model=model, usage=usage,
+                    provider_contact=contact, process_exit_code=result.exit_code)
             try:
                 artifacts = self._capture_artifacts(workspace, artifact_paths)
             except CodexAdapterError as exc:
-                # The provider ran and produced bad/absent output: known failure with possible cost.
+                # Terminal success but bad/absent declared artifact: known failure with possible cost.
                 raise ProviderExecutionFailure(str(exc), failure_class="WORKER_ERROR",
-                                               model=model, usage=usage) from exc
+                                               model=model, usage=usage, provider_contact=contact,
+                                               process_exit_code=result.exit_code) from exc
 
         external_result_id = self._result_id(request, session_id, artifacts)
         structured = {"exit_code": 0, "terminal": "completed", "artifact_count": len(artifacts)}

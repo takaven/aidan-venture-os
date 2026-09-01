@@ -1,7 +1,13 @@
 """Deterministic proof of the frozen live-Codex-smoke entrypoint — NO real Codex.
 
-Proves frozen-hash fail-closed guards, capital preconditions, at-most-one provider invocation,
-and the full behavioural + conservative-cost path via an injected fake provider.
+Proves frozen-hash fail-closed guards, capital preconditions, at-most-one Codex PROCESS
+invocation, HONEST provider-contact evidence (crossing the subprocess boundary is NOT proof an
+OpenAI API request occurred), the surfaced cost-bearing-failure audit event, and the full
+behavioural + conservative-cost path via an injected fake provider.
+
+Regression matrix (A–K) covers: frozen guards (A/B/C/G/F), capital/credential preconditions with
+zero process crossings (D/E), post-invocation known-failure cost reconciliation (J/K), and the full
+behavioural verify path (H/I). Contact evidence is asserted on every path that reaches the process.
 """
 from __future__ import annotations
 
@@ -18,6 +24,9 @@ from aidan_core.factory.codex_worker import CodexProcessResult
 
 CORRECT = "import re\ndef slugify(text):\n    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')\n"
 WRONG = "def slugify(text):\n    return text.lower().replace(' ', '-')\n"
+
+# A terminal-success stream that DID open a provider thread (positive contact evidence).
+OK_EVENTS = [{"type": "thread.started", "thread_id": "th"}, {"type": "turn.completed"}]
 
 
 class FakeCodex:
@@ -65,7 +74,7 @@ def test_F_wrong_confirm_token_blocks(monkeypatch, capsys):
     assert "CONFIRM_REQUIRED" in capsys.readouterr().out
 
 
-# ---- D/E/J/K: DB accounting + invocation bound (no bwrap) --------------------
+# ---- D/E: capital + credential preconditions (no process crossing) ----------
 
 @pytest.fixture
 def _codex(monkeypatch):
@@ -75,27 +84,51 @@ def _codex(monkeypatch):
 
 def test_D_reservation_failure_zero_invocations(migrated, _codex):
     ev = cls.run_smoke(migrated, transport=FakeCodex(src=CORRECT), grant=Decimal("0.10"), slug="cx-smoke-D")
-    assert ev["result"] == "RESERVATION_FAILED" and ev["provider_invocations"] == 0
+    assert ev["result"] == "RESERVATION_FAILED"
+    assert ev["codex_process_invocations"] == 0                 # transport never called
+    assert ev["provider_contact_evidence"] == "NOT_OBSERVED"    # no process -> no contact
+    assert ev["cost_bearing_failure"] is False
 
 
 def test_E_missing_credential_zero_invocations(migrated, monkeypatch):
     monkeypatch.delenv("WORKER_CODEX_API_KEY", raising=False)
     monkeypatch.setattr("aidan_core.factory.codex_worker.codex_bin", lambda: "/usr/bin/codex")
     ev = cls.run_smoke(migrated, transport=FakeCodex(src=CORRECT), slug="cx-smoke-E")
-    assert ev["provider_invocations"] == 0 and ev["result"] == "FAIL"
+    assert ev["codex_process_invocations"] == 0 and ev["result"] == "FAIL"
+    assert ev["provider_contact_evidence"] == "NOT_OBSERVED"    # pre-invocation guard fired
+    assert ev["committed"] == "0.0000"                          # released, zero spend
 
+
+# ---- J/K: post-invocation KNOWN failure -> conservative cost, honest contact -
 
 def test_J_post_invocation_failure_no_usage_conservative(migrated, _codex):
     ev = cls.run_smoke(migrated, transport=FakeCodex(events=[{"type": "turn.failed"}]), slug="cx-smoke-J")
-    assert ev["provider_invocations"] == 1 and ev["result"] == "FAIL"
+    assert ev["codex_process_invocations"] == 1 and ev["result"] == "FAIL"
     assert ev["committed"] == "0.2000" and ev["final_status"] == "FAILED"   # full ceiling, not zero
+    # Process crossed but NO thread.started was seen -> contact genuinely UNKNOWN (not "invoked").
+    assert ev["provider_contact_evidence"] == "UNKNOWN"
+    assert ev["cost_bearing_failure"] is True
+    assert ev["failure_code"] == "CODEX_TURN_FAILED"
+    assert ev["usage_observed"] is False
 
 
 def test_K_known_failure_with_usage_commits_estimate(migrated, _codex):
     usage = {"input_tokens": 20000, "output_tokens": 5000}   # 0.015 at gpt-5-mini
     ev = cls.run_smoke(migrated, transport=FakeCodex(events=[{"type": "turn.failed", "usage": usage}]),
                        slug="cx-smoke-K")
-    assert ev["provider_invocations"] == 1 and ev["committed"] == "0.0150"
+    assert ev["codex_process_invocations"] == 1 and ev["committed"] == "0.0150"
+    assert ev["provider_contact_evidence"] == "UNKNOWN"      # usage present, but no thread.started
+    assert ev["cost_bearing_failure"] is True and ev["usage_observed"] is True
+    assert ev["failure_code"] == "CODEX_TURN_FAILED"
+
+
+def test_J2_nonzero_exit_reports_bounded_code_and_exit(migrated, _codex):
+    # The smoke-#2 shape: the process exits non-zero WITHOUT any terminal/thread event.
+    ev = cls.run_smoke(migrated, transport=FakeCodex(events=[], exit_code=4), slug="cx-smoke-J2")
+    assert ev["codex_process_invocations"] == 1 and ev["result"] == "FAIL"
+    assert ev["failure_code"] == "CODEX_NONZERO_EXIT" and ev["process_exit_code"] == 4
+    assert ev["provider_contact_evidence"] == "UNKNOWN"     # boundary crossed != API request proven
+    assert ev["committed"] == "0.2000"                      # conservative full ceiling, no usage
 
 
 # ---- H/I: full behavioural path (DB + bwrap) --------------------------------
@@ -106,7 +139,8 @@ def test_H_correct_candidate_verifies_and_reconciles(migrated, _codex):
     ev = cls.run_smoke(migrated, transport=FakeCodex(
         src=CORRECT, events=[{"type": "thread.started", "thread_id": "th"},
                              {"type": "turn.completed", "usage": usage}]), slug="cx-smoke-H")
-    assert ev["provider_invocations"] == 1
+    assert ev["codex_process_invocations"] == 1
+    assert ev["provider_contact_evidence"] == "OBSERVED"     # thread.started + terminal success
     assert ev["result"] == "PASS" and ev["test_execution_verdict"] == "VERIFIED"
     assert ev["proof_result"] == "VERIFIED" and ev["governance_deltas"] == 0
     assert ev["secret_leak_check"] == "PASS"
@@ -121,8 +155,9 @@ def test_installed_condition_no_canonical_root_fails_before_provider(migrated, _
     monkeypatch.delenv("AIDAN_OS_REPO_ROOT", raising=False)
     monkeypatch.setattr("aidan_core.factory.codex_worker.ws.canonical_os_repo_root", lambda: None)
     ev = cls.run_smoke(migrated, transport=FakeCodex(src=CORRECT), slug="cx-inst-red")
-    assert ev["result"] == "FAIL" and ev["provider_invocations"] == 0    # guard fired before transport
-    assert ev["committed"] == "0.0000"                                    # zero spend, released
+    assert ev["result"] == "FAIL" and ev["codex_process_invocations"] == 0    # guard fired before transport
+    assert ev["provider_contact_evidence"] == "NOT_OBSERVED"
+    assert ev["committed"] == "0.0000"                                        # zero spend, released
 
 
 @pytest.mark.skipif(not te.bwrap_available(), reason="bwrap not available (non-Linux/dev)")
@@ -134,7 +169,8 @@ def test_installed_condition_with_trusted_root_reaches_provider_and_verifies(mig
     ev = cls.run_smoke(migrated, transport=FakeCodex(
         src=CORRECT, events=[{"type": "thread.started", "thread_id": "th"},
                              {"type": "turn.completed", "usage": usage}]), slug="cx-inst-green")
-    assert ev["provider_invocations"] == 1 and ev["result"] == "PASS"
+    assert ev["codex_process_invocations"] == 1 and ev["result"] == "PASS"
+    assert ev["provider_contact_evidence"] == "OBSERVED"
     assert ev["test_execution_verdict"] == "VERIFIED" and ev["governance_deltas"] == 0
 
 
@@ -143,6 +179,8 @@ def test_I_wrong_candidate_rejected(migrated, _codex):
     ev = cls.run_smoke(migrated, transport=FakeCodex(
         src=WRONG, events=[{"type": "thread.started", "thread_id": "th"},
                           {"type": "turn.completed"}]), slug="cx-smoke-I")
-    assert ev["provider_invocations"] == 1
+    assert ev["codex_process_invocations"] == 1
+    # Terminal success opened a thread (contact OBSERVED) but the candidate fails verification.
+    assert ev["provider_contact_evidence"] == "OBSERVED"
     assert ev["result"] == "FAIL" and ev["test_execution_verdict"] == "REJECTED"
     assert ev["final_status"] != "SUCCEEDED"

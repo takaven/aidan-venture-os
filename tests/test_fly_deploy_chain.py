@@ -17,11 +17,11 @@ import pytest
 
 from aidan_core import execution
 from aidan_core.deploy.fly_live_smoke import CEILING, TOKEN_ENV, run_fly_deploy_smoke
+from aidan_core.deploy.fly_stagec_spec import NGINX_AMD64_MANIFEST_DIGEST, HEALTH_MARKER
 from aidan_core.deploy.fly_transport import PHASE_POST_SEND, FlyResponse, FlyTransportError
 
-DIGEST = "sha256:" + "ab" * 32
-APP = "aidan-smoke-app"
-IMAGE = f"registry.fly.io/aidan-smoke@{DIGEST}"
+DIGEST = NGINX_AMD64_MANIFEST_DIGEST     # the FROZEN concrete linux/amd64 manifest digest
+APP = "aidan-gate8-smoke-1"
 
 
 class StatefulFly:
@@ -71,9 +71,9 @@ def _token(monkeypatch):
     monkeypatch.setenv(TOKEN_ENV, "fly-secret-not-real-XYZ")
 
 
-def _run(conn, fake, *, slug, **kw):
-    return run_fly_deploy_smoke(conn, app=APP, image_ref=IMAGE, internal_port=80, health_path="/",
-                                transport=fake, health_probe=lambda: "ok", slug=slug, **kw)
+def _run(conn, fake, *, slug, marker=HEALTH_MARKER, **kw):
+    return run_fly_deploy_smoke(conn, app=APP, transport=fake, health_probe=lambda: marker,
+                                slug=slug, **kw)
 
 
 # ---- A + L + N + K + E: clean end-to-end boundary smoke, BUILDING, cleanup confirmed --

@@ -113,6 +113,29 @@ SMOKE**, not a production-operation proof. Corrections that bound it honestly:
   `CLEANUP_CONFIRMED`; an ambiguous cleanup is never a clean PASS (owner-actionable reconciliation is
   returned, and no second machine is ever created).
 
+## Stage-C final freeze (immutable preregistration)
+
+The Stage-C smoke is a single immutable preregistration, not a parameterised job:
+
+- **Frozen spec.** `deploy/fly_stagec_spec.py` freezes every deploy-relevant value — the exact public
+  image `registry-1.docker.io/library/nginx@sha256:<amd64-manifest-digest>`, the expected artifact
+  digest, the runtime/network contract (internal_port 80; ports 80→http, 443→tls,http), the health
+  contract (path `/`, marker `Welcome to nginx!`), required state `started`, `max_attempts=1`, ceiling
+  USD 0.05, one-machine cleanup semantics, and `lifecycle_after_pass=BUILDING`. A canonical
+  `FROZEN_SMOKE_SPEC_HASH` is recomputed at runtime and fails closed BEFORE any Fly mutation, so
+  tampering with image/digest/port/path/marker/ceiling aborts before a machine is created.
+- **Concrete platform digest.** The frozen digest is the concrete **linux/amd64 image manifest**
+  digest (verified read-only against the registry: fetching by it returns an OCI image manifest with
+  config + layers), NOT the multi-arch index digest. Pinning the platform manifest removes
+  index→platform resolution, so Fly's `image_ref.digest` read-back denotes exactly the frozen value.
+- **Health marker at the probe boundary.** The external HTTP body (untrusted HTML) is reduced to the
+  canonical marker at the probe (`observed_health_from_body`: the marker string iff it occurs within
+  the bounded body, else None). The deterministic verifier's exact-match health semantics
+  (`checks.py::_obs_health`) are UNCHANGED and shared with the local path.
+- **No mutable dispatch inputs.** The workflow accepts only the confirmation token, the owner-created
+  `fly_app`, and the accepted-main SHA (fail-closed against `GITHUB_SHA`) — mirroring the Codex smoke
+  discipline. Image/port/path/marker are not inputs.
+
 ## Provider state (as of this ADR)
 
 **CASE B — no external deployment provider is canonically designated.** Evidence: `provider_kind`

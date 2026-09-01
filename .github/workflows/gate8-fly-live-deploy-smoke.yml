@@ -20,18 +20,6 @@ on:
         description: 'The owner-created, venture-owned Fly app name (external infrastructure) to deploy into'
         required: true
         default: ''
-      image_ref:
-        description: 'A DIGEST-PINNED public OCI image with a bounded HTTP health endpoint, e.g. nginx@sha256:...'
-        required: true
-        default: ''
-      internal_port:
-        description: 'The image internal HTTP port (e.g. 80 for nginx)'
-        required: true
-        default: '80'
-      health_path:
-        description: 'External health path served by the image (e.g. /)'
-        required: true
-        default: '/'
       accepted_sha:
         description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
         required: true
@@ -66,9 +54,6 @@ jobs:
       CONFIRM: ${{ github.event.inputs.confirm }}
       AIDAN_OS_REPO_ROOT: ${{ github.workspace }}
       FLY_SMOKE_APP: ${{ github.event.inputs.fly_app }}
-      FLY_SMOKE_IMAGE_REF: ${{ github.event.inputs.image_ref }}
-      FLY_SMOKE_INTERNAL_PORT: ${{ github.event.inputs.internal_port }}
-      FLY_SMOKE_HEALTH_PATH: ${{ github.event.inputs.health_path }}
       FLY_SMOKE_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
 
     steps:

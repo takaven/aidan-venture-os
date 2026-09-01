@@ -45,6 +45,7 @@ from typing import Callable, Optional
 
 from ..build import workspace as ws
 from ..errors import ProviderExecutionFailure, WorkerTimeoutError
+from .codex_argv import build_codex_argv
 from .workers import WorkerRequest, WorkerResult
 
 WORKER_KIND = "codex-exec"
@@ -126,17 +127,8 @@ class CodexExecWorker:
         }
 
     def _argv(self, bin_path: str, model: str, workspace: str) -> list:
-        return [
-            bin_path, "exec", "-", "--json",
-            "--model", model,
-            "--cd", workspace,
-            "--sandbox", "workspace-write",
-            "--ask-for-approval", "never",
-            "--ephemeral",
-            "--ignore-user-config",     # do not load $CODEX_HOME/config.toml semantics from ambient config
-            "--ignore-rules",           # skip user/project execpolicy .rules
-            "-c", "shell_environment_policy.ignore_default_excludes=false",
-        ]
+        # Single source of truth (shared with the CI argv-falsifier) so the two can never drift.
+        return build_codex_argv(bin_path, model, workspace)
 
     def execute(self, request: WorkerRequest) -> WorkerResult:
         payload = dict(request.task_payload or {})

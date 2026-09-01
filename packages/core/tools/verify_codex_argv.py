@@ -33,11 +33,11 @@ _QUOTED = re.compile(r"'([^']{1,64})'")
 
 
 def _production_argv(codex_bin: str, ws: str):
-    """The EXACT argv the adapter emits (frozen model, given workspace)."""
-    # packages/core (contains aidan_core) — importing codex_worker is light (no psycopg/DB).
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from aidan_core.factory.codex_worker import CodexExecWorker
-    return CodexExecWorker()._argv(codex_bin, "gpt-5-mini", ws)
+    """The EXACT argv the adapter emits (frozen model, given workspace), from the shared single
+    source of truth — importing it pulls in nothing heavy (no psycopg/DB), so this needs no install."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # -> packages/core
+    from aidan_core.factory.codex_argv import build_codex_argv
+    return build_codex_argv(codex_bin, "gpt-5-mini", ws)
 
 
 def classify(text: str) -> str:

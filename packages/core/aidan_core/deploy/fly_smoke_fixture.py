@@ -109,7 +109,7 @@ def build_release_contract(*, image_ref, internal_port, health_path, health_mark
 
 
 def establish_fixture(conn, *, app, image_ref, internal_port, health_path="/", health_marker=None,
-                      region=None, grant=Decimal("1.00"), ceiling=Decimal("0.05"),
+                      region=None, ports=None, grant=Decimal("1.00"), ceiling=Decimal("0.05"),
                       slug="gate8-fly-smoke", actor="fly-smoke"):
     """Establish the complete bounded canonical fixture and return the created IDs + release_contract.
     Deploy authority is fully guarded (create_release_candidate re-checks Gate-5 quality from DB)."""
@@ -151,7 +151,8 @@ def establish_fixture(conn, *, app, image_ref, internal_port, health_path="/", h
         conn, venture_id=vid, action_type="deploy", actor=actor, idempotency_key=f"deploy:{slug}",
         required_autonomy=0, requested_amount=ceiling, requested_currency="USD").action_id
     rc = build_release_contract(image_ref=image_ref, internal_port=internal_port,
-                                health_path=health_path, health_marker=health_marker, region=region)
+                                health_path=health_path, health_marker=health_marker, region=region,
+                                ports=ports)
     rel_res = release_mod.create_release_candidate(
         conn, deploy_aid, build_manifest_id=manifest_id, deployment_target_id=target.deployment_target_id,
         release_contract=rc)

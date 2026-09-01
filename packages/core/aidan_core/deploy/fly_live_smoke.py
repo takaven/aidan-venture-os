@@ -22,24 +22,30 @@ from __future__ import annotations
 
 import json
 import os
-from decimal import Decimal
+import re
 
-PROVIDER_KIND = "fly-machines"
-CEILING = Decimal("0.05")
+from . import fly_stagec_spec as spec
+
+PROVIDER_KIND = spec.PROVIDER_KIND
+CEILING = spec.CEILING
 CONFIRM_TOKEN = "RUN_FROZEN_FLY_DEPLOY_SMOKE"
 TOKEN_ENV = "DEPLOY_FLY_API_TOKEN"
-REQUIRED_STATE = "started"
+REQUIRED_STATE = spec.REQUIRED_STATE
 TIMEOUT_SECONDS = 120
-MAX_ATTEMPTS = 1
-# Owner-provided external-target inputs for the manual run (the app + image are owner-created infra).
+MAX_ATTEMPTS = spec.MAX_ATTEMPTS
+# The ONLY dispatch-time inputs: the owner-created external target, plus the accepted-main SHA. Every
+# deploy-relevant value (image/digest/port/path/marker/ceiling) is frozen in fly_stagec_spec.
 APP_ENV = "FLY_SMOKE_APP"
-IMAGE_ENV = "FLY_SMOKE_IMAGE_REF"          # a digest-pinned public OCI image, e.g. nginx@sha256:...
-PORT_ENV = "FLY_SMOKE_INTERNAL_PORT"       # the image's internal HTTP port (e.g. 80)
-HEALTH_PATH_ENV = "FLY_SMOKE_HEALTH_PATH"
-HEALTH_MARKER_ENV = "FLY_SMOKE_HEALTH_MARKER"
-REGION_ENV = "FLY_SMOKE_REGION"
-# Accepted-main SHA fail-close (mirrors the Codex smoke discipline): the workflow pins it.
 ACCEPTED_SHA_ENV = "FLY_SMOKE_ACCEPTED_SHA"
+
+# Conservative Fly app-name validation (owner input): lowercase alnum + hyphens, starts alnum.
+_APP_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+def validate_app_name(app: str) -> str:
+    if not app or not _APP_RE.match(str(app)):
+        raise ValueError("FLY_SMOKE_APP is not a valid Fly app name")
+    return app
 
 
 def _captured_claim(conn, action_id):
@@ -70,9 +76,26 @@ def _lifecycle(conn, vid):
     return row[0] if row else None
 
 
+_HEALTH_BODY_LIMIT = 65536   # bounded body read (never unbounded)
+
+
+def observed_health_from_body(body, expected_marker):
+    """Reduce a bounded external HTTP body to the CANONICAL health marker the deterministic verifier
+    exact-matches. When an ``expected_marker`` is frozen: return EXACTLY that marker if it occurs
+    within the (bounded) body, else None. When no marker is frozen: any non-empty body -> "ok".
+
+    This keeps the untrusted external HTML at the probe boundary; the verifier's exact-match semantics
+    (checks.py::_obs_health) are UNCHANGED — the observed marker it receives is already canonical.
+    """
+    text = body or ""
+    if expected_marker is not None:
+        return str(expected_marker) if str(expected_marker) in text else None
+    return "ok" if text.strip() else None
+
+
 def default_health_probe(app, path, expected_marker):
-    """Real external health probe: GET https://<app>.fly.dev/<path>, return the bounded marker text
-    on HTTP 200, else None. Read-only; never mutates."""
+    """Real external health probe: GET https://<app>.fly.dev/<path>, read a BOUNDED body, and reduce
+    it to the canonical marker via ``observed_health_from_body``. Read-only; never mutates."""
     def _probe():
         import urllib.request
         url = f"https://{app}.fly.dev/{str(path or '').lstrip('/')}"
@@ -80,33 +103,44 @@ def default_health_probe(app, path, expected_marker):
             with urllib.request.urlopen(url, timeout=15) as resp:   # noqa: S310 (fixed https host)
                 if resp.status != 200:
                     return None
-                body = resp.read(4096).decode("utf-8", "replace").strip()
+                body = resp.read(_HEALTH_BODY_LIMIT).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
             return None
-        return body if body else "ok"
+        return observed_health_from_body(body, expected_marker)
     return _probe
 
 
-def run_fly_deploy_smoke(conn, *, app, image_ref, internal_port, health_path="/", health_marker=None,
-                         region=None, transport=None, health_probe=None, actor="fly-smoke",
-                         actual_cost=CEILING, slug="gate8-fly-smoke"):
-    """Establish the fixture, govern one deploy, verify independently, record the proof, then clean up.
-    Returns a sanitized evidence dict. Does NOT promote lifecycle (Stage C)."""
+def run_fly_deploy_smoke(conn, *, app, transport=None, health_probe=None, actor="fly-smoke",
+                         slug="gate8-fly-smoke"):
+    """Establish the fixture from the FROZEN Stage-C spec, govern one deploy, verify independently,
+    record the proof, then clean up. Returns a sanitized evidence dict. Does NOT promote lifecycle.
+    Every deploy-relevant value is frozen (fly_stagec_spec); only ``app`` varies (owner target)."""
     from .. import execution
     from ..errors import ExecutionBlockedError, InsufficientBudgetError
     from . import fly_smoke_fixture, runtime as deploy_runtime
     from .fly_worker import FlyMachinesWorker, cleanup_machine
     from ..factory.workers import WorkerRegistry
 
-    ev = {"smoke": "gate8-fly-deploy", "provider": PROVIDER_KIND, "repo_sha": os.environ.get("GITHUB_SHA", "local"),
-          "ceiling": str(CEILING), "result": None, "deployment_effect": "NOT_OBSERVED",
-          "provider_contact_evidence": "UNKNOWN", "cleanup_state": "NOT_ATTEMPTED",
-          "source_to_artifact_derivation_proven": False, "promoted_to_operating": False}
+    # 0. FAIL-CLOSE on any tampering with the frozen smoke spec, BEFORE any Fly mutation, and validate
+    #    the owner-supplied app name (the only variable external identity).
+    smoke_hash = spec.assert_frozen()
+    validate_app_name(app)
+    s = spec.STAGEC_SPEC
+    health_path, health_marker = s["health_contract"]["path"], s["health_contract"]["marker_content"]
 
-    # 1. FIXTURE FREEZE — self-contained; the app/image are frozen into release_hash.
+    ev = {"smoke": "gate8-fly-deploy", "provider": PROVIDER_KIND, "repo_sha": os.environ.get("GITHUB_SHA", "local"),
+          "ceiling": str(CEILING), "smoke_spec_hash": smoke_hash, "fly_app": app,
+          "image_ref": s["image_ref"], "expected_artifact_digest": s["expected_artifact_digest"],
+          "result": None, "deployment_effect": "NOT_OBSERVED", "provider_contact_evidence": "UNKNOWN",
+          "cleanup_state": "NOT_ATTEMPTED",
+          "source_to_artifact_derivation_proven": s["source_to_artifact_derivation_proven"],
+          "promoted_to_operating": False}
+
+    # 1. FIXTURE FREEZE — self-contained; app + FROZEN image/runtime/health are bound into release_hash.
     fx = fly_smoke_fixture.establish_fixture(
-        conn, app=app, image_ref=image_ref, internal_port=internal_port, health_path=health_path,
-        health_marker=health_marker, region=region, ceiling=CEILING, slug=slug, actor=actor)
+        conn, app=app, image_ref=s["image_ref"], internal_port=s["runtime_contract"]["internal_port"],
+        health_path=health_path, health_marker=health_marker,
+        ports=s["runtime_contract"]["ports"], ceiling=CEILING, slug=slug, actor=actor)
     vid = fx["venture_id"]
     deploy_action_id = fx["deploy_action_id"]
     ev["canonical_ids"] = {k: fx[k] for k in ("venture_id", "build_manifest_id", "deployment_target_id",
@@ -158,7 +192,7 @@ def run_fly_deploy_smoke(conn, *, app, image_ref, internal_port, health_path="/"
             deployment_target_id=contract.get("deployment_target_id"),
             health_probe=hp, required_state=REQUIRED_STATE, timeout=30.0)
 
-    out = deploy_runtime.verify_deploy(conn, deploy_action_id, actual_cost=actual_cost, actor=actor,
+    out = deploy_runtime.verify_deploy(conn, deploy_action_id, actual_cost=CEILING, actor=actor,
                                        observer_factory=_observer_factory)
     ev["deployment_verdict"] = "VERIFIED" if out.verified else "REJECTED"
     ev["provider_contact_evidence"] = "OBSERVED" if machine_id else "UNKNOWN"
@@ -211,11 +245,15 @@ def main() -> int:
     if os.environ.get("CONFIRM", "") != CONFIRM_TOKEN:
         print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIRM_REQUIRED"}))
         return 2
+    # Accepted-main SHA fail-close: refuse to run against any commit other than the preregistered one.
     accepted = os.environ.get(ACCEPTED_SHA_ENV)
-    if accepted and os.environ.get("GITHUB_SHA") and accepted != os.environ["GITHUB_SHA"]:
+    if not accepted:
+        print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIG_ERROR", "reason": ACCEPTED_SHA_ENV}))
+        return 2
+    if os.environ.get("GITHUB_SHA") and accepted != os.environ["GITHUB_SHA"]:
         print(json.dumps({"smoke": "gate8-fly-deploy", "result": "SHA_MISMATCH"}))
         return 3
-    for env in (TOKEN_ENV, APP_ENV, IMAGE_ENV, PORT_ENV):
+    for env in (TOKEN_ENV, APP_ENV):
         if not os.environ.get(env):
             print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIG_ERROR", "reason": env}))
             return 2
@@ -223,10 +261,8 @@ def main() -> int:
     import psycopg
     conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
     try:
-        ev = run_fly_deploy_smoke(
-            conn, app=os.environ[APP_ENV], image_ref=os.environ[IMAGE_ENV],
-            internal_port=int(os.environ[PORT_ENV]), health_path=os.environ.get(HEALTH_PATH_ENV, "/"),
-            health_marker=os.environ.get(HEALTH_MARKER_ENV), region=os.environ.get(REGION_ENV))
+        # Every deploy-relevant value is frozen (fly_stagec_spec); only the app varies.
+        ev = run_fly_deploy_smoke(conn, app=os.environ[APP_ENV])
     except Exception as exc:  # sanitized last-resort; never a raw traceback / provider body
         print(json.dumps({"smoke": "gate8-fly-deploy", "result": "UNEXPECTED_ERROR",
                           "error_type": type(exc).__name__}))

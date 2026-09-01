@@ -32,6 +32,10 @@ from . import target as target_mod
 RELEASE_CONTRACT_KEYS = frozenset({
     "runtime_kind", "entry_artifact", "health_contract", "required_config",
     "expected_artifact_identity", "image_ref", "region", "required_state",
+    # Provider runtime/network contract frozen into release_hash so the worker emits (never invents)
+    # the exact Machine service/port config, and the observer's external health route is authorized:
+    # {internal_port, ports:[{port,handlers}], protocol}. No secret.
+    "runtime_contract",
 })
 
 

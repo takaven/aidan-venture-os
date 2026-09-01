@@ -1,18 +1,22 @@
-"""Bounded, MANUAL, fail-closed first real Fly deployment smoke (Gate 6 real-deploy readiness).
+"""Bounded, MANUAL, fail-closed first REAL_EXTERNAL Fly deployment BOUNDARY smoke (Stage C).
 
-Deploys an ALREADY quality-qualified, frozen ``release_candidate`` (whose immutable
-``expected_artifact_identity`` = an OCI image digest) to a venture-owned Fly app through the
-governed Gate-4/6 path, reads the running identity back INDEPENDENTLY through a Fly observer,
-promotes ONLY from a VERIFIED ``DEPLOYMENT_RELEASE`` proof, and emits ONE sanitized evidence line.
-It never fabricates success, never prints the credential, and never blind-retries an ambiguous
-effect. The Fly transport + health probe are injectable seams, so the whole entrypoint is proven
-deterministically with fakes — no real Fly is required for the tests.
+Establishes its OWN complete bounded canonical fixture (venture -> quality-qualified build/release ->
+venture-owned Fly deployment_target -> deploy ActionRequest -> frozen release_candidate) in its own
+ephemeral PostgreSQL, deploys the EXACT frozen OCI artifact the release authorizes to a venture-owned
+Fly app, reads the running identity back INDEPENDENTLY, verifies deterministically, records a
+DEPLOYMENT_RELEASE Proof Receipt, then DELETES the created machine and confirms its absence. It emits
+ONE sanitized evidence line, never prints the credential, and never blind-retries an ambiguous
+effect. Transport + health probe are injectable seams — the whole entrypoint is proven with fakes.
 
-Frozen smoke bounds: provider ``fly-machines`` · ceiling USD 0.05 · max_attempts 1 · required state
-``started`` · confirm ``RUN_FROZEN_FLY_DEPLOY_SMOKE`` · credential env ``DEPLOY_FLY_API_TOKEN``.
+Stage-C scope. This PROVES: one real machine create, exact frozen OCI artifact authorization,
+provider contact, deployment effect, independent digest read-back, bounded health, a
+DEPLOYMENT_RELEASE proof, and deterministic cleanup. It DOES NOT prove: candidate_tree_hash -> OCI
+build derivation (SOURCE_TO_ARTIFACT_DERIVATION_PROVEN is False), durable production operation, or
+BUILDING -> OPERATING. The venture DELIBERATELY REMAINS BUILDING; the proof is historical evidence
+the external deployment boundary worked, not a claim that a runtime remains operating.
 
-Establishing the qualified release (Gate 5 build + quality) and the venture-owned Fly app is an
-owner/preceding-gate responsibility; this entrypoint governs only the deploy + verify + promote.
+Frozen bounds: provider fly-machines · ceiling USD 0.05 · max_attempts 1 · required state started ·
+confirm RUN_FROZEN_FLY_DEPLOY_SMOKE · credential env DEPLOY_FLY_API_TOKEN.
 """
 from __future__ import annotations
 
@@ -27,11 +31,15 @@ TOKEN_ENV = "DEPLOY_FLY_API_TOKEN"
 REQUIRED_STATE = "started"
 TIMEOUT_SECONDS = 120
 MAX_ATTEMPTS = 1
-# Env the owner sets for the manual run: the deploy ActionRequest whose frozen release_candidate
-# (with expected_artifact_identity) is to be deployed, and the app's external health path.
-ACTION_ENV = "FLY_SMOKE_DEPLOY_ACTION_ID"
+# Owner-provided external-target inputs for the manual run (the app + image are owner-created infra).
+APP_ENV = "FLY_SMOKE_APP"
+IMAGE_ENV = "FLY_SMOKE_IMAGE_REF"          # a digest-pinned public OCI image, e.g. nginx@sha256:...
+PORT_ENV = "FLY_SMOKE_INTERNAL_PORT"       # the image's internal HTTP port (e.g. 80)
 HEALTH_PATH_ENV = "FLY_SMOKE_HEALTH_PATH"
 HEALTH_MARKER_ENV = "FLY_SMOKE_HEALTH_MARKER"
+REGION_ENV = "FLY_SMOKE_REGION"
+# Accepted-main SHA fail-close (mirrors the Codex smoke discipline): the workflow pins it.
+ACCEPTED_SHA_ENV = "FLY_SMOKE_ACCEPTED_SHA"
 
 
 def _captured_claim(conn, action_id):
@@ -42,14 +50,9 @@ def _captured_claim(conn, action_id):
     return ((row[0] if row else {}) or {}).get("structured_output", {}) if row else {}
 
 
-def _gov_count(conn, action_id):
-    """Count investment_decision_record for the action's venture (the governance-delta baseline)."""
+def _gov_count(conn, vid):
     with conn.cursor() as cur:
-        cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_id,))
-        row = cur.fetchone()
-        if row is None:
-            return 0
-        cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (row[0],))
+        cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (vid,))
         return cur.fetchone()[0]
 
 
@@ -60,9 +63,16 @@ def _budget_state(conn, vid):
         return cur.fetchone()
 
 
-def default_health_probe(app, path, expected_marker, *, http=None):
+def _lifecycle(conn, vid):
+    with conn.cursor() as cur:
+        cur.execute("SELECT lifecycle_state FROM venture WHERE id = %s", (vid,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def default_health_probe(app, path, expected_marker):
     """Real external health probe: GET https://<app>.fly.dev/<path>, return the bounded marker text
-    on HTTP 200 (optionally matched), else None. Read-only; never mutates."""
+    on HTTP 200, else None. Read-only; never mutates."""
     def _probe():
         import urllib.request
         url = f"https://{app}.fly.dev/{str(path or '').lstrip('/')}"
@@ -77,69 +87,73 @@ def default_health_probe(app, path, expected_marker, *, http=None):
     return _probe
 
 
-def run_fly_deploy_smoke(conn, deploy_action_id, *, transport=None, health_probe=None,
-                         actor="fly-smoke", actual_cost=CEILING):
-    """Govern the deploy of a frozen release to Fly and independently verify it. Returns a sanitized
-    evidence dict. Provider dispatch is impossible until the frozen release + expected digest exist
-    (prepare guard); at most one create occurs (max_attempts=1); success comes only from the verifier."""
+def run_fly_deploy_smoke(conn, *, app, image_ref, internal_port, health_path="/", health_marker=None,
+                         region=None, transport=None, health_probe=None, actor="fly-smoke",
+                         actual_cost=CEILING, slug="gate8-fly-smoke"):
+    """Establish the fixture, govern one deploy, verify independently, record the proof, then clean up.
+    Returns a sanitized evidence dict. Does NOT promote lifecycle (Stage C)."""
     from .. import execution
     from ..errors import ExecutionBlockedError, InsufficientBudgetError
-    from . import runtime as deploy_runtime
-    from . import state as deploy_state
-    from .fly_worker import FlyMachinesWorker
+    from . import fly_smoke_fixture, runtime as deploy_runtime
+    from .fly_worker import FlyMachinesWorker, cleanup_machine
     from ..factory.workers import WorkerRegistry
 
     ev = {"smoke": "gate8-fly-deploy", "provider": PROVIDER_KIND, "repo_sha": os.environ.get("GITHUB_SHA", "local"),
           "ceiling": str(CEILING), "result": None, "deployment_effect": "NOT_OBSERVED",
-          "provider_contact_evidence": "UNKNOWN", "action_request_id": str(deploy_action_id)}
+          "provider_contact_evidence": "UNKNOWN", "cleanup_state": "NOT_ATTEMPTED",
+          "source_to_artifact_derivation_proven": False, "promoted_to_operating": False}
 
-    # Governance-delta baseline: the venture is already quality-qualified (Gate 5), so it legitimately
-    # carries prior investment decisions. The deploy must author ZERO new ones — measure the DELTA.
-    gov_baseline = _gov_count(conn, deploy_action_id)
+    # 1. FIXTURE FREEZE — self-contained; the app/image are frozen into release_hash.
+    fx = fly_smoke_fixture.establish_fixture(
+        conn, app=app, image_ref=image_ref, internal_port=internal_port, health_path=health_path,
+        health_marker=health_marker, region=region, ceiling=CEILING, slug=slug, actor=actor)
+    vid = fx["venture_id"]
+    deploy_action_id = fx["deploy_action_id"]
+    ev["canonical_ids"] = {k: fx[k] for k in ("venture_id", "build_manifest_id", "deployment_target_id",
+                                              "deploy_action_id", "release_candidate_id", "release_hash")}
+    ev["action_request_id"] = deploy_action_id
+    gov_baseline = _gov_count(conn, vid)   # baseline AFTER the (legitimate) BUILD decision
 
     worker = FlyMachinesWorker(transport=transport) if transport is not None else FlyMachinesWorker()
     reg = WorkerRegistry()
     reg.register(worker)
 
+    # 2. GOVERNED MACHINE CREATE
     try:
         _dispatch, r = deploy_runtime.execute_deploy(
             conn, deploy_action_id, registry=reg, worker_kind=PROVIDER_KIND,
             timeout_seconds=TIMEOUT_SECONDS, max_attempts=MAX_ATTEMPTS, actor=actor)
     except (InsufficientBudgetError, ExecutionBlockedError) as exc:
         blocked = "RESERVATION_FAILED" if "BUDGET" in str(exc).upper() else "BLOCKED_BEFORE_DISPATCH"
-        ev.update(result=blocked)
-        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
+        ev["result"] = blocked
+        return _finalize(conn, deploy_action_id, vid, ev, gov_baseline=gov_baseline)
 
     ev["dispatch_status"] = r.action_status
     ev["failure_class"] = r.failure_class
     status = execution.get_status(conn, deploy_action_id)
     if status == "RECOVERY_REQUIRED":
         ev.update(result="RECOVERY_REQUIRED", deployment_effect="UNKNOWN")
-        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
+        return _finalize(conn, deploy_action_id, vid, ev, gov_baseline=gov_baseline)
     if status == "FAILED":
-        # A definitive no-effect failure or provider rejection (never dispatched a machine we kept).
         ev.update(result="FAIL", deployment_effect="NOT_OBSERVED")
-        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
+        return _finalize(conn, deploy_action_id, vid, ev, gov_baseline=gov_baseline)
 
-    # A machine claim was captured -> read the durable identity and verify it INDEPENDENTLY.
+    # 3. INDEPENDENT OBSERVER + 4. DETERMINISTIC VERIFICATION
     claim = _captured_claim(conn, deploy_action_id)
     machine_id = claim.get("machine_id")
-    app = claim.get("app")
+    machine_app = claim.get("app") or app
     ev["machine_id"] = machine_id
     ev["deployment_effect"] = "OBSERVED" if machine_id else "UNKNOWN"
 
     token = os.environ.get(TOKEN_ENV)
-    hp = health_probe
-    if hp is None:
-        hp = default_health_probe(app, os.environ.get(HEALTH_PATH_ENV, "healthz"),
-                                  os.environ.get(HEALTH_MARKER_ENV))
+    hp = health_probe or default_health_probe(machine_app, health_path, health_marker)
     obs_transport = transport if transport is not None else __import__(
         "aidan_core.deploy.fly_transport", fromlist=["HttpFlyTransport"]).HttpFlyTransport()
 
     def _observer_factory(contract):
         from .observe import FlyDeploymentObserver
         return FlyDeploymentObserver(
-            fly_transport=obs_transport, token=token, app=contract.get("target_ref") or app,
+            fly_transport=obs_transport, token=token, app=contract.get("target_ref") or machine_app,
             machine_id=machine_id, venture_id=contract.get("venture_id"),
             deployment_target_id=contract.get("deployment_target_id"),
             health_probe=hp, required_state=REQUIRED_STATE, timeout=30.0)
@@ -148,40 +162,45 @@ def run_fly_deploy_smoke(conn, deploy_action_id, *, transport=None, health_probe
                                        observer_factory=_observer_factory)
     ev["deployment_verdict"] = "VERIFIED" if out.verified else "REJECTED"
     ev["provider_contact_evidence"] = "OBSERVED" if machine_id else "UNKNOWN"
-    if out.verified:
-        promo = deploy_state.promote_verified_deployment(conn, deploy_action_id, actor=actor)
-        ev["promotion"] = promo.get("outcome")
-    ev["result"] = "PASS" if execution.get_status(conn, deploy_action_id) == "SUCCEEDED" else "FAIL"
-    return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
+
+    # 5. GOVERNED CLEANUP of exactly the created machine (Stage C is ephemeral). NO promotion.
+    if machine_id:
+        ev["cleanup_state"] = cleanup_machine(obs_transport, token, machine_app, machine_id, timeout=30.0)
+
+    if not out.verified:
+        ev["result"] = "FAIL"
+    elif ev["cleanup_state"] == "CLEANUP_CONFIRMED":
+        ev["result"] = "PASS"
+    else:
+        # Verified boundary but cleanup not confirmed -> not a clean PASS; owner must reconcile the
+        # machine (no new machine is ever created here).
+        ev["result"] = "PASS_UNCLEAN_CLEANUP"
+        ev["owner_reconciliation"] = {"app": machine_app, "machine_id": machine_id,
+                                      "action": "verify machine deletion in the Fly app"}
+    return _finalize(conn, deploy_action_id, vid, ev, gov_baseline=gov_baseline)
 
 
-def _finalize(conn, action_id, ev, *, gov_baseline=0):
+def _finalize(conn, action_id, vid, ev, *, gov_baseline=0):
     from .. import execution
+    b = _budget_state(conn, vid)
+    if b is not None:
+        reserved, committed, granted = b
+        ev["reserved"], ev["committed"], ev["granted"] = (str(reserved), str(committed), str(granted))
+        ev["released"] = str(CEILING - committed)   # of the frozen ceiling, what was returned
+    ev["lifecycle_state"] = _lifecycle(conn, vid)   # MUST stay BUILDING (Stage C never promotes)
+    ev["governance_deltas"] = _gov_count(conn, vid) - gov_baseline
     with conn.cursor() as cur:
-        cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_id,))
-        row = cur.fetchone()
-    vid = row[0] if row else None
-    if vid is not None:
-        b = _budget_state(conn, vid)
-        if b is not None:
-            ev["reserved"], ev["committed"], ev["granted"] = (str(b[0]), str(b[1]), str(b[2]))
-        with conn.cursor() as cur:
-            cur.execute("SELECT lifecycle_state FROM venture WHERE id = %s", (vid,))
-            lr = cur.fetchone()
-            ev["lifecycle_state"] = lr[0] if lr else None
-            cur.execute("SELECT id, verification_type, result, evidence_hash FROM proof_receipt "
-                        "WHERE action_request_id = %s ORDER BY created_at DESC LIMIT 1", (action_id,))
-            pr = cur.fetchone()
-            cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (vid,))
-            # DELTA vs the pre-deploy baseline: a deploy must author no new investment decision.
-            ev["governance_deltas"] = cur.fetchone()[0] - gov_baseline
-        if pr is not None:
-            ev["proof_receipt_id"], ev["proof_verification_type"] = str(pr[0]), pr[1]
-            ev["proof_result"], ev["evidence_hash"] = pr[2], pr[3]
+        cur.execute("SELECT id, verification_type, result, evidence_hash FROM proof_receipt "
+                    "WHERE action_request_id = %s ORDER BY created_at DESC LIMIT 1", (action_id,))
+        pr = cur.fetchone()
+    if pr is not None:
+        ev["proof_receipt_id"], ev["proof_verification_type"] = str(pr[0]), pr[1]
+        ev["proof_result"], ev["evidence_hash"] = pr[2], pr[3]
     ev["final_status"] = execution.get_status(conn, action_id)
-    # secret-leak self check (token read in-process, only tested for ABSENCE)
     token = os.environ.get(TOKEN_ENV)
     ev["secret_leak_check"] = "FAIL" if (token and token in json.dumps(ev)) else "PASS"
+    # actual Fly billing is UNKNOWN unless independently observed; never claimed from accounting.
+    ev["actual_provider_billing"] = "UNKNOWN"
     return ev
 
 
@@ -192,19 +211,22 @@ def main() -> int:
     if os.environ.get("CONFIRM", "") != CONFIRM_TOKEN:
         print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIRM_REQUIRED"}))
         return 2
-    if not os.environ.get(TOKEN_ENV):
-        print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIG_ERROR", "reason": TOKEN_ENV}))
-        return 2
-    action_id = os.environ.get(ACTION_ENV)
-    if not action_id:
-        # The qualified release + deploy ActionRequest must be established (owner/preceding gate).
-        print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIG_ERROR", "reason": ACTION_ENV}))
-        return 2
+    accepted = os.environ.get(ACCEPTED_SHA_ENV)
+    if accepted and os.environ.get("GITHUB_SHA") and accepted != os.environ["GITHUB_SHA"]:
+        print(json.dumps({"smoke": "gate8-fly-deploy", "result": "SHA_MISMATCH"}))
+        return 3
+    for env in (TOKEN_ENV, APP_ENV, IMAGE_ENV, PORT_ENV):
+        if not os.environ.get(env):
+            print(json.dumps({"smoke": "gate8-fly-deploy", "result": "CONFIG_ERROR", "reason": env}))
+            return 2
 
     import psycopg
     conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
     try:
-        ev = run_fly_deploy_smoke(conn, action_id)   # real Fly transport + health probe
+        ev = run_fly_deploy_smoke(
+            conn, app=os.environ[APP_ENV], image_ref=os.environ[IMAGE_ENV],
+            internal_port=int(os.environ[PORT_ENV]), health_path=os.environ.get(HEALTH_PATH_ENV, "/"),
+            health_marker=os.environ.get(HEALTH_MARKER_ENV), region=os.environ.get(REGION_ENV))
     except Exception as exc:  # sanitized last-resort; never a raw traceback / provider body
         print(json.dumps({"smoke": "gate8-fly-deploy", "result": "UNEXPECTED_ERROR",
                           "error_type": type(exc).__name__}))
@@ -213,7 +235,7 @@ def main() -> int:
         conn.close()
     print(json.dumps(ev, sort_keys=True))
     ok = (ev.get("result") == "PASS" and ev.get("secret_leak_check") == "PASS"
-          and ev.get("governance_deltas") == 0)
+          and ev.get("governance_deltas") == 0 and ev.get("lifecycle_state") == "BUILDING")
     return 0 if ok else 4
 
 

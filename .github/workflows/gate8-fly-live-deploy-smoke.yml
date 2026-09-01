@@ -1,12 +1,14 @@
 name: Gate 8 Fly Live Deploy Smoke
 
-# MANUAL ONLY. One authorized dispatch -> at most one real Fly machine create (max_attempts=1). No
-# push / pull_request / schedule / workflow_run trigger, and NO retry. The deploy governs an already
-# quality-qualified, frozen release_candidate whose immutable expected_artifact_identity (OCI digest)
-# is the release authority; the running digest is read back INDEPENDENTLY and promotion happens only
-# from a VERIFIED DEPLOYMENT_RELEASE proof. Spend is bounded to USD 0.05. Ambiguous effects fail
-# closed into RECOVERY_REQUIRED (never blind-retried). Sanitized evidence only — no credential, no
-# raw provider response. NOT auto-dispatched; requires the explicit confirmation token below.
+# MANUAL ONLY. One authorized dispatch -> at most one real Fly machine create (max_attempts=1) plus
+# ONE cleanup delete of that exact machine. No push / pull_request / schedule / workflow_run trigger,
+# and NO retry. The smoke establishes its OWN complete bounded canonical fixture in a fresh ephemeral
+# PostgreSQL (no foreign ActionRequest id), deploys the EXACT frozen OCI artifact its release
+# authorizes to an owner-created venture-owned Fly app, reads the running digest back INDEPENDENTLY,
+# records a VERIFIED DEPLOYMENT_RELEASE proof, then DELETES the machine and confirms absence. It does
+# NOT promote to OPERATING (Stage C: the venture stays BUILDING). Spend bounded to USD 0.05. Ambiguous
+# effects fail closed into RECOVERY_REQUIRED (never blind-retried); ambiguous cleanup is never a clean
+# PASS. Sanitized evidence only — no credential, no raw provider response. NOT auto-dispatched.
 on:
   workflow_dispatch:
     inputs:
@@ -14,8 +16,24 @@ on:
         description: 'Type RUN_FROZEN_FLY_DEPLOY_SMOKE to authorize the single bounded live deploy (<= USD 0.05)'
         required: true
         default: ''
-      deploy_action_id:
-        description: 'The deploy ActionRequest id whose frozen fly-machines release_candidate is to be deployed'
+      fly_app:
+        description: 'The owner-created, venture-owned Fly app name (external infrastructure) to deploy into'
+        required: true
+        default: ''
+      image_ref:
+        description: 'A DIGEST-PINNED public OCI image with a bounded HTTP health endpoint, e.g. nginx@sha256:...'
+        required: true
+        default: ''
+      internal_port:
+        description: 'The image internal HTTP port (e.g. 80 for nginx)'
+        required: true
+        default: '80'
+      health_path:
+        description: 'External health path served by the image (e.g. /)'
+        required: true
+        default: '/'
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
         required: true
         default: ''
 
@@ -47,8 +65,11 @@ jobs:
       DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_fly_smoke
       CONFIRM: ${{ github.event.inputs.confirm }}
       AIDAN_OS_REPO_ROOT: ${{ github.workspace }}
-      FLY_SMOKE_DEPLOY_ACTION_ID: ${{ github.event.inputs.deploy_action_id }}
-      FLY_SMOKE_HEALTH_PATH: healthz
+      FLY_SMOKE_APP: ${{ github.event.inputs.fly_app }}
+      FLY_SMOKE_IMAGE_REF: ${{ github.event.inputs.image_ref }}
+      FLY_SMOKE_INTERNAL_PORT: ${{ github.event.inputs.internal_port }}
+      FLY_SMOKE_HEALTH_PATH: ${{ github.event.inputs.health_path }}
+      FLY_SMOKE_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
 
     steps:
       - name: Checkout
@@ -65,7 +86,7 @@ jobs:
       - name: Apply migrations
         run: python -m aidan_core.migrate
 
-      - name: Run the frozen bounded live Fly deploy smoke (exactly one attempt)
+      - name: Run the frozen bounded live Fly deploy boundary smoke (one create + one cleanup)
         env:
           # Invocation-scoped, app-scoped Fly deploy token. Host-mapped into this step only; never
           # persisted in canonical state and never printed.

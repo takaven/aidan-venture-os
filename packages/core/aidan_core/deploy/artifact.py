@@ -1,20 +1,34 @@
 """Provider-neutral deploy ARTIFACT IDENTITY (Gate 6 real-deploy readiness).
 
 Gate-6 freezes ``candidate_tree_hash`` (exact source-tree identity). A real external deploy runs an
-OCI image, whose identity is an immutable content digest. This module is the trusted authority
-bridge: it validates and normalizes the ``expected_artifact_identity`` (the frozen OCI digest) that
-a trusted host tool derives from the frozen candidate BEFORE deploy authority is frozen. The digest
-then rides inside the immutable ``release_contract`` (so it is hashed into ``release_hash`` and a
-changed digest changes release identity), is bound into the immutable execution spec, and is later
-compared by the verifier against the provider read-back. Nothing here builds an image or talks to a
-provider; the deterministic OCI construction is a separate, pinned, contract-tested host tool with
-NO worker authority. The worker can never substitute a different digest — it only receives the frozen
-one and the verifier independently confirms the RUNNING digest equals it.
+OCI image, whose identity is an immutable content digest. This module validates and normalizes the
+``expected_artifact_identity`` (an OCI digest) that is frozen into the immutable ``release_contract``
+(so it is hashed into ``release_hash`` and a changed digest changes release identity), bound into the
+immutable execution spec, and later compared by the verifier against the provider read-back.
+
+SCOPE — honest claim boundary. This module does NOT derive ``candidate_tree_hash -> OCI digest``. It
+only validates/normalizes a caller-supplied digest. Therefore the Stage-C smoke proves only:
+
+    "AIDAN deployed the EXACT OCI artifact its frozen release explicitly authorized."
+
+and explicitly NOT:
+
+    "AIDAN proved this OCI artifact was BUILT from candidate_tree_hash."
+
+The ``candidate_tree_hash -> deploy artifact`` derivation (a deterministic, pinned host build tool)
+is deliberately out of scope here and remains UNPROVEN by this smoke — a later composed production
+proof must close that bridge. ``SOURCE_TO_ARTIFACT_DERIVATION_PROVEN`` records this, so no evidence
+line can overclaim a derivation. The worker can never substitute a different digest — it receives
+only the frozen one and the verifier independently confirms the RUNNING digest equals it.
 """
 from __future__ import annotations
 
 import re
 from typing import Any, Optional
+
+# HONEST MARKER: this module does not (and this smoke does not) prove source-tree -> OCI-image
+# derivation. Kept False until a deterministic, pinned build tool closes that bridge in a later slice.
+SOURCE_TO_ARTIFACT_DERIVATION_PROVEN = False
 
 ARTIFACT_KIND_OCI_DIGEST = "oci-image-digest"
 _ALGOS = ("sha256", "sha512")

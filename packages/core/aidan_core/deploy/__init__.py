@@ -25,6 +25,13 @@ from .state import (
     promote_verified_deployment,
     verified_deployment,
 )
+from .observe import (
+    DeploymentObservation,
+    DeploymentObserver,
+    LocalTargetObserver,
+    ObservedFile,
+    observed_tree_hash,
+)
 from .target import TargetResult, get_deployment_target, register_deployment_target
 from .verifiers import DeploymentReleaseVerifier, deploy_verifier_registry
 
@@ -32,6 +39,11 @@ __all__ = [
     "TargetResult",
     "register_deployment_target",
     "get_deployment_target",
+    "DeploymentObservation",
+    "DeploymentObserver",
+    "LocalTargetObserver",
+    "ObservedFile",
+    "observed_tree_hash",
     "ReleaseResult",
     "create_release_candidate",
     "get_release_candidate",

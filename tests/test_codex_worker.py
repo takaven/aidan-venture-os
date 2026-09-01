@@ -112,11 +112,18 @@ def test_prompt_via_stdin_and_locked_flags(tmp_path):
     argv = call["argv"]
     assert call["stdin"] == "implement add(a,b)"
     assert "implement add(a,b)" not in " ".join(argv)
-    assert argv[1:4] == ["exec", "-", "--json"]
-    for tok in ("--model", "gpt-5-mini", "--sandbox", "workspace-write", "--ask-for-approval",
-                "never", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+    # --ask-for-approval is a GLOBAL codex option (not an `exec` option in 0.151.0) and MUST precede
+    # the subcommand; placing it after `exec` is rejected by clap (the live-smoke-#2 root cause).
+    assert argv[1:3] == ["--ask-for-approval", "never"]
+    ai = argv.index("--ask-for-approval")
+    ei = argv.index("exec")
+    assert ai < ei                                       # global flag strictly before the subcommand
+    assert argv[ei:ei + 3] == ["exec", "-", "--json"]    # exec options still follow the subcommand
+    for tok in ("--model", "gpt-5-mini", "--sandbox", "workspace-write",
+                "--ephemeral", "--ignore-user-config", "--ignore-rules",
                 "shell_environment_policy.ignore_default_excludes=false"):
         assert tok in argv
+        assert argv.index(tok) > ei                      # ...and after `exec`
     assert "--skip-git-repo-check" not in argv           # removed: git-repo safety kept
 
 

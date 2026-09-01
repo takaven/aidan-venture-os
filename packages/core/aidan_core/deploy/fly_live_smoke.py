@@ -42,6 +42,17 @@ def _captured_claim(conn, action_id):
     return ((row[0] if row else {}) or {}).get("structured_output", {}) if row else {}
 
 
+def _gov_count(conn, action_id):
+    """Count investment_decision_record for the action's venture (the governance-delta baseline)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_id,))
+        row = cur.fetchone()
+        if row is None:
+            return 0
+        cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (row[0],))
+        return cur.fetchone()[0]
+
+
 def _budget_state(conn, vid):
     with conn.cursor() as cur:
         cur.execute("SELECT reserved_amount, committed_amount, granted_amount FROM budget_account "
@@ -82,6 +93,10 @@ def run_fly_deploy_smoke(conn, deploy_action_id, *, transport=None, health_probe
           "ceiling": str(CEILING), "result": None, "deployment_effect": "NOT_OBSERVED",
           "provider_contact_evidence": "UNKNOWN", "action_request_id": str(deploy_action_id)}
 
+    # Governance-delta baseline: the venture is already quality-qualified (Gate 5), so it legitimately
+    # carries prior investment decisions. The deploy must author ZERO new ones — measure the DELTA.
+    gov_baseline = _gov_count(conn, deploy_action_id)
+
     worker = FlyMachinesWorker(transport=transport) if transport is not None else FlyMachinesWorker()
     reg = WorkerRegistry()
     reg.register(worker)
@@ -93,18 +108,18 @@ def run_fly_deploy_smoke(conn, deploy_action_id, *, transport=None, health_probe
     except (InsufficientBudgetError, ExecutionBlockedError) as exc:
         blocked = "RESERVATION_FAILED" if "BUDGET" in str(exc).upper() else "BLOCKED_BEFORE_DISPATCH"
         ev.update(result=blocked)
-        return _finalize(conn, deploy_action_id, ev)
+        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
 
     ev["dispatch_status"] = r.action_status
     ev["failure_class"] = r.failure_class
     status = execution.get_status(conn, deploy_action_id)
     if status == "RECOVERY_REQUIRED":
         ev.update(result="RECOVERY_REQUIRED", deployment_effect="UNKNOWN")
-        return _finalize(conn, deploy_action_id, ev)
+        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
     if status == "FAILED":
         # A definitive no-effect failure or provider rejection (never dispatched a machine we kept).
         ev.update(result="FAIL", deployment_effect="NOT_OBSERVED")
-        return _finalize(conn, deploy_action_id, ev)
+        return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
 
     # A machine claim was captured -> read the durable identity and verify it INDEPENDENTLY.
     claim = _captured_claim(conn, deploy_action_id)
@@ -137,10 +152,10 @@ def run_fly_deploy_smoke(conn, deploy_action_id, *, transport=None, health_probe
         promo = deploy_state.promote_verified_deployment(conn, deploy_action_id, actor=actor)
         ev["promotion"] = promo.get("outcome")
     ev["result"] = "PASS" if execution.get_status(conn, deploy_action_id) == "SUCCEEDED" else "FAIL"
-    return _finalize(conn, deploy_action_id, ev)
+    return _finalize(conn, deploy_action_id, ev, gov_baseline=gov_baseline)
 
 
-def _finalize(conn, action_id, ev):
+def _finalize(conn, action_id, ev, *, gov_baseline=0):
     from .. import execution
     with conn.cursor() as cur:
         cur.execute("SELECT venture_id FROM action_request WHERE id = %s", (action_id,))
@@ -158,7 +173,8 @@ def _finalize(conn, action_id, ev):
                         "WHERE action_request_id = %s ORDER BY created_at DESC LIMIT 1", (action_id,))
             pr = cur.fetchone()
             cur.execute("SELECT count(*) FROM investment_decision_record WHERE venture_id = %s", (vid,))
-            ev["governance_deltas"] = cur.fetchone()[0]
+            # DELTA vs the pre-deploy baseline: a deploy must author no new investment decision.
+            ev["governance_deltas"] = cur.fetchone()[0] - gov_baseline
         if pr is not None:
             ev["proof_receipt_id"], ev["proof_verification_type"] = str(pr[0]), pr[1]
             ev["proof_result"], ev["evidence_hash"] = pr[2], pr[3]

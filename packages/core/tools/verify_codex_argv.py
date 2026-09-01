@@ -1,32 +1,43 @@
 """Deterministic Codex 0.151.0 argv PARSE falsification — NO credential, NO provider request.
 
-Runs the EXACT production adapter argv with NO API key and a benign prompt on stdin, inside a
-throwaway git dir, and classifies the failure from BOUNDED stderr markers only (never emits raw
-stderr/stdout). It distinguishes:
-  - ARG_PARSE_ERROR       : the CLI rejected the flag shape (adapter argv is wrong for 0.151.0)
+Runs the EXACT production adapter argv (taken from ``CodexExecWorker._argv`` itself, never a copy
+that could drift) with NO API key and a benign prompt on stdin, inside a throwaway git dir, and
+classifies the failure from BOUNDED markers only. It distinguishes:
+  - ARG_PARSE_ERROR        : the CLI rejected the flag shape (adapter argv is wrong for 0.151.0)
   - AUTH_OR_CONFIG_MISSING : flags accepted; the run only failed for lack of a credential
   - OTHER / TIMEOUT        : inconclusive
-Because no credential is present, the CLI fails before any provider API request, so this cannot
-contact OpenAI. Used by the codex-contract CI job.
+
+Because no credential is present, the CLI fails BEFORE any provider API request (clap parses argv
+before auth/network), so this can never contact OpenAI or spend. On ARG_PARSE_ERROR it additionally
+surfaces, safely, which of OUR OWN known flag tokens clap rejected and each flag's parser scope
+(accepted by the ``exec`` subcommand help and/or the global help) — enough to repair the argv
+minimally. It never echoes raw stderr/stdout; the only tokens it can print are ones already present
+in our own argv. Used by the codex-contract CI job; fails closed on ARG_PARSE_ERROR.
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
-# The EXACT flag shape the CodexExecWorker adapter emits (workspace filled at runtime).
-FLAGS = ["exec", "-", "--json", "--model", "gpt-5-mini", "--cd", "{ws}",
-         "--sandbox", "workspace-write", "--ask-for-approval", "never", "--ephemeral",
-         "--ignore-user-config", "--ignore-rules",
-         "-c", "shell_environment_policy.ignore_default_excludes=false"]
-
 _ARG_MARKERS = ["unexpected argument", "unrecognized", "invalid value for", "error: a value",
                 "error: unexpected", "usage:", "tip: a similar", "argument"]
 _AUTH_MARKERS = ["not logged in", "authenticate", "api key", "codex_api_key", "openai_api_key",
                  "sign in", "login", "401", "unauthorized", "credential", "no api key"]
+
+# clap quotes the offending token; we only ever surface a token that is ALSO in our own argv.
+_QUOTED = re.compile(r"'([^']{1,64})'")
+
+
+def _production_argv(codex_bin: str, ws: str):
+    """The EXACT argv the adapter emits (frozen model, given workspace)."""
+    # packages/core (contains aidan_core) — importing codex_worker is light (no psycopg/DB).
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from aidan_core.factory.codex_worker import CodexExecWorker
+    return CodexExecWorker()._argv(codex_bin, "gpt-5-mini", ws)
 
 
 def classify(text: str) -> str:
@@ -40,6 +51,17 @@ def classify(text: str) -> str:
     return "OTHER"
 
 
+def _run(argv, ws, stdin=""):
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": ws, "CODEX_HOME": ws, "TMPDIR": ws}
+    return subprocess.run(argv, input=stdin, capture_output=True, text=True, env=env, timeout=60)
+
+
+def _rejected_own_tokens(stderr_stdout: str, own_tokens):
+    """Tokens clap quoted as offending that are ALSO in our argv (never arbitrary text)."""
+    quoted = set(_QUOTED.findall(stderr_stdout or ""))
+    return [t for t in own_tokens if t in quoted]
+
+
 def main() -> int:
     codex = shutil.which("codex")
     if not codex:
@@ -47,25 +69,35 @@ def main() -> int:
         return 1
     with tempfile.TemporaryDirectory() as ws:
         subprocess.run(["git", "init", "-q", ws], check=False)
-        argv = [codex] + [a.replace("{ws}", ws) for a in FLAGS]
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": ws, "CODEX_HOME": ws, "TMPDIR": ws}
+        argv = _production_argv(codex, ws)
+        # only long/short flag tokens from OUR argv are ever eligible to be echoed back
+        own_flags = [a for a in argv if a.startswith("-") and a != "-"]
         try:
-            p = subprocess.run(argv, input="say hi", capture_output=True, text=True, env=env, timeout=60)
+            p = _run(argv, ws, stdin="say hi")
         except subprocess.TimeoutExpired:
             print("classification=TIMEOUT exit=timeout")
             return 0
-        cat = classify((p.stderr or "") + "\n" + (p.stdout or ""))
+        combined = (p.stderr or "") + "\n" + (p.stdout or "")
+        cat = classify(combined)
         print(f"classification={cat} exit={p.returncode}")
-        # bounded diagnostic: only which marker categories matched, never raw text
-        low = ((p.stderr or "") + (p.stdout or "")).lower()
+        low = combined.lower()
         print("markers: arg=%s auth=%s" % (
             any(m in low for m in _ARG_MARKERS), any(m in low for m in _AUTH_MARKERS)))
-    # Fail CLOSED iff the CLI REJECTED the production flag shape (argv drift for 0.151.0). A run that
-    # only failed for the (deliberately) missing credential proves the flags parsed -> PASS. OTHER /
-    # TIMEOUT are inconclusive and non-fatal, but printed for the operator.
-    if cat == "ARG_PARSE_ERROR":
-        print("FAIL: production adapter argv was rejected by codex 0.151.0 (contract drift)")
-        return 1
+
+        if cat == "ARG_PARSE_ERROR":
+            rejected = _rejected_own_tokens(combined, own_flags)
+            print(f"rejected_own_flags: {rejected or 'unnamed'}")
+            # Scope probe: for each production flag, is it accepted by the exec subcommand's help
+            # and/or the global help? A flag present only in the global help but placed AFTER `exec`
+            # is the classic clap "global option must precede subcommand" drift.
+            exec_help = _run([codex, "exec", "--help"], ws).stdout or ""
+            root_help = _run([codex, "--help"], ws).stdout or ""
+            for f in own_flags:
+                in_exec = f in exec_help
+                in_root = f in root_help
+                print(f"scope {f}: exec={in_exec} global={in_root}")
+            print("FAIL: production adapter argv was rejected by codex 0.151.0 (contract drift)")
+            return 1
     return 0
 
 

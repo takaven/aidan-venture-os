@@ -46,6 +46,53 @@ def _machine_name(action_request_id: str) -> str:
     return f"aidan-{slug}"
 
 
+def _machine_config(image: str, runtime_contract, health_contract) -> dict:
+    """Build the EXACT Fly Machine config from FROZEN authority (the worker invents nothing). The
+    runtime_contract must expose an HTTP service so <app>.fly.dev routes to the machine; missing it
+    means the observer's external health route cannot be satisfied -> refuse to create."""
+    rc = dict(runtime_contract or {})
+    internal_port = rc.get("internal_port")
+    ports = rc.get("ports")
+    if not isinstance(internal_port, int) or not ports:
+        raise DeployAdapterError("FLY_RUNTIME_CONTRACT_MISSING")
+    config = {"image": image, "services": [{
+        "protocol": rc.get("protocol", "tcp"),
+        "internal_port": internal_port,
+        "ports": ports,
+    }]}
+    # Optional bounded Fly-side HTTP health check, derived from the frozen health path.
+    hc = dict(health_contract or {})
+    path = hc.get("path")
+    if path:
+        config["checks"] = {"http": {"type": "http", "port": internal_port, "method": "GET",
+                                     "path": path, "interval": "15s", "timeout": "10s"}}
+    return config
+
+
+def cleanup_machine(transport, token, app, machine_id, *, timeout=30.0) -> str:
+    """Governed teardown of EXACTLY the created machine, then independently confirm absence. Returns
+    CLEANUP_CONFIRMED (machine gone), CLEANUP_FAILED (still present), or CLEANUP_AMBIGUOUS (could not
+    determine). Never creates anything; never blind-retries an ambiguous DELETE. Force-deletes a
+    running machine (Fly ?force=true)."""
+    if not machine_id or not app:
+        return "CLEANUP_AMBIGUOUS"
+    try:
+        transport("DELETE", f"/apps/{app}/machines/{machine_id}?force=true", token=token, timeout=timeout)
+    except FlyTransportError:
+        # The DELETE may or may not have taken effect; a single read-only confirmation decides, but
+        # we do NOT re-issue the DELETE.
+        pass
+    try:
+        resp = transport("GET", f"/apps/{app}/machines/{machine_id}", token=token, timeout=timeout)
+    except FlyTransportError:
+        return "CLEANUP_AMBIGUOUS"
+    if resp.status == 404:
+        return "CLEANUP_CONFIRMED"       # independently confirmed absent
+    if resp.status == 200 and (resp.body or {}).get("state") not in (None, "destroyed"):
+        return "CLEANUP_FAILED"          # still present/running
+    return "CLEANUP_AMBIGUOUS"
+
+
 class FlyMachinesWorker:
     """Deploy the frozen release image to a venture-owned Fly app via the Machines API."""
 
@@ -90,13 +137,17 @@ class FlyMachinesWorker:
                 raise DeployAdapterError("FLY_IMAGE_DIGEST_MISMATCH")
         except artifact_mod.ArtifactIdentityError as exc:
             raise DeployAdapterError("FLY_IMAGE_NOT_DIGEST_PINNED") from exc
+        # The Machine service/port config that makes <app>.fly.dev externally reachable is FROZEN
+        # authority, not invented by the worker. Without it the observer's health route cannot be
+        # satisfied, so refuse to create anything.
+        config = _machine_config(image, rc.get("runtime_contract"), rc.get("health_contract"))
 
         name = _machine_name(request.action_request_id)
         region = rc.get("region")
         timeout = float(request.timeout_seconds or 60)
 
         # ---- create the machine (the consequential mutation) --------------------------------------
-        body = {"name": name, "config": {"image": image}}
+        body = {"name": name, "config": config}
         if region:
             body["region"] = region
         try:

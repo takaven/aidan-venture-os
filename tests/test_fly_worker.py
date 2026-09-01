@@ -13,7 +13,7 @@ import pytest
 
 from aidan_core.errors import AmbiguousExternalEffectError, DeployAdapterError
 from aidan_core.deploy.fly_transport import PHASE_POST_SEND, PHASE_PRE_SEND, FlyResponse, FlyTransportError
-from aidan_core.deploy.fly_worker import TOKEN_ENV, FlyMachinesWorker, _machine_name
+from aidan_core.deploy.fly_worker import TOKEN_ENV, FlyMachinesWorker, _machine_name, cleanup_machine
 from aidan_core.factory.workers import WorkerRequest
 
 DIGEST = "sha256:" + "ab" * 32
@@ -44,11 +44,19 @@ class FakeFly:
         return sum(1 for c in self.calls if c["method"] == method)
 
 
-def _request(*, image=IMAGE, digest=DIGEST, provider="fly-machines", app=APP, aid="a1b2c3d4-0000"):
+RUNTIME_CONTRACT = {"internal_port": 8080, "protocol": "tcp",
+                    "ports": [{"port": 80, "handlers": ["http"]}, {"port": 443, "handlers": ["tls", "http"]}]}
+
+
+def _request(*, image=IMAGE, digest=DIGEST, provider="fly-machines", app=APP, aid="a1b2c3d4-0000",
+             runtime_contract=RUNTIME_CONTRACT):
     rc = {"expected_artifact_identity": {"kind": "oci-image-digest", "digest": digest} if digest else None,
-          "image_ref": image, "region": "ams", "required_state": "started"}
+          "image_ref": image, "region": "ams", "required_state": "started",
+          "runtime_contract": runtime_contract, "health_contract": {"path": "/"}}
     if digest is None:
         rc.pop("expected_artifact_identity")
+    if runtime_contract is None:
+        rc.pop("runtime_contract")
     return WorkerRequest(
         action_request_id=aid, attempt_id="att-1", venture_id="ven-1", spec_hash="sh",
         worker_kind="fly-machines", capabilities=("DEPLOY_CANDIDATE",), timeout_seconds=60,
@@ -102,6 +110,24 @@ def test_D_deploys_exact_frozen_digest():
     FlyMachinesWorker(transport=fake).execute(_request())
     post = next(c for c in fake.calls if c["method"] == "POST")
     assert post["body"]["config"]["image"] == IMAGE            # exactly the frozen digest-pinned ref
+
+
+# ---- F: the exact frozen Machine service/port config is emitted (worker invents nothing) ----------
+def test_F_emits_frozen_service_config():
+    fake = FakeFly(responses=[("POST", "/machines", FlyResponse(200, _created()))])
+    FlyMachinesWorker(transport=fake).execute(_request())
+    cfg = next(c for c in fake.calls if c["method"] == "POST")["body"]["config"]
+    assert cfg["services"] == [{"protocol": "tcp", "internal_port": 8080,
+                                "ports": RUNTIME_CONTRACT["ports"]}]
+    assert cfg["checks"]["http"]["port"] == 8080 and cfg["checks"]["http"]["path"] == "/"
+
+
+# ---- G: missing required networking/runtime config -> NO create -----------------------
+def test_G_missing_runtime_contract_no_create():
+    fake = FakeFly()
+    with pytest.raises(DeployAdapterError) as ei:
+        FlyMachinesWorker(transport=fake).execute(_request(runtime_contract=None))
+    assert ei.value.code == "FLY_RUNTIME_CONTRACT_MISSING" and fake.calls == []
 
 
 def test_D_image_digest_mismatch_rejected_before_mutation():
@@ -180,3 +206,42 @@ def test_Q_no_secret_in_worker_result():
     result = FlyMachinesWorker(transport=fake).execute(_request())
     blob = json.dumps(result.structured_output) + result.external_result_id + result.reported_outcome
     assert "fly-secret-not-real-XYZ" not in blob
+
+
+# ---- M/N/O: governed cleanup deletes only the exact machine + independently confirms absence ------
+def test_M_N_cleanup_deletes_exact_machine_and_confirms_absence():
+    fake = FakeFly(responses=[("DELETE", "/machines/m-1", FlyResponse(200, {"ok": True})),
+                              ("GET", "/machines/m-1", FlyResponse(404, {}))])
+    state = cleanup_machine(fake, "tok", APP, "m-1")
+    assert state == "CLEANUP_CONFIRMED"
+    dele = next(c for c in fake.calls if c["method"] == "DELETE")
+    assert dele["path"] == f"/apps/{APP}/machines/m-1?force=true"   # exactly that machine, force
+
+
+def test_O_cleanup_still_present_is_failed():
+    fake = FakeFly(responses=[("DELETE", "/machines/m-1", FlyResponse(200, {"ok": True})),
+                              ("GET", "/machines/m-1", FlyResponse(200, {"id": "m-1", "state": "started"}))])
+    assert cleanup_machine(fake, "tok", APP, "m-1") == "CLEANUP_FAILED"
+
+
+def test_O_cleanup_unreachable_confirm_is_ambiguous_no_retry():
+    fake = FakeFly(raises=[("GET", "/machines/m-1", FlyTransportError("t", phase=PHASE_POST_SEND))],
+                   responses=[("DELETE", "/machines/m-1", FlyResponse(200, {"ok": True}))])
+    assert cleanup_machine(fake, "tok", APP, "m-1") == "CLEANUP_AMBIGUOUS"
+    assert fake.count("DELETE") == 1                                # never re-issued the DELETE
+
+
+# ---- C/D/E: artifact identity frozen; digest changes release identity; no derivation claim -------
+def test_C_D_E_artifact_identity_frozen_and_honest():
+    from aidan_core.deploy import artifact as artifact_mod
+    from aidan_core.deploy.fly_smoke_fixture import build_release_contract
+    rc = build_release_contract(image_ref=IMAGE, internal_port=80, health_path="/")
+    # C: BOTH the full digest-pinned image_ref AND the expected_artifact_identity are frozen.
+    assert rc["image_ref"] == IMAGE
+    assert rc["expected_artifact_identity"]["digest"] == DIGEST
+    # D: a different image digest yields a different frozen artifact identity (=> different release_hash).
+    other = f"registry.fly.io/x@sha256:{'cd' * 32}"
+    rc2 = build_release_contract(image_ref=other, internal_port=80, health_path="/")
+    assert rc2["expected_artifact_identity"] != rc["expected_artifact_identity"]
+    # E: the module records that source->artifact derivation is NOT proven by this smoke.
+    assert artifact_mod.SOURCE_TO_ARTIFACT_DERIVATION_PROVEN is False

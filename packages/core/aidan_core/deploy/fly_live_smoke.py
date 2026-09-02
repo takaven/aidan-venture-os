@@ -93,25 +93,63 @@ def observed_health_from_body(body, expected_marker):
     return "ok" if text.strip() else None
 
 
-def default_health_probe(app, path, expected_marker):
+def default_health_probe(app, path, expected_marker, diag=None):
     """Real external health probe: GET https://<app>.fly.dev/<path>, read a BOUNDED body, and reduce
-    it to the canonical marker via ``observed_health_from_body``. Read-only; never mutates."""
+    it to the canonical marker via ``observed_health_from_body``. Read-only; never mutates. When a
+    ``diag`` dict is given it records ONLY bounded, non-secret signals (whether the probe reached HTTP
+    and the status code) — never the body/headers."""
     def _probe():
         import urllib.request
         url = f"https://{app}.fly.dev/{str(path or '').lstrip('/')}"
         try:
             with urllib.request.urlopen(url, timeout=15) as resp:   # noqa: S310 (fixed https host)
+                if diag is not None:
+                    diag["reached"] = True
+                    diag["http_status"] = int(resp.status)
                 if resp.status != 200:
                     return None
                 body = resp.read(_HEALTH_BODY_LIMIT).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
+            if diag is not None:
+                diag["reached"] = False
             return None
         return observed_health_from_body(body, expected_marker)
     return _probe
 
 
+def _build_diagnostics(captured, health_diag, expected_marker):
+    """Bounded, sanitized diagnostic block (DISTINCT from the canonical Proof Receipt). Re-runs the
+    SAME pure digest-mode checks over the captured observation — no extra Fly call — so a REJECTED
+    run reveals the exact failed invariant. Emits NO token/header/raw-body/unbounded payload."""
+    obs = captured.get("observation")
+    if obs is None:
+        return {"available": False, "reason": "no independent observation was captured"}
+    c = captured.get("contract", {})
+    from . import checks as checks_mod
+    results = checks_mod.evaluate_artifact_observation(
+        obs, venture_id=c.get("venture_id"), deployment_target_id=c.get("deployment_target_id"),
+        expected_artifact_identity=c.get("expected_artifact_identity"),
+        release_contract=c.get("release_contract", {}),
+        required_state=c.get("required_state", spec.REQUIRED_STATE))
+    return {
+        "available": True,
+        "checks": [{"name": r.name, "result": r.result, "detail": r.detail} for r in results],
+        "expected_artifact_digest": c.get("expected_artifact_identity", {}).get("digest"),
+        "observed_artifact_digest": obs.artifact_identity,
+        "required_runtime_state": c.get("required_state", spec.REQUIRED_STATE),
+        "observed_runtime_state": obs.running_state,
+        "read_back_contact": obs.contact,               # OBSERVED | NOT_OBSERVED | UNKNOWN
+        "health": {
+            "probe_reached": health_diag.get("reached"),      # True/False/None(injected)
+            "http_status": health_diag.get("http_status"),
+            "expected_marker": expected_marker,
+            "marker_matched": obs.health_marker == expected_marker,
+        },
+    }
+
+
 def run_fly_deploy_smoke(conn, *, app, transport=None, health_probe=None, actor="fly-smoke",
-                         slug="gate8-fly-smoke"):
+                         slug="gate8-fly-smoke", cleanup_sleep=None):
     """Establish the fixture from the FROZEN Stage-C spec, govern one deploy, verify independently,
     record the proof, then clean up. Returns a sanitized evidence dict. Does NOT promote lifecycle.
     Every deploy-relevant value is frozen (fly_stagec_spec); only ``app`` varies (owner target)."""
@@ -180,26 +218,40 @@ def run_fly_deploy_smoke(conn, *, app, transport=None, health_probe=None, actor=
     ev["deployment_effect"] = "OBSERVED" if machine_id else "UNKNOWN"
 
     token = os.environ.get(TOKEN_ENV)
-    hp = health_probe or default_health_probe(machine_app, health_path, health_marker)
+    health_diag = {}
+    hp = health_probe or default_health_probe(machine_app, health_path, health_marker, diag=health_diag)
     obs_transport = transport if transport is not None else __import__(
         "aidan_core.deploy.fly_transport", fromlist=["HttpFlyTransport"]).HttpFlyTransport()
 
+    # Capture the ONE independent observation the verifier reads, so a REJECTED run stays diagnosable
+    # (no extra Fly call — the per-check diagnostics re-run the SAME pure checks over it).
+    captured = {}
+
     def _observer_factory(contract):
         from .observe import FlyDeploymentObserver
-        return FlyDeploymentObserver(
+        real = FlyDeploymentObserver(
             fly_transport=obs_transport, token=token, app=contract.get("target_ref") or machine_app,
             machine_id=machine_id, venture_id=contract.get("venture_id"),
             deployment_target_id=contract.get("deployment_target_id"),
             health_probe=hp, required_state=REQUIRED_STATE, timeout=30.0)
 
+        class _Capturing:
+            def observe(self):
+                o = real.observe()
+                captured["observation"], captured["contract"] = o, dict(contract)
+                return o
+        return _Capturing()
+
     out = deploy_runtime.verify_deploy(conn, deploy_action_id, actual_cost=CEILING, actor=actor,
                                        observer_factory=_observer_factory)
     ev["deployment_verdict"] = "VERIFIED" if out.verified else "REJECTED"
     ev["provider_contact_evidence"] = "OBSERVED" if machine_id else "UNKNOWN"
+    ev["diagnostics"] = _build_diagnostics(captured, health_diag, health_marker)
 
     # 5. GOVERNED CLEANUP of exactly the created machine (Stage C is ephemeral). NO promotion.
     if machine_id:
-        ev["cleanup_state"] = cleanup_machine(obs_transport, token, machine_app, machine_id, timeout=30.0)
+        ev["cleanup_state"] = cleanup_machine(obs_transport, token, machine_app, machine_id,
+                                              timeout=30.0, sleep=cleanup_sleep)
 
     if not out.verified:
         ev["result"] = "FAIL"

@@ -73,7 +73,7 @@ def _token(monkeypatch):
 
 def _run(conn, fake, *, slug, marker=HEALTH_MARKER, **kw):
     return run_fly_deploy_smoke(conn, app=APP, transport=fake, health_probe=lambda: marker,
-                                slug=slug, **kw)
+                                slug=slug, cleanup_sleep=lambda *_: None, **kw)
 
 
 # ---- A + L + N + K + E: clean end-to-end boundary smoke, BUILDING, cleanup confirmed --
@@ -111,6 +111,12 @@ def test_P_wrong_digest_fails_no_promote(migrated):
     assert ev["deployment_verdict"] == "REJECTED" and ev["result"] == "FAIL"
     assert ev["lifecycle_state"] == "BUILDING" and ev.get("proof_result") != "VERIFIED"
     assert fake.count("DELETE") == 1                       # a created machine is still torn down
+    # A REJECTED run must retain per-check diagnostics (never collapse to just deployment_verdict).
+    diag = ev["diagnostics"]
+    checks = {c["name"]: c["result"] for c in diag["checks"]}
+    assert checks["ARTIFACT_IDENTITY"] == "FAIL"
+    assert diag["observed_artifact_digest"] == "sha256:" + "cd" * 32
+    assert diag["expected_artifact_digest"] == DIGEST
 
 
 # ---- O: verified boundary but ambiguous cleanup is NOT a clean PASS -------------------

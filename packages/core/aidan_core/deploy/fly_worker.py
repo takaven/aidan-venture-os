@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Optional
 
 from ..errors import AmbiguousExternalEffectError, DeployAdapterError
@@ -69,28 +70,36 @@ def _machine_config(image: str, runtime_contract, health_contract) -> dict:
     return config
 
 
-def cleanup_machine(transport, token, app, machine_id, *, timeout=30.0) -> str:
-    """Governed teardown of EXACTLY the created machine, then independently confirm absence. Returns
-    CLEANUP_CONFIRMED (machine gone), CLEANUP_FAILED (still present), or CLEANUP_AMBIGUOUS (could not
-    determine). Never creates anything; never blind-retries an ambiguous DELETE. Force-deletes a
-    running machine (Fly ?force=true)."""
+def cleanup_machine(transport, token, app, machine_id, *, timeout=30.0, confirm_reads=4,
+                    backoff=1.0, sleep=None) -> str:
+    """Governed teardown of EXACTLY the created machine: ONE force DELETE, then BOUNDED read-only
+    confirmation retries (the DELETE is NEVER re-issued). Returns CLEANUP_CONFIRMED (a confirmation
+    GET saw 404), CLEANUP_FAILED (the machine was definitely still present and never 404), or
+    CLEANUP_AMBIGUOUS (all confirmation reads inconclusive). ``confirm_reads`` bounds the number of
+    read-only confirmations; ``sleep`` is injectable so tests avoid real backoff."""
     if not machine_id or not app:
         return "CLEANUP_AMBIGUOUS"
+    _sleep = sleep or time.sleep
     try:
         transport("DELETE", f"/apps/{app}/machines/{machine_id}?force=true", token=token, timeout=timeout)
     except FlyTransportError:
-        # The DELETE may or may not have taken effect; a single read-only confirmation decides, but
-        # we do NOT re-issue the DELETE.
-        pass
-    try:
-        resp = transport("GET", f"/apps/{app}/machines/{machine_id}", token=token, timeout=timeout)
-    except FlyTransportError:
-        return "CLEANUP_AMBIGUOUS"
-    if resp.status == 404:
-        return "CLEANUP_CONFIRMED"       # independently confirmed absent
-    if resp.status == 200 and (resp.body or {}).get("state") not in (None, "destroyed"):
-        return "CLEANUP_FAILED"          # still present/running
-    return "CLEANUP_AMBIGUOUS"
+        pass   # the DELETE may or may not have taken effect; read-only confirmation decides. No retry.
+
+    present_seen = False
+    reads = max(1, int(confirm_reads))
+    for i in range(reads):
+        try:
+            resp = transport("GET", f"/apps/{app}/machines/{machine_id}", token=token, timeout=timeout)
+        except FlyTransportError:
+            resp = None                 # transient/unreachable read -> inconclusive, keep trying
+        if resp is not None:
+            if resp.status == 404:
+                return "CLEANUP_CONFIRMED"      # independently confirmed absent
+            if resp.status == 200 and (resp.body or {}).get("state") not in (None, "destroyed"):
+                present_seen = True             # definitely still present (keep confirming until bound)
+        if i < reads - 1:
+            _sleep(backoff)
+    return "CLEANUP_FAILED" if present_seen else "CLEANUP_AMBIGUOUS"
 
 
 class FlyMachinesWorker:

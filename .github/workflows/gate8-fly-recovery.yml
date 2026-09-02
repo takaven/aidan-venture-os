@@ -1,0 +1,60 @@
+name: Gate 8 Fly Recovery (orphan machine)
+
+# MANUAL ONLY, RECOVERY ONLY. Reconciles ONE already-known Fly Machine left behind by a failed
+# Stage-C smoke (cleanup ambiguous). It performs an independent read and at most ONE force DELETE of
+# exactly that machine under exactly that app, then bounded read-only confirmation. It NEVER creates
+# a machine, deploys, issues a second DELETE, or touches the app / IPs / volumes. No push /
+# pull_request / schedule trigger, no retry. Fail-closed against the accepted-main SHA. NOT
+# auto-dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_FLY_RECOVERY_ONLY to authorize the single bounded recovery (one force DELETE max)'
+        required: true
+        default: ''
+      fly_app:
+        description: 'The Fly app that holds the orphan-risk machine'
+        required: true
+        default: ''
+      machine_id:
+        description: 'The exact Fly machine id to reconcile/delete'
+        required: true
+        default: ''
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  fly-recovery:
+    if: ${{ github.event.inputs.confirm == 'RUN_FLY_RECOVERY_ONLY' }}
+    runs-on: ubuntu-latest
+    environment: gate8-fly-live-deploy
+
+    env:
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      FLY_RECOVERY_APP: ${{ github.event.inputs.fly_app }}
+      FLY_RECOVERY_MACHINE_ID: ${{ github.event.inputs.machine_id }}
+      FLY_RECOVERY_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Reconcile exactly one known Fly machine (recovery only; no deploy)
+        env:
+          # Invocation-scoped Fly token; host-mapped into this step only; never persisted or printed.
+          DEPLOY_FLY_API_TOKEN: ${{ secrets.DEPLOY_FLY_API_TOKEN }}
+        run: python -m aidan_core.deploy.fly_recovery

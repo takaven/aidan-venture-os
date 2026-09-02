@@ -17,7 +17,7 @@ import os
 import re
 
 from .fly_live_smoke import TOKEN_ENV, validate_app_name
-from .fly_transport import FlyTransportError, HttpFlyTransport
+from .fly_transport import FlyTransportError, HttpFlyTransport, is_machine_absent
 from .fly_worker import cleanup_machine
 
 CONFIRM_TOKEN = "RUN_FLY_RECOVERY_ONLY"
@@ -59,8 +59,10 @@ def run_fly_recovery(*, app, machine_id, transport=None, token=None, timeout=30.
         ev.update(result="RECOVERY_AMBIGUOUS_NO_DELETE", reason="pre-delete read unreachable")
         return _finalize(ev)
 
-    if resp.status == 404:
-        ev["result"] = "RECOVERY_ALREADY_CLEAN"          # nothing to delete; success, no mutation
+    if is_machine_absent(resp):
+        # 404 OR a retained destroyed record -> already gone; never DELETE again.
+        ev.update(result="RECOVERY_ALREADY_CLEAN",
+                  pre_cleanup={"runtime_state": (resp.body or {}).get("state")} if resp.status == 200 else {})
         return _finalize(ev)
     if resp.status != 200:
         ev.update(result="RECOVERY_AMBIGUOUS_NO_DELETE", reason=f"pre-delete status {resp.status}")

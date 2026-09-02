@@ -73,7 +73,8 @@ def _token(monkeypatch):
 
 def _run(conn, fake, *, slug, marker=HEALTH_MARKER, **kw):
     return run_fly_deploy_smoke(conn, app=APP, transport=fake, health_probe=lambda: marker,
-                                slug=slug, cleanup_sleep=lambda *_: None, **kw)
+                                slug=slug, cleanup_sleep=lambda *_: None,
+                                observe_sleep=lambda *_: None, **kw)
 
 
 # ---- A + L + N + K + E: clean end-to-end boundary smoke, BUILDING, cleanup confirmed --

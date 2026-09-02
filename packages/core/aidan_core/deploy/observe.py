@@ -55,6 +55,9 @@ class DeploymentObservation:
     # observed runtime state. None on the local-tree path (which uses ``files`` instead).
     artifact_identity: Optional[str] = None
     running_state: Optional[str] = None
+    # Bounded read-only convergence history (digest mode): one sanitized entry per read attempt so a
+    # REJECTED run shows how external reality converged. Empty on the local path.
+    attempts: tuple = ()
 
 
 @runtime_checkable
@@ -126,7 +129,8 @@ class FlyDeploymentObserver:
     """
 
     def __init__(self, *, fly_transport, token, app, machine_id, venture_id, deployment_target_id,
-                 health_probe=None, required_state="started", timeout=30.0):
+                 health_probe=None, required_state="started", timeout=30.0,
+                 poll_attempts=10, poll_backoff=3.0, sleep=None):
         self._transport = fly_transport
         self._token = token
         self._app = app
@@ -136,30 +140,68 @@ class FlyDeploymentObserver:
         self._health_probe = health_probe
         self._required_state = required_state
         self._timeout = timeout
+        # Bounded READ-ONLY convergence: total window (attempts*backoff) is kept under the smoke's
+        # 120s deploy timeout. Polling only lets external reality converge; it never mutates.
+        self._poll_attempts = max(1, int(poll_attempts))
+        self._poll_backoff = poll_backoff
+        self._sleep = sleep
 
     def observe(self) -> DeploymentObservation:
-        from .fly_transport import FlyTransportError
+        """Bounded, READ-ONLY convergence read of the exact machine. Polls GET (and, once ``started``,
+        the external health) up to ``poll_attempts`` times with backoff, stopping early on a healthy
+        started machine, on absence (404 / retained destroyed record), or on a terminal state. Returns
+        the FINAL observation with a sanitized per-attempt history. Never mutates; never self-reports."""
+        from .fly_transport import (FlyTransportError, MACHINE_TERMINAL_STATES, is_machine_absent)
+        import time
+        _sleep = self._sleep or time.sleep
         identity = f"fly-machines/{self._venture_id}/{self._tid}/{self._app}"
-        try:
-            resp = self._transport(
-                "GET", f"/apps/{self._app}/machines/{self._machine_id}",
-                token=self._token, timeout=self._timeout)
-        except FlyTransportError:
-            # Could not reach Fly to read back -> contact UNKNOWN, nothing observed. Fail-closed.
-            return DeploymentObservation(identity, (), None, target_present=False,
-                                         contact=CONTACT_UNKNOWN)
-        # An HTTP status response is provider contact.
-        if resp.status != 200:
-            # 404 = machine not found under the frozen app (wrong/missing target); other 4xx/5xx too.
-            return DeploymentObservation(identity, (), None, target_present=False,
-                                         contact=CONTACT_OBSERVED)
-        body = resp.body or {}
-        state = body.get("state")
-        digest = ((body.get("image_ref") or {}).get("digest")) or None
-        present = bool(body.get("id"))
-        health = self._health_probe() if (present and state == self._required_state
-                                          and self._health_probe) else None
-        return DeploymentObservation(
-            isolation_identity=identity, files=(), health_marker=health,
-            target_present=present, contact=CONTACT_OBSERVED,
-            artifact_identity=digest, running_state=state)
+        attempts = []
+        obs = DeploymentObservation(identity, (), None, target_present=False, contact=CONTACT_UNKNOWN)
+
+        for n in range(self._poll_attempts):
+            try:
+                resp = self._transport("GET", f"/apps/{self._app}/machines/{self._machine_id}",
+                                       token=self._token, timeout=self._timeout)
+            except FlyTransportError:
+                attempts.append({"attempt": n, "get": "ERROR", "runtime_state": None,
+                                 "artifact_digest": None, "health_attempted": False, "health_matched": False})
+                obs = DeploymentObservation(identity, (), None, target_present=False,
+                                            contact=CONTACT_UNKNOWN, attempts=tuple(attempts))
+                if n < self._poll_attempts - 1:
+                    _sleep(self._poll_backoff)
+                    continue
+                break
+
+            absent = is_machine_absent(resp)
+            if resp.status != 200 or absent:
+                # 404, a retained destroyed record, or any non-200 -> target ABSENT. Stop.
+                state = (resp.body or {}).get("state") if resp.status == 200 else None
+                attempts.append({"attempt": n, "get": resp.status, "runtime_state": state,
+                                 "artifact_digest": None, "health_attempted": False, "health_matched": False})
+                obs = DeploymentObservation(identity, (), None, target_present=False,
+                                            contact=CONTACT_OBSERVED, running_state=state,
+                                            attempts=tuple(attempts))
+                break
+
+            body = resp.body or {}
+            state = body.get("state")
+            digest = ((body.get("image_ref") or {}).get("digest")) or None
+            present = bool(body.get("id"))
+            health = None
+            health_attempted = False
+            if present and state == self._required_state and self._health_probe:
+                health_attempted = True
+                health = self._health_probe()   # external read-only HTTP; retried across attempts
+            attempts.append({"attempt": n, "get": 200, "runtime_state": state, "artifact_digest": digest,
+                             "health_attempted": health_attempted, "health_matched": health is not None})
+            obs = DeploymentObservation(identity, (), health, target_present=present,
+                                        contact=CONTACT_OBSERVED, artifact_identity=digest,
+                                        running_state=state, attempts=tuple(attempts))
+
+            if state in MACHINE_TERMINAL_STATES:
+                break                                   # can never reach a healthy 'started' -> stop
+            if state == self._required_state and health is not None:
+                break                                   # converged: started + healthy -> done
+            if n < self._poll_attempts - 1:
+                _sleep(self._poll_backoff)               # not yet converged -> bounded wait, re-read
+        return obs

@@ -27,6 +27,25 @@ from typing import Any, Optional
 FLY_API_BASE = "https://api.machines.dev/v1"
 _MAX_BODY_BYTES = 65536   # bounded response body; never store/log more
 
+# Fly retains DELETED machine records as HTTP 200 with a terminal state (it does NOT return 404).
+# A machine in one of these terminal states is ABSENT for our purposes — it is not running and not
+# billing. This is the ONE shared absence semantic (cleanup, recovery, observer all use it).
+MACHINE_ABSENT_STATES = ("destroyed",)
+# States a machine can never leave to become a healthy 'started' target (stop bounded polling early).
+MACHINE_TERMINAL_STATES = ("destroyed", "stopped", "failed")
+
+
+def is_machine_absent(resp) -> bool:
+    """True iff the provider confirms the exact machine is absent: HTTP 404, OR HTTP 200 with a
+    terminal ``state`` (a retained destroyed record). Fail-closed: None/other -> not absent."""
+    if resp is None:
+        return False
+    if resp.status == 404:
+        return True
+    if resp.status == 200 and (resp.body or {}).get("state") in MACHINE_ABSENT_STATES:
+        return True
+    return False
+
 PHASE_PRE_SEND = "PRE_SEND"     # request provably not transmitted -> no external effect
 PHASE_POST_SEND = "POST_SEND"   # request may have reached the provider -> effect ambiguous
 

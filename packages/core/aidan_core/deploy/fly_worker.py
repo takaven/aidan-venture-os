@@ -33,7 +33,7 @@ from typing import Optional
 from ..errors import AmbiguousExternalEffectError, DeployAdapterError
 from ..factory.workers import WorkerRequest, WorkerResult
 from . import artifact as artifact_mod
-from .fly_transport import PHASE_PRE_SEND, FlyTransportError, HttpFlyTransport
+from .fly_transport import PHASE_PRE_SEND, FlyTransportError, HttpFlyTransport, is_machine_absent
 
 WORKER_KIND = "fly-machines"
 WORKER_VERSION = "1"
@@ -93,8 +93,8 @@ def cleanup_machine(transport, token, app, machine_id, *, timeout=30.0, confirm_
         except FlyTransportError:
             resp = None                 # transient/unreachable read -> inconclusive, keep trying
         if resp is not None:
-            if resp.status == 404:
-                return "CLEANUP_CONFIRMED"      # independently confirmed absent
+            if is_machine_absent(resp):
+                return "CLEANUP_CONFIRMED"      # 404 OR 200+state=destroyed -> confirmed absent
             if resp.status == 200 and (resp.body or {}).get("state") not in (None, "destroyed"):
                 present_seen = True             # definitely still present (keep confirming until bound)
         if i < reads - 1:

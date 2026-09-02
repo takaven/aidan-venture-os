@@ -1,0 +1,91 @@
+name: Gate 8 Postmark Owner-Ingress Smoke
+
+# MANUAL ONLY. One authorized dispatch -> at most ONE real Postmark send (max_attempts=1) to ONE
+# owner-controlled recipient, on the outbound stream, no CC/BCC/attachments. The smoke establishes
+# its OWN governed OPERATING-venture chain in a fresh ephemeral PostgreSQL, sends the exact FROZEN
+# message through the RECONCILABLE consequential path, and verifies it against provider state with
+# the deterministic MARKET_ACTION verifier. An ambiguous send fails closed into RECOVERY_REQUIRED
+# (never blind-retried). Lifecycle is NOT over-promoted. Spend bounded to USD 0.01. Sanitized
+# evidence only — no token, no raw provider payload. No push / pull_request / schedule trigger, no
+# retry. Proves the governed SEND boundary only (no inbox/reply/demand/commercial claim). NOT
+# auto-dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_OWNER_POSTMARK_INGRESS_SMOKE to authorize the single bounded send (<= USD 0.01)'
+        required: true
+        default: ''
+      recipient:
+        description: 'The OWNER-CONTROLLED recipient email address (owner declaration; no prospect/customer)'
+        required: true
+        default: ''
+      postmark_server_id:
+        description: 'The expected Postmark Server ID (non-secret; GET /server must match)'
+        required: true
+        default: ''
+      postmark_sender:
+        description: 'The authorized From address on that server'
+        required: true
+        default: ''
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  postmark-owner-ingress-smoke:
+    if: ${{ github.event.inputs.confirm == 'RUN_OWNER_POSTMARK_INGRESS_SMOKE' }}
+    runs-on: ubuntu-latest
+    environment: gate8-postmark-live
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aidan
+          POSTGRES_PASSWORD: aidan
+          POSTGRES_DB: aidan_postmark_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aidan"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://aidan:aidan@localhost:5432/aidan_postmark_smoke
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      POSTMARK_SMOKE_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
+      POSTMARK_SMOKE_RECIPIENT: ${{ github.event.inputs.recipient }}
+      POSTMARK_SERVER_ID: ${{ github.event.inputs.postmark_server_id }}
+      POSTMARK_SENDER: ${{ github.event.inputs.postmark_sender }}
+      POSTMARK_MESSAGE_STREAM: outbound
+      POSTMARK_INBOUND_DOMAIN: ${{ vars.POSTMARK_INBOUND_DOMAIN }}
+      POSTMARK_CREDENTIAL_REF: postmark-owner-smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Apply migrations
+        run: python -m aidan_core.migrate
+
+      - name: Run the frozen bounded owner-controlled Postmark ingress smoke (one send max)
+        env:
+          # SECRET: the Postmark server API token. Host-mapped into this step only; never persisted
+          # in canonical state and never printed.
+          POSTMARK_SERVER_TOKEN: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+        run: python -m aidan_core.market.postmark_live_smoke

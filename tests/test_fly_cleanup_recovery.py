@@ -56,6 +56,20 @@ def test_F_cleanup_single_delete_max():
     assert f.count("DELETE") == 1
 
 
+def test_B_cleanup_200_destroyed_confirms():
+    # Fly retains a deleted machine as HTTP 200 state=destroyed (not 404) -> still CONFIRMED absent.
+    f = SeqFly(gets=[FlyResponse(200, {"id": MID, "state": "destroyed"})])
+    assert cleanup_machine(f, "tok", APP, MID, sleep=NOSLEEP) == "CLEANUP_CONFIRMED"
+    assert f.count("DELETE") == 1
+
+
+def test_C_recovery_destroyed_pre_read_already_clean_no_delete():
+    f = SeqFly(gets=[FlyResponse(200, {"id": MID, "state": "destroyed"})])
+    ev = fly_recovery.run_fly_recovery(app=APP, machine_id=MID, transport=f, token="tok", sleep=NOSLEEP)
+    assert ev["result"] == "RECOVERY_ALREADY_CLEAN" and ev["delete_issued"] is False
+    assert f.count("DELETE") == 0            # a retained destroyed record must NOT trigger another DELETE
+
+
 def test_G_transient_get_then_404_confirms():
     f = SeqFly(gets=[FlyTransportError("t", phase=PHASE_POST_SEND), FlyResponse(404, {})])
     assert cleanup_machine(f, "tok", APP, MID, sleep=NOSLEEP) == "CLEANUP_CONFIRMED"

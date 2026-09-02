@@ -139,6 +139,8 @@ def _build_diagnostics(captured, health_diag, expected_marker):
         "required_runtime_state": c.get("required_state", spec.REQUIRED_STATE),
         "observed_runtime_state": obs.running_state,
         "read_back_contact": obs.contact,               # OBSERVED | NOT_OBSERVED | UNKNOWN
+        # bounded read-only convergence sequence (one sanitized entry per attempt; no token/body)
+        "attempt_history": [dict(a) for a in obs.attempts],
         "health": {
             "probe_reached": health_diag.get("reached"),      # True/False/None(injected)
             "http_status": health_diag.get("http_status"),
@@ -149,7 +151,7 @@ def _build_diagnostics(captured, health_diag, expected_marker):
 
 
 def run_fly_deploy_smoke(conn, *, app, transport=None, health_probe=None, actor="fly-smoke",
-                         slug="gate8-fly-smoke", cleanup_sleep=None):
+                         slug="gate8-fly-smoke", cleanup_sleep=None, observe_sleep=None):
     """Establish the fixture from the FROZEN Stage-C spec, govern one deploy, verify independently,
     record the proof, then clean up. Returns a sanitized evidence dict. Does NOT promote lifecycle.
     Every deploy-relevant value is frozen (fly_stagec_spec); only ``app`` varies (owner target)."""
@@ -233,7 +235,8 @@ def run_fly_deploy_smoke(conn, *, app, transport=None, health_probe=None, actor=
             fly_transport=obs_transport, token=token, app=contract.get("target_ref") or machine_app,
             machine_id=machine_id, venture_id=contract.get("venture_id"),
             deployment_target_id=contract.get("deployment_target_id"),
-            health_probe=hp, required_state=REQUIRED_STATE, timeout=30.0)
+            health_probe=hp, required_state=REQUIRED_STATE, timeout=30.0,
+            poll_attempts=10, poll_backoff=6.0, sleep=observe_sleep)
 
         class _Capturing:
             def observe(self):

@@ -55,12 +55,22 @@ MARKET_ACTION = "MARKET_ACTION"
 # result is reconciled against provider state via the opaque correlation metadata (below)
 # before any retry. Never blind-retry an ambiguous real send.
 POSTMARK_SEND_SAFETY = "RECONCILABLE"
+# Every consequential-path Postmark HTTP call is bounded by this explicit timeout (no unbounded call).
+POSTMARK_HTTP_TIMEOUT_SECONDS = 30
 
 
 class PostmarkSendRejected(MarketAuthorityError):
     """A Postmark POST /email returned a 4xx client rejection: the send was deterministically NOT
     accepted, so it is a PROVEN no-external-effect failure (ordinarily retryable) — distinct from an
     ambiguous no-response / 5xx fault where the effect may have occurred."""
+
+
+class PostmarkReconcileUnknown(AmbiguousExternalEffectError):
+    """A Postmark read-back/reconciliation could NOT be determined — HTTP 5xx, a timeout/network
+    fault, or a malformed/unexpected payload. It is NEVER an empty 'no prior send' result. Being an
+    AmbiguousExternalEffectError, it fails the action CLOSED into RECOVERY_REQUIRED (not auto-claimable,
+    never blind-retried) on the send path, so provider uncertainty can never trigger a duplicate send;
+    the verifier catches it and REJECTS (unknown provider state is never VERIFIED)."""
 
 # Verified provider events normalize ONLY into the existing finite observation vocabulary.
 _EVENT_TO_OBSERVATION = {"Delivery": "DELIVERED", "Bounce": "BOUNCED"}
@@ -279,6 +289,18 @@ class PostmarkActionVerifier:
         self._t = transport
 
     def verify(self, request: VerificationRequest) -> VerificationResult:
+        # Fail CLOSED on undetermined provider state: an unknown read-back is NEVER VERIFIED.
+        try:
+            return self._verify(request)
+        except PostmarkReconcileUnknown:
+            from ..actions import canonical_payload_hash
+            return VerificationResult(
+                self.kind, "REJECTED", self.verification_type,
+                canonical_payload_hash({"attempt": str(request.execution_attempt_id),
+                                        "reason": "provider_state_unknown"}),
+                detail={"reason": "provider_state_unknown"})
+
+    def _verify(self, request: VerificationRequest) -> VerificationResult:
         market = dict((request.expected_output_contract or {}).get("market", {}))
         pm = dict((request.expected_output_contract or {}).get("postmark", {}))
         correlation = dict(pm.get("correlation", {}))
@@ -520,8 +542,13 @@ def reconcile_postmark_recovery(conn, action_request_id: str, *, transport: Post
     if status != "RECOVERY_REQUIRED":
         return {"outcome": "not_recovery_required", "status": status}
     correlation, expected = _frozen_expected(conn, action_request_id)
-    candidates = [m for m in transport.find_outbound_by_correlation(dict(correlation))
-                  if _message_matches_frozen(m, expected)]
+    try:
+        candidates = [m for m in transport.find_outbound_by_correlation(dict(correlation))
+                      if _message_matches_frozen(m, expected)]
+    except PostmarkReconcileUnknown:
+        # Provider read-back undetermined -> cannot prove presence OR absence. Stay fail-closed;
+        # never redispatch. The action remains RECOVERY_REQUIRED for a later reconcile.
+        return {"outcome": "still_ambiguous", "reason": "provider_state_unknown"}
     if len(candidates) > 1:
         return {"outcome": "duplicate_detected"}          # ambiguous duplicate -> stay fail-closed
     if not candidates:
@@ -708,18 +735,32 @@ class _PostmarkVerifiedProviderState:
         self.delivery_type = delivery_type    # actual DeliveryType — a REAL attestation is only Live
 
 
-def _http_request(method: str, url: str, *, headers: dict, body: bytes = None):  # pragma: no cover - network
-    """The SOLE network boundary. Returns (status_code, parsed_json). Tests stub THIS function
-    beneath the genuine production path — they never subclass/replace the transport object."""
+def _http_request(method: str, url: str, *, headers: dict, body: bytes = None,
+                  timeout: float = POSTMARK_HTTP_TIMEOUT_SECONDS):  # pragma: no cover - network
+    """The SOLE network boundary. Returns (status_code, parsed_json_or_None) for any HTTP RESPONSE
+    (2xx/4xx/5xx). A transport/timeout/network fault — where there is NO usable provider response —
+    raises ``PostmarkReconcileUnknown`` (fail closed; never a status/empty that could look like a
+    definitive outcome). Explicit bounded timeout; no unbounded call. Tests stub THIS function."""
     import json
     import urllib.error
     import urllib.request
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.status, json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            try:
+                return resp.status, (json.loads(raw) if raw else None)
+            except Exception:  # noqa: BLE001 - a 2xx with an unparseable body is UNDETERMINED
+                return resp.status, None
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        try:
+            parsed = json.loads(exc.read())
+        except Exception:  # noqa: BLE001
+            parsed = None
+        return exc.code, parsed
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # No usable provider response (timeout/DNS/connection reset): UNKNOWN, never empty. Fail closed.
+        raise PostmarkReconcileUnknown(f"Postmark transport failure: {type(exc).__name__}") from exc
 
 
 class PostmarkHttpTransport:
@@ -754,16 +795,21 @@ class PostmarkHttpTransport:
     def get_server_state(self) -> PostmarkServerState:
         """The actual Postmark server facts for the runtime token: GET /server -> ("ID","DeliveryType")
         (server-scoped, proves which server the token belongs to AND whether it is Live vs Sandbox).
-        Non-secret; no token returned into evidence."""
-        _status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
-        data = data or {}
+        Non-secret; no token returned into evidence. A non-200 / malformed response is UNKNOWN (raise),
+        never a fabricated 'None/None' server state that could pass or fail a check by accident."""
+        status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
+        if status != 200 or not isinstance(data, dict):
+            raise PostmarkReconcileUnknown(f"Postmark GET /server undetermined (status={status})")
         return PostmarkServerState(server_id=str(data.get("ID")), delivery_type=str(data.get("DeliveryType")))
 
     def get_outbound_message(self, message_id):
         status, data = _http_request("GET", f"{self._API}/messages/outbound/{message_id}/details",
                                      headers=self._headers())
-        if status == 404 or data is None:
-            return None                        # unknown MessageID -> no reconcilable record
+        if status == 404:
+            return None                        # DEFINITIVE: unknown MessageID -> no reconcilable record
+        if status != 200 or not isinstance(data, dict):
+            # 5xx / other 4xx / unparseable -> UNDETERMINED. Never collapse to 'no record'.
+            raise PostmarkReconcileUnknown(f"Postmark outbound details undetermined (status={status})")
         recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
         # Reply-To: prefer the structured field; else parse the provider's raw message headers
         # (stdlib email, no dependency) — never trust what the worker CLAIMED it sent.
@@ -784,12 +830,19 @@ class PostmarkHttpTransport:
         metadata match is never trusted alone — the caller re-checks the full frozen contract."""
         import urllib.parse
         params = "&".join(f"metadata_{k}={urllib.parse.quote(str(v))}" for k, v in correlation.items())
-        _status, data = _http_request(
+        status, data = _http_request(
             "GET", f"{self._API}/messages/outbound?count=100&offset=0&{params}", headers=self._headers())
+        # ONLY a valid HTTP 200 with a Messages array is a DEFINITIVE search result (possibly empty =
+        # genuine no-match). A 5xx / non-200 / malformed payload is UNDETERMINED -> raise, never empty
+        # (an empty-from-error would look like 'no prior send' and risk a duplicate send).
+        if status != 200 or not isinstance(data, dict) or "Messages" not in data:
+            raise PostmarkReconcileUnknown(f"Postmark outbound search undetermined (status={status})")
         out = []
-        for m in (data or {}).get("Messages", []):
+        for m in data.get("Messages", []):
             mid = m.get("MessageID")
-            full = self.get_outbound_message(mid) if mid else None
+            if not mid:
+                continue
+            full = self.get_outbound_message(mid)   # strict: raises UNKNOWN on 5xx, None only on a real 404
             if full is not None:
                 out.append(full)
         return out

@@ -1,0 +1,77 @@
+name: Gate 8 Postmark Field Diagnostic (read-only)
+
+# MANUAL ONLY, READ-ONLY. Fetches ONE already-sent Postmark message by its known MessageID and emits
+# a SANITIZED per-field comparison against the frozen identity, so the field that made the verifier
+# REJECT can be pinned deterministically. GET reads only (GET /server + GET outbound details). NO
+# database, NO POST /email, NO mutation, and the transport is wrapped read-only (no send_email) so a
+# send is structurally impossible. Emits NO raw email body, NO token, NO raw provider payload — only
+# booleans, hashes, lengths, line-ending classes, parsed-address equality, and field types.
+# Accepted-SHA fail-close. No push / pull_request / schedule trigger, no retry. NOT auto-dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_POSTMARK_FIELD_DIAGNOSTIC to authorize the read-only per-field diagnostic'
+        required: true
+        default: ''
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
+        required: true
+        default: ''
+      action_request_id:
+        description: 'The action_request UUID of the sent message (its Postmark correlation tag)'
+        required: true
+        default: ''
+      message_id:
+        description: 'The known Postmark MessageID returned by the send'
+        required: true
+        default: ''
+      postmark_server_id:
+        description: 'The expected Postmark Server ID (non-secret; GET /server must match)'
+        required: true
+        default: ''
+      sender:
+        description: 'The authorized From address the send used'
+        required: true
+        default: ''
+      recipient:
+        description: 'The owner-controlled recipient the send targeted'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  postmark-field-diagnostic:
+    if: ${{ github.event.inputs.confirm == 'RUN_POSTMARK_FIELD_DIAGNOSTIC' }}
+    runs-on: ubuntu-latest
+    environment: gate8-postmark-live
+
+    env:
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      POSTMARK_DIAG_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
+      POSTMARK_DIAG_ACTION_REQUEST_ID: ${{ github.event.inputs.action_request_id }}
+      POSTMARK_DIAG_MESSAGE_ID: ${{ github.event.inputs.message_id }}
+      POSTMARK_SERVER_ID: ${{ github.event.inputs.postmark_server_id }}
+      POSTMARK_SENDER: ${{ github.event.inputs.sender }}
+      POSTMARK_SMOKE_RECIPIENT: ${{ github.event.inputs.recipient }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Compare the sent Postmark message to the frozen identity (reads only, no send, no DB)
+        env:
+          # SECRET: the Postmark server API token. Host-mapped into this step only; used ONLY for GET
+          # reads (the diagnostic transport cannot POST /email); never persisted, never printed.
+          POSTMARK_SERVER_TOKEN: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+        run: python -m aidan_core.market.postmark_field_diagnostic

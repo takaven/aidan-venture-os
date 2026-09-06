@@ -70,7 +70,22 @@ class PostmarkReconcileUnknown(AmbiguousExternalEffectError):
     fault, or a malformed/unexpected payload. It is NEVER an empty 'no prior send' result. Being an
     AmbiguousExternalEffectError, it fails the action CLOSED into RECOVERY_REQUIRED (not auto-claimable,
     never blind-retried) on the send path, so provider uncertainty can never trigger a duplicate send;
-    the verifier catches it and REJECTS (unknown provider state is never VERIFIED)."""
+    the verifier catches it and REJECTS (unknown provider state is never VERIFIED).
+
+    Carries a SANITIZED fault classification (``http_status`` int-or-None + ``fault_kind`` string) so
+    diagnostics can record the exact failing phase without ever exposing a raw body/header/token."""
+
+    def __init__(self, *args, http_status=None, fault_kind=None):
+        super().__init__(*args)
+        self.http_status = http_status
+        self.fault_kind = fault_kind
+
+
+def _annotate(exc, *, http_status=None, fault_kind=None):
+    """Attach the sanitized fault classification to an ambiguity exception, in place."""
+    exc.http_status = http_status
+    exc.fault_kind = fault_kind
+    return exc
 
 # Verified provider events normalize ONLY into the existing finite observation vocabulary.
 _EVENT_TO_OBSERVATION = {"Delivery": "DELIVERED", "Bounce": "BOUNCED"}
@@ -163,10 +178,16 @@ class PostmarkEmailWorker:
         self.mode = mode
         self.calls = 0
         self.last_request = None
+        # Diagnostics: the exact phase reached (PRE_SEND_RECONCILE | SEND_REQUEST | POST_SEND_RECONCILE)
+        # and a SANITIZED transport-fault classification, so a fail-closed run records WHERE it failed
+        # without ever exposing a token/body. Never load-bearing for authority — observability only.
+        self.phase = "INIT"
+        self.last_fault = None
 
     def execute(self, request) -> WorkerResult:  # no DB access, no canonical authority
         self.calls += 1
         self.last_request = request
+        self.phase = "PRE_SEND_RECONCILE"   # server-identity + pre-send correlation reads happen first
         m = dict((request.task_payload or {}).get("market", {}))
         pm = dict((request.task_payload or {}).get("postmark", {}))
         fs = dict(pm.get("source", {}))                       # FROZEN approved provider identity
@@ -183,7 +204,11 @@ class PostmarkEmailWorker:
         # that the server is LIVE (GET /server) — a matching credential_ref string is NOT sufficient,
         # and a Sandbox server (which 'delivers' without reaching a real recipient) is refused BEFORE
         # any consequential send, never silently downgraded to SIMULATED after sending.
-        server = self._t.get_server_state()
+        try:
+            server = self._t.get_server_state()
+        except AmbiguousExternalEffectError as exc:   # provider-identity read undetermined (pre-send)
+            self._record_fault(exc)
+            raise
         if str(server.server_id) != str(fs.get("postmark_server_id")):
             raise MarketAuthorityError("transport credential does not belong to the frozen Postmark server")
         if str(server.delivery_type) != REQUIRED_DELIVERY_TYPE:
@@ -236,6 +261,7 @@ class PostmarkEmailWorker:
         existing = self._reconcile(expected, correlation)      # (1) never duplicate a prior send
         if existing is not None:
             return existing
+        self.phase = "SEND_REQUEST"                            # about to issue the consequential POST
         try:                                                   # (2) attempt the consequential POST
             mid = self._t.send_email(message_stream=message_stream, sender=sender, to=to, subject=subject,
                                      text_body=text_body, reply_to=reply_to, metadata=dict(correlation))
@@ -243,14 +269,17 @@ class PostmarkEmailWorker:
             # A received provider REJECTION (HTTP response, not accepted): the send was NOT accepted,
             # so this is a PROVEN no-effect failure — retryable (WORKER_ERROR), not recovery. Reconcile
             # defensively in case a compliant message somehow exists; otherwise it is a plain failure.
+            self.phase = "POST_SEND_RECONCILE"
             reconciled = self._reconcile(expected, correlation)
             if reconciled is not None:
                 return reconciled
             raise MarketAuthorityError("Postmark rejected the send (no external effect); retryable")
-        except Exception:
+        except Exception as exc:
             # AMBIGUOUS: no usable provider response — the POST MAY have crossed the boundary. Reconcile
             # against provider state; capture if the exact message landed, else FAIL CLOSED into recovery
             # (an empty, eventually-consistent search is NOT proof the effect did not occur).
+            self._record_fault(exc)                            # sanitized SEND-phase fault classification
+            self.phase = "POST_SEND_RECONCILE"
             reconciled = self._reconcile(expected, correlation)
             if reconciled is not None:
                 return reconciled                              # the send DID occur -> capture, never re-POST
@@ -258,12 +287,21 @@ class PostmarkEmailWorker:
                 "ambiguous Postmark send could not be reconciled against provider state; failing closed")
         return str(mid)
 
+    def _record_fault(self, exc):
+        """Capture the SANITIZED fault classification off an ambiguity exception (never a raw body)."""
+        self.last_fault = {"phase": self.phase, "http_status": getattr(exc, "http_status", None),
+                           "fault_kind": getattr(exc, "fault_kind", None)}
+
     def _reconcile(self, expected, correlation):
         """The single provider MessageID for the exact frozen action iff provider state holds exactly
         one FULLY-compliant correlated message; None if none; if more than one, the effect is
         ambiguously duplicated -> fail CLOSED into recovery (never resolve to an arbitrary id)."""
-        candidates = [msg for msg in self._t.find_outbound_by_correlation(dict(correlation))
-                      if _message_matches_frozen(msg, expected)]
+        try:
+            found = self._t.find_outbound_by_correlation(dict(correlation))
+        except AmbiguousExternalEffectError as exc:   # correlation read undetermined -> fail closed
+            self._record_fault(exc)
+            raise
+        candidates = [msg for msg in found if _message_matches_frozen(msg, expected)]
         if len(candidates) > 1:
             raise AmbiguousExternalEffectError(
                 "multiple correlated Postmark messages exist for one action; failing closed (prior duplicate)")
@@ -735,6 +773,16 @@ class _PostmarkVerifiedProviderState:
         self.delivery_type = delivery_type    # actual DeliveryType — a REAL attestation is only Live
 
 
+def _fault_kind(status, data, *, accepted_no_id=False) -> str:
+    """Sanitized classification of a non-usable provider response (no body/token/header exposed):
+    a 5xx/other HTTP status vs a malformed/unparseable 2xx payload vs a 2xx accepted-without-id."""
+    if status is not None and 200 <= status < 300:
+        return "accepted_no_message_id" if accepted_no_id else "malformed"
+    if status is None:
+        return "no_response"
+    return "http_status"
+
+
 def _http_request(method: str, url: str, *, headers: dict, body: bytes = None,
                   timeout: float = POSTMARK_HTTP_TIMEOUT_SECONDS):  # pragma: no cover - network
     """The SOLE network boundary. Returns (status_code, parsed_json_or_None) for any HTTP RESPONSE
@@ -760,7 +808,9 @@ def _http_request(method: str, url: str, *, headers: dict, body: bytes = None,
         return exc.code, parsed
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # No usable provider response (timeout/DNS/connection reset): UNKNOWN, never empty. Fail closed.
-        raise PostmarkReconcileUnknown(f"Postmark transport failure: {type(exc).__name__}") from exc
+        kind = "timeout" if isinstance(exc, TimeoutError) else "network"
+        raise PostmarkReconcileUnknown(f"Postmark transport failure: {type(exc).__name__}",
+                                       http_status=None, fault_kind=kind) from exc
 
 
 class PostmarkHttpTransport:
@@ -790,7 +840,8 @@ class PostmarkHttpTransport:
             # a received 4xx = deterministic client rejection: the send was NOT accepted (no effect)
             raise PostmarkSendRejected(f"Postmark rejected the send (status={status})")
         # 5xx / unusable response / accepted-without-id: the effect MAY have occurred -> ambiguous
-        raise AmbiguousExternalEffectError(f"Postmark send outcome is ambiguous (status={status})")
+        raise _annotate(AmbiguousExternalEffectError(f"Postmark send outcome is ambiguous (status={status})"),
+                        http_status=status, fault_kind=_fault_kind(status, data, accepted_no_id=mid is None))
 
     def get_server_state(self) -> PostmarkServerState:
         """The actual Postmark server facts for the runtime token: GET /server -> ("ID","DeliveryType")
@@ -799,7 +850,8 @@ class PostmarkHttpTransport:
         never a fabricated 'None/None' server state that could pass or fail a check by accident."""
         status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
         if status != 200 or not isinstance(data, dict):
-            raise PostmarkReconcileUnknown(f"Postmark GET /server undetermined (status={status})")
+            raise PostmarkReconcileUnknown(f"Postmark GET /server undetermined (status={status})",
+                                           http_status=status, fault_kind=_fault_kind(status, data))
         return PostmarkServerState(server_id=str(data.get("ID")), delivery_type=str(data.get("DeliveryType")))
 
     def get_outbound_message(self, message_id):
@@ -809,7 +861,8 @@ class PostmarkHttpTransport:
             return None                        # DEFINITIVE: unknown MessageID -> no reconcilable record
         if status != 200 or not isinstance(data, dict):
             # 5xx / other 4xx / unparseable -> UNDETERMINED. Never collapse to 'no record'.
-            raise PostmarkReconcileUnknown(f"Postmark outbound details undetermined (status={status})")
+            raise PostmarkReconcileUnknown(f"Postmark outbound details undetermined (status={status})",
+                                           http_status=status, fault_kind=_fault_kind(status, data))
         recipients = data.get("Recipients") or [r.get("Email") for r in (data.get("To") or []) if isinstance(r, dict)]
         # Reply-To: prefer the structured field; else parse the provider's raw message headers
         # (stdlib email, no dependency) — never trust what the worker CLAIMED it sent.
@@ -836,7 +889,8 @@ class PostmarkHttpTransport:
         # genuine no-match). A 5xx / non-200 / malformed payload is UNDETERMINED -> raise, never empty
         # (an empty-from-error would look like 'no prior send' and risk a duplicate send).
         if status != 200 or not isinstance(data, dict) or "Messages" not in data:
-            raise PostmarkReconcileUnknown(f"Postmark outbound search undetermined (status={status})")
+            raise PostmarkReconcileUnknown(f"Postmark outbound search undetermined (status={status})",
+                                           http_status=status, fault_kind=_fault_kind(status, data))
         out = []
         for m in data.get("Messages", []):
             mid = m.get("MessageID")

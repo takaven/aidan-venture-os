@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from aidan_core.errors import AmbiguousExternalEffectError
 from aidan_core.market import postmark as pm
 from aidan_core.market.postmark import (POSTMARK_HTTP_TIMEOUT_SECONDS, PostmarkHttpTransport,
                                         PostmarkReconcileUnknown, PostmarkSendRejected)
@@ -134,6 +135,47 @@ def test_K_L_send_request_shape(monkeypatch):
     assert isinstance(body["To"], str)                    # single recipient, not a list/batch
     assert "Cc" not in body and "Bcc" not in body and "Attachments" not in body
     assert set(body) == {"From", "To", "Subject", "TextBody", "ReplyTo", "Metadata", "MessageStream"}
+
+
+# ---- diagnostics: the worker records the exact failing PHASE + a sanitized fault classification ---
+_EXPECTED = {"correlation": {"action_request": "a1"}, "content_hash": "h", "recipient_hash": "r",
+             "subject": "s", "reply_to": "x@x", "sender": "a@x", "message_stream": "outbound"}
+
+
+def _send(w):
+    return w._send_reconcilably(_EXPECTED, message_stream="outbound", sender="a@x", to="b@y",
+                                subject="s", text_body="t", reply_to="x@x", correlation={"action_request": "a1"})
+
+
+def test_send_phase_ambiguous_records_fault(monkeypatch):
+    # pre-send reconcile returns a definitive empty 200; the POST then 5xx -> ambiguous, fail closed.
+    monkeypatch.setattr(pm, "_http_request", FakeHttp([("GET", "/messages/outbound?", (200, {"Messages": []})),
+                                                       ("POST", "/email", (503, None))]))
+    w = pm.PostmarkEmailWorker(PostmarkHttpTransport("tok-not-real"), resolver=None, source=None)
+    with pytest.raises(AmbiguousExternalEffectError):
+        _send(w)
+    assert w.phase == "POST_SEND_RECONCILE"                       # ended in post-send reconcile
+    assert w.last_fault["phase"] == "SEND_REQUEST"                # the fault occurred at the POST
+    assert w.last_fault["http_status"] == 503 and w.last_fault["fault_kind"] == "http_status"
+
+
+def test_pre_send_reconcile_ambiguous_records_fault(monkeypatch):
+    # the pre-send correlation read is undetermined (5xx) -> UNKNOWN, fail closed, NO send attempted.
+    fake = FakeHttp([("GET", "/messages/outbound?", (503, None))])
+    monkeypatch.setattr(pm, "_http_request", fake)
+    w = pm.PostmarkEmailWorker(PostmarkHttpTransport("tok-not-real"), resolver=None, source=None)
+    with pytest.raises(PostmarkReconcileUnknown):
+        w._reconcile(_EXPECTED, {"action_request": "a1"})
+    assert w.last_fault["http_status"] == 503 and w.last_fault["fault_kind"] == "http_status"
+    assert not any(c["method"] == "POST" for c in fake.calls)     # never a send POST
+
+
+def test_send_5xx_fault_carries_sanitized_classification(monkeypatch):
+    monkeypatch.setattr(pm, "_http_request", FakeHttp([("POST", "/email", (503, None))]))
+    with pytest.raises(AmbiguousExternalEffectError) as ei:
+        _t().send_email(message_stream="outbound", sender="a@x", to="b@y", subject="s",
+                        text_body="t", reply_to="r@x", metadata=CORR)
+    assert ei.value.http_status == 503 and ei.value.fault_kind == "http_status"   # int + kind, no raw body
 
 
 # ---- H: explicit HTTP timeout actually reaches the transport (urllib) -----------------

@@ -305,15 +305,12 @@ class PostmarkEmailWorker:
         outcome is ambiguous (network fault after dispatch, or no usable MessageID) is reconciled
         against provider state — captured if the exact message landed, else failed closed with NO
         blind re-dispatch. Known PRE-send failures are handled earlier and never reach here."""
-        try:
-            existing = self._reconcile(expected, correlation)  # (1) never duplicate a prior send
-        except PostmarkReconcileUnknown as exc:
-            # pre-send reconcile UNDETERMINED, BEFORE any POST -> no consequential effect is possible.
-            # Deterministic PROVIDER_UNAVAILABLE (retryable), never RECOVERY_REQUIRED.
-            raise PostmarkProviderUnavailable(
-                "pre-send reconcile undetermined; no send issued",
-                http_status=getattr(exc, "http_status", None),
-                fault_kind=getattr(exc, "fault_kind", None)) from exc
+        # (1) never duplicate a prior send. An UNDETERMINED duplicate-check (PostmarkReconcileUnknown)
+        # is NOT reclassified here: on a retry a prior consequential send may exist, so it stays
+        # AMBIGUOUS and fails closed into RECOVERY_REQUIRED (the duplicate-send corridor). This is
+        # distinct from the pure GET /server identity read, which can never have sent and so fails
+        # DETERMINISTICALLY (PROVIDER_UNAVAILABLE) in execute().
+        existing = self._reconcile(expected, correlation)
         if existing is not None:
             return existing
         self.phase = "SEND_REQUEST"                            # about to issue the consequential POST

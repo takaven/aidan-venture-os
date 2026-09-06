@@ -440,7 +440,11 @@ class PostmarkActionVerifier:
             checks.append(("AUDIENCE_IDENTITY", _recipient_hash(str(msg.get("To"))) == recipient_hash))
             checks.append(("REPLY_TO_IDENTITY", _normalize_email(msg.get("ReplyTo")) == expected_reply_to))
             checks.append(("CHANNEL_IDENTITY", str(msg.get("MessageStream")) == str(fs.get("message_stream"))))
-            checks.append(("SENDER_IDENTITY", str(msg.get("From")) == str(fs.get("sender"))))
+            # SENDER identity is the mailbox, not the raw header representation: real Postmark echoes
+            # `From` in a display-name/formatted form that is not byte-identical to the frozen sender
+            # but normalizes to the SAME mailbox. Compare parsed mailbox (the SAME strict normalizer
+            # already governing recipient and Reply-To identity); a different mailbox/domain is REJECTED.
+            checks.append(("SENDER_IDENTITY", _normalize_email(msg.get("From")) == _normalize_email(fs.get("sender"))))
             checks.append(("NOT_SANDBOXED", msg.get("Sandboxed") is not True))
             checks.append(("ACCEPTANCE_IDENTITY",
                            canonical == str(msg.get("MessageID")) and canonical not in ("", "None")))
@@ -501,7 +505,7 @@ def _message_matches_frozen(msg: dict, expected: dict) -> bool:
             and _recipient_hash(str(msg.get("To"))) == str(expected["recipient_hash"])
             and str(msg.get("Subject")) == str(expected["subject"])
             and _normalize_email(msg.get("ReplyTo")) == _normalize_email(expected["reply_to"])
-            and str(msg.get("From")) == str(expected["sender"])
+            and _normalize_email(msg.get("From")) == _normalize_email(expected["sender"])
             and str(msg.get("MessageStream")) == str(expected["message_stream"])
             and msg.get("Sandboxed") is not True)
 

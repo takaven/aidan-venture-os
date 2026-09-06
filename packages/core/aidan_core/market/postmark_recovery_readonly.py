@@ -97,7 +97,7 @@ def _matches(msg: dict, expected: dict, action_request_id: str) -> bool:
             and channels_mod.content_sha(str(msg.get("TextBody", ""))) == expected["content_hash"]
             and pm._recipient_hash(str(msg.get("To"))) == str(expected["recipient_hash"])
             and str(msg.get("Subject")) == str(expected["subject"])
-            and str(msg.get("From")) == str(expected["sender"])
+            and pm._normalize_email(msg.get("From")) == pm._normalize_email(expected["sender"])
             and str(msg.get("MessageStream")) == str(expected["message_stream"])
             and msg.get("Sandboxed") is not True)
 

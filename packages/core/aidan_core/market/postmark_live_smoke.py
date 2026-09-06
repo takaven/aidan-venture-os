@@ -115,8 +115,12 @@ def run_postmark_ingress_smoke(conn, *, recipient, token=None, transport=None, s
                   failure_phase=getattr(worker, "phase", "UNKNOWN"))
         return _finalize(conn, action_id, vid, ev, gov_baseline, worker)
     if status == "FAILED":
+        fk = (getattr(worker, "last_fault", None) or {}).get("fault_kind")
+        reason = {"auth": "AUTH_FAILURE", "config": "CONFIG_FAILURE",
+                  "timeout": "PROVIDER_UNAVAILABLE", "network": "PROVIDER_UNAVAILABLE",
+                  "http_status": "PROVIDER_UNAVAILABLE", "malformed": "PROVIDER_UNAVAILABLE"}.get(fk, "WORKER_ERROR")
         ev.update(result="FAIL", send_effect="NOT_OBSERVED",
-                  failure_phase=getattr(worker, "phase", "UNKNOWN"))
+                  failure_phase=getattr(worker, "phase", "UNKNOWN"), failure_reason=reason)
         return _finalize(conn, action_id, vid, ev, gov_baseline, worker)
 
     # A message id was captured -> verify against provider state (independent of the worker claim).
@@ -141,7 +145,12 @@ def _finalize(conn, action_id, vid, ev, gov_baseline, worker):
     ev["lifecycle_after"] = _lifecycle(conn, vid)
     ev["lifecycle_over_promoted"] = ev["lifecycle_after"] != ev.get("lifecycle_before")
     ev["governance_deltas"] = _gov_count(conn, vid) - gov_baseline
-    ev["send_invocations"] = getattr(worker, "calls", None)
+    # TWO distinct counters (never conflate them): worker_invocations counts worker ENTRY; the worker
+    # runs many pre-send reads before any POST, so it is NOT a send count. send_post_invocations counts
+    # ACTUAL POST /email calls — a pre-send auth/config/unavailable failure reports 0 (no provider
+    # mutation is inferred merely because the worker ran).
+    ev["worker_invocations"] = getattr(worker, "calls", None)
+    ev["send_post_invocations"] = getattr(worker, "send_post_calls", None)
     # Diagnostics: the exact provider phase reached + a SANITIZED transport-fault classification, so a
     # future fail-closed run records WHERE it failed (a duplicate of the ambiguity that cost run #1
     # its phase). The correlation id lets a later read-only recovery locate the message at Postmark.
@@ -198,7 +207,7 @@ def main() -> int:
     print(json.dumps(ev, sort_keys=True))
     ok = (ev.get("result") == "PASS" and ev.get("secret_leak_check") == "PASS"
           and ev.get("governance_deltas") == 0 and ev.get("lifecycle_over_promoted") is False
-          and (ev.get("send_invocations") or 0) <= spec.MAX_SENDS)
+          and (ev.get("send_post_invocations") or 0) <= spec.MAX_SENDS)
     return 0 if ok else 4
 
 

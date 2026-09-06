@@ -87,6 +87,42 @@ def _annotate(exc, *, http_status=None, fault_kind=None):
     exc.fault_kind = fault_kind
     return exc
 
+
+class PostmarkAuthError(MarketAuthorityError):
+    """A Postmark request was deterministically REJECTED for authentication/authorization (HTTP
+    401/403): the runtime token cannot act on this server. On the MANDATORY pre-send GET /server
+    identity check this is a definitive AUTH_FAILURE with NO send effect — a deterministic no-effect
+    failure that fails the action closed as WORKER_ERROR/FAILED, NEVER RECOVERY_REQUIRED (which is
+    reserved for a consequential send that may actually have occurred)."""
+
+    def __init__(self, *args, http_status=None):
+        super().__init__(*args)
+        self.http_status = http_status
+        self.fault_kind = "auth"
+
+
+class PostmarkConfigError(MarketAuthorityError):
+    """A deterministic Postmark provider-CONFIGURATION failure discovered BEFORE any send: the runtime
+    token authenticates but belongs to a different server than the frozen approved one, or the server
+    is not Live. No send effect; deterministic (FAILED), never ambiguous."""
+
+    def __init__(self, *args, http_status=None):
+        super().__init__(*args)
+        self.http_status = http_status
+        self.fault_kind = "config"
+
+
+class PostmarkProviderUnavailable(MarketAuthorityError):
+    """A PRE-send provider read (GET /server or the pre-send duplicate reconcile) was UNDETERMINED
+    (5xx / timeout / malformed) BEFORE any POST /email was issued. Because no consequential send is
+    yet possible, this fails the action CLOSED as a DETERMINISTIC no-effect failure (retryable under
+    policy), NOT RECOVERY_REQUIRED — that state is reserved for a POST whose effect may have occurred."""
+
+    def __init__(self, *args, http_status=None, fault_kind=None):
+        super().__init__(*args)
+        self.http_status = http_status
+        self.fault_kind = fault_kind
+
 # Verified provider events normalize ONLY into the existing finite observation vocabulary.
 _EVENT_TO_OBSERVATION = {"Delivery": "DELIVERED", "Bounce": "BOUNCED"}
 
@@ -176,7 +212,8 @@ class PostmarkEmailWorker:
         self._resolver = resolver
         self._source = source
         self.mode = mode
-        self.calls = 0
+        self.calls = 0                 # WORKER-ENTRY count (execute invocations); NOT a send count
+        self.send_post_calls = 0       # ACTUAL POST /email invocations (incremented at the POST boundary)
         self.last_request = None
         # Diagnostics: the exact phase reached (PRE_SEND_RECONCILE | SEND_REQUEST | POST_SEND_RECONCILE)
         # and a SANITIZED transport-fault classification, so a fail-closed run records WHERE it failed
@@ -204,16 +241,26 @@ class PostmarkEmailWorker:
         # that the server is LIVE (GET /server) — a matching credential_ref string is NOT sufficient,
         # and a Sandbox server (which 'delivers' without reaching a real recipient) is refused BEFORE
         # any consequential send, never silently downgraded to SIMULATED after sending.
+        # The mandatory pre-send identity/live read. Its outcomes are DETERMINISTIC (no send is
+        # possible yet): 401/403 -> AUTH_FAILURE; a wrong/non-Live server -> CONFIG_FAILURE; a 5xx/
+        # timeout/malformed read -> PROVIDER_UNAVAILABLE. NONE of these is RECOVERY_REQUIRED — that is
+        # reserved for a POST whose consequential effect may actually have occurred (below).
         try:
             server = self._t.get_server_state()
-        except AmbiguousExternalEffectError as exc:   # provider-identity read undetermined (pre-send)
+        except PostmarkAuthError as exc:              # 401/403: deterministic AUTH_FAILURE, no send
+            raise self._record_fault(exc)
+        except PostmarkReconcileUnknown as exc:       # 5xx/timeout/malformed BEFORE any POST -> no effect
             self._record_fault(exc)
-            raise
+            raise PostmarkProviderUnavailable(
+                "pre-send GET /server undetermined; no send issued",
+                http_status=getattr(exc, "http_status", None),
+                fault_kind=getattr(exc, "fault_kind", None)) from exc
         if str(server.server_id) != str(fs.get("postmark_server_id")):
-            raise MarketAuthorityError("transport credential does not belong to the frozen Postmark server")
+            raise self._record_fault(PostmarkConfigError(
+                "transport credential does not belong to the frozen Postmark server"))
         if str(server.delivery_type) != REQUIRED_DELIVERY_TYPE:
-            raise MarketAuthorityError(
-                "Postmark server is not Live; a Sandbox server cannot perform a real market action")
+            raise self._record_fault(PostmarkConfigError(
+                "Postmark server is not Live; a Sandbox server cannot perform a real market action"))
         recipient = self._resolver.resolve(str(request.venture_id), m["source_instance_ref"], m["audience_ref"])
         if _recipient_hash(recipient) != str(pm.get("recipient_hash")):
             raise MarketAuthorityError("resolved recipient does not match the frozen approved recipient")
@@ -258,10 +305,16 @@ class PostmarkEmailWorker:
         outcome is ambiguous (network fault after dispatch, or no usable MessageID) is reconciled
         against provider state — captured if the exact message landed, else failed closed with NO
         blind re-dispatch. Known PRE-send failures are handled earlier and never reach here."""
-        existing = self._reconcile(expected, correlation)      # (1) never duplicate a prior send
+        # (1) never duplicate a prior send. An UNDETERMINED duplicate-check (PostmarkReconcileUnknown)
+        # is NOT reclassified here: on a retry a prior consequential send may exist, so it stays
+        # AMBIGUOUS and fails closed into RECOVERY_REQUIRED (the duplicate-send corridor). This is
+        # distinct from the pure GET /server identity read, which can never have sent and so fails
+        # DETERMINISTICALLY (PROVIDER_UNAVAILABLE) in execute().
+        existing = self._reconcile(expected, correlation)
         if existing is not None:
             return existing
         self.phase = "SEND_REQUEST"                            # about to issue the consequential POST
+        self.send_post_calls += 1                              # ACTUAL POST /email boundary (only here)
         try:                                                   # (2) attempt the consequential POST
             mid = self._t.send_email(message_stream=message_stream, sender=sender, to=to, subject=subject,
                                      text_body=text_body, reply_to=reply_to, metadata=dict(correlation))
@@ -288,9 +341,11 @@ class PostmarkEmailWorker:
         return str(mid)
 
     def _record_fault(self, exc):
-        """Capture the SANITIZED fault classification off an ambiguity exception (never a raw body)."""
+        """Capture the SANITIZED fault classification off a fault exception (never a raw body) and
+        return it, so a raise site can read ``raise self._record_fault(SomeError(...))``."""
         self.last_fault = {"phase": self.phase, "http_status": getattr(exc, "http_status", None),
                            "fault_kind": getattr(exc, "fault_kind", None)}
+        return exc
 
     def _reconcile(self, expected, correlation):
         """The single provider MessageID for the exact frozen action iff provider state holds exactly
@@ -327,16 +382,17 @@ class PostmarkActionVerifier:
         self._t = transport
 
     def verify(self, request: VerificationRequest) -> VerificationResult:
-        # Fail CLOSED on undetermined provider state: an unknown read-back is NEVER VERIFIED.
+        # Fail CLOSED on undetermined OR unauthorized provider state: neither an unknown read-back nor
+        # an auth-rejected read is EVER VERIFIED (a 401/403 during verification cannot prove the send).
         try:
             return self._verify(request)
-        except PostmarkReconcileUnknown:
+        except (PostmarkReconcileUnknown, PostmarkAuthError) as exc:
             from ..actions import canonical_payload_hash
+            reason = "provider_auth_failed" if isinstance(exc, PostmarkAuthError) else "provider_state_unknown"
             return VerificationResult(
                 self.kind, "REJECTED", self.verification_type,
-                canonical_payload_hash({"attempt": str(request.execution_attempt_id),
-                                        "reason": "provider_state_unknown"}),
-                detail={"reason": "provider_state_unknown"})
+                canonical_payload_hash({"attempt": str(request.execution_attempt_id), "reason": reason}),
+                detail={"reason": reason})
 
     def _verify(self, request: VerificationRequest) -> VerificationResult:
         market = dict((request.expected_output_contract or {}).get("market", {}))
@@ -849,6 +905,10 @@ class PostmarkHttpTransport:
         Non-secret; no token returned into evidence. A non-200 / malformed response is UNKNOWN (raise),
         never a fabricated 'None/None' server state that could pass or fail a check by accident."""
         status, data = _http_request("GET", f"{self._API}/server", headers=self._headers())
+        if status in (401, 403):
+            # DETERMINISTIC auth rejection (bad/revoked token or forbidden): NOT undetermined — the
+            # token simply cannot act on this server. No send effect. Never RECOVERY_REQUIRED.
+            raise PostmarkAuthError(f"Postmark GET /server unauthorized (status={status})", http_status=status)
         if status != 200 or not isinstance(data, dict):
             raise PostmarkReconcileUnknown(f"Postmark GET /server undetermined (status={status})",
                                            http_status=status, fault_kind=_fault_kind(status, data))

@@ -1,0 +1,57 @@
+name: Gate 8 Postmark Live Preflight (zero-send)
+
+# MANUAL ONLY, ZERO-SEND. Proves the POSTMARK_SERVER_TOKEN secret can authenticate to the expected
+# Postmark server and that the server satisfies the live-send contract (exact Server ID + Live), using
+# a SINGLE GET /server read and nothing else. It issues NO POST /email and touches NO mutation
+# endpoint — the transport is wrapped read-only (no send_email), so a send is structurally impossible.
+# A 401/403 is a deterministic AUTH_FAILURE, never ambiguity. Fail-closed against the accepted-main
+# SHA. Sanitized evidence only — no token, no raw provider body. No push / pull_request / schedule
+# trigger, no retry. NOT auto-dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_POSTMARK_LIVE_PREFLIGHT to authorize the zero-send credential preflight'
+        required: true
+        default: ''
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
+        required: true
+        default: ''
+      postmark_server_id:
+        description: 'The expected Postmark Server ID (non-secret; GET /server must return exactly this)'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  postmark-live-preflight:
+    if: ${{ github.event.inputs.confirm == 'RUN_POSTMARK_LIVE_PREFLIGHT' }}
+    runs-on: ubuntu-latest
+    environment: gate8-postmark-live
+
+    env:
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      POSTMARK_PREFLIGHT_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
+      POSTMARK_SERVER_ID: ${{ github.event.inputs.postmark_server_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Prove the Postmark token authenticates to the expected Live server (GET /server only)
+        env:
+          # SECRET: the Postmark server API token. Host-mapped into this step only; used ONLY for the
+          # single GET /server read (the preflight transport cannot POST /email); never persisted, never printed.
+          POSTMARK_SERVER_TOKEN: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+        run: python -m aidan_core.market.postmark_live_preflight

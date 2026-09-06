@@ -1,5 +1,9 @@
 # Historical Donor Register — Gate 0 Verified Baseline
 
+> **HISTORICAL RECORD (Gate 0).** "Current" here refers to the *donor repositories'* GitHub state as
+> observed during Gate 0 — not to AI-DAN programme status. For current programme state see
+> [`docs/PROGRAMME_STATUS.md`](../PROGRAMME_STATUS.md).
+
 **Verification date:** 2026-08-18
 **Scope:** Current public GitHub metadata, default-branch HEADs, branch/PR signals needed for Gate 0, root licence files where available, and bounded secret-risk filename review. No claim is made about uncommitted working-tree content in any historical clone.
 

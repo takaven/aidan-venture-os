@@ -1,3 +1,7 @@
+> **HISTORICAL RECORD — NOT CURRENT PROGRAMME STATUS.** This documents the Gate 0 execution
+> (2026-08-18) and is preserved unchanged as historical background. For current programme state, the
+> active gate, and the current blocker, see [`docs/PROGRAMME_STATUS.md`](PROGRAMME_STATUS.md).
+
 # Gate 0 — Preserve & Canonicalise — Local Execution Record
 
 **Execution date:** 2026-08-18

@@ -16,7 +16,7 @@ from aidan_core import execution
 from aidan_core.errors import AmbiguousExternalEffectError
 from aidan_core.market import postmark_live_smoke as smoke
 from aidan_core.market import postmark_smoke_spec as spec
-from aidan_core.market.postmark import PostmarkReconcileUnknown
+from aidan_core.market.postmark import PostmarkAuthError, PostmarkReconcileUnknown
 
 from postmark_fakes import FakePostmarkTransport
 
@@ -45,6 +45,68 @@ class _UnknownReconcile(FakePostmarkTransport):
         raise PostmarkReconcileUnknown("provider search 5xx")
 
 
+class _AuthFailServer(FakePostmarkTransport):
+    def get_server_state(self):
+        raise PostmarkAuthError("Postmark GET /server unauthorized (status=401)", http_status=401)
+
+
+class _ServerUnavailable(FakePostmarkTransport):
+    def get_server_state(self):
+        raise PostmarkReconcileUnknown("Postmark GET /server undetermined (status=503)",
+                                       http_status=503, fault_kind="http_status")
+
+
+class _VerifyAmbiguousOnDetails(FakePostmarkTransport):
+    # Send + pre-send reads succeed; only the verifier's per-message details read is undetermined.
+    def get_outbound_message(self, message_id):
+        raise PostmarkReconcileUnknown("Postmark outbound details undetermined (status=503)",
+                                       http_status=503, fault_kind="http_status")
+
+
+# ==== auth/config taxonomy + true send accounting at the canonical level (A,B,C,D,E,G,H) ===========
+def test_A_B_auth_401_is_failed_not_recovery(migrated):
+    ev = _run(migrated, _AuthFailServer(server_id="server-A"), slug="pm-auth")
+    assert ev["result"] == "FAIL" and ev["failure_reason"] == "AUTH_FAILURE"      # taxonomy
+    assert ev["worker_invocations"] == 1 and ev["send_post_invocations"] == 0     # A: worker ran, no POST
+    assert execution.get_status(migrated, ev["action_request_id"]) == "FAILED"    # B: NOT RECOVERY_REQUIRED
+    assert ev["failure_phase"] == "PRE_SEND_RECONCILE"
+
+
+def test_C_wrong_server_is_config_failure(migrated):
+    ev = _run(migrated, FakePostmarkTransport(server_id="server-OTHER"), slug="pm-wrongsrv")
+    assert ev["result"] == "FAIL" and ev["failure_reason"] == "CONFIG_FAILURE"
+    assert ev["send_post_invocations"] == 0                                       # zero POST
+    assert execution.get_status(migrated, ev["action_request_id"]) == "FAILED"
+
+
+def test_D_non_live_is_config_failure(migrated):
+    ev = _run(migrated, FakePostmarkTransport(server_id="server-A", delivery_type="Sandbox"), slug="pm-sandbox")
+    assert ev["result"] == "FAIL" and ev["failure_reason"] == "CONFIG_FAILURE"
+    assert ev["send_post_invocations"] == 0
+    assert execution.get_status(migrated, ev["action_request_id"]) == "FAILED"
+
+
+def test_E_pre_send_unavailable_is_failed_not_recovery(migrated):
+    ev = _run(migrated, _ServerUnavailable(server_id="server-A"), slug="pm-unavail")
+    assert ev["result"] == "FAIL" and ev["failure_reason"] == "PROVIDER_UNAVAILABLE"
+    assert ev["send_post_invocations"] == 0                                       # no POST possible
+    assert execution.get_status(migrated, ev["action_request_id"]) == "FAILED"    # NOT RECOVERY_REQUIRED
+
+
+def test_G_ambiguous_post_is_recovery_with_one_send(migrated):
+    ev = _run(migrated, _AmbiguousSend(server_id="server-A", delivery_type="Live"), slug="pm-ambig2")
+    assert ev["result"] == "RECOVERY_REQUIRED"
+    assert ev["send_post_invocations"] == 1                                       # a real POST was issued
+    assert execution.get_status(migrated, ev["action_request_id"]) == "RECOVERY_REQUIRED"
+    assert ev["failure_phase"] == "POST_SEND_RECONCILE"
+
+
+def test_H_post_send_verify_ambiguity_preserves_message_id(migrated):
+    ev = _run(migrated, _VerifyAmbiguousOnDetails(server_id="server-A", delivery_type="Live"), slug="pm-verifamb")
+    assert ev["result"] == "FAIL" and ev["failure_phase"] == "POST_SEND_VERIFY"
+    assert ev["send_post_invocations"] == 1 and ev.get("message_id")              # MessageID preserved
+
+
 # ---- happy path: VERIFIED, one send, no over-promote, proof, bounded spend (Q,R,S) ----
 def test_pass_verified_one_send_no_overpromote(migrated):
     fake = FakePostmarkTransport(server_id="server-A", delivery_type="Live")
@@ -52,7 +114,8 @@ def test_pass_verified_one_send_no_overpromote(migrated):
     assert ev["result"] == "PASS" and ev["market_verdict"] == "VERIFIED"
     assert ev["proof_verification_type"] == "MARKET_ACTION" and ev["proof_result"] == "VERIFIED"  # R
     assert ev["provider_contact_evidence"] == "OBSERVED" and ev["send_effect"] == "OBSERVED"
-    assert ev["send_invocations"] == 1 and fake._n == 1                    # exactly one send
+    assert ev["send_post_invocations"] == 1 and fake._n == 1               # exactly one ACTUAL send POST
+    assert ev["worker_invocations"] == 1                                   # worker ran once (distinct count)
     assert ev["lifecycle_over_promoted"] is False and ev["lifecycle_after"] == "OPERATING"  # S
     assert ev["governance_deltas"] == 0 and ev["secret_leak_check"] == "PASS"
     assert Decimal(ev["committed"]) <= spec.CEILING                        # Q

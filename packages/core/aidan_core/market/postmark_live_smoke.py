@@ -111,10 +111,12 @@ def run_postmark_ingress_smoke(conn, *, recipient, token=None, transport=None, s
     ev["failure_class"] = r.failure_class
     status = execution.get_status(conn, action_id)
     if status == "RECOVERY_REQUIRED":
-        ev.update(result="RECOVERY_REQUIRED", send_effect="UNKNOWN")
+        ev.update(result="RECOVERY_REQUIRED", send_effect="UNKNOWN",
+                  failure_phase=getattr(worker, "phase", "UNKNOWN"))
         return _finalize(conn, action_id, vid, ev, gov_baseline, worker)
     if status == "FAILED":
-        ev.update(result="FAIL", send_effect="NOT_OBSERVED")
+        ev.update(result="FAIL", send_effect="NOT_OBSERVED",
+                  failure_phase=getattr(worker, "phase", "UNKNOWN"))
         return _finalize(conn, action_id, vid, ev, gov_baseline, worker)
 
     # A message id was captured -> verify against provider state (independent of the worker claim).
@@ -128,6 +130,8 @@ def run_postmark_ingress_smoke(conn, *, recipient, token=None, transport=None, s
     out = pm.verify_postmark_action(conn, action_id, transport=transport, actual_cost=spec.CEILING, actor=actor)
     ev["market_verdict"] = "VERIFIED" if out.verified else "REJECTED"
     ev["result"] = "PASS" if execution.get_status(conn, action_id) == "SUCCEEDED" else "FAIL"
+    if ev["result"] != "PASS":
+        ev["failure_phase"] = "POST_SEND_VERIFY"       # a send was captured; the verify step rejected
     return _finalize(conn, action_id, vid, ev, gov_baseline, worker)
 
 
@@ -138,6 +142,14 @@ def _finalize(conn, action_id, vid, ev, gov_baseline, worker):
     ev["lifecycle_over_promoted"] = ev["lifecycle_after"] != ev.get("lifecycle_before")
     ev["governance_deltas"] = _gov_count(conn, vid) - gov_baseline
     ev["send_invocations"] = getattr(worker, "calls", None)
+    # Diagnostics: the exact provider phase reached + a SANITIZED transport-fault classification, so a
+    # future fail-closed run records WHERE it failed (a duplicate of the ambiguity that cost run #1
+    # its phase). The correlation id lets a later read-only recovery locate the message at Postmark.
+    ev["send_phase_reached"] = getattr(worker, "phase", "UNKNOWN")
+    ev["correlation_action_request"] = str(action_id)
+    fault = getattr(worker, "last_fault", None)
+    if fault:
+        ev["transport_fault"] = fault
     b = _budget(conn, vid)
     if b is not None:
         ev["reserved"], ev["committed"] = str(b[0]), str(b[1])

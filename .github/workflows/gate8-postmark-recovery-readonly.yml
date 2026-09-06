@@ -1,0 +1,73 @@
+name: Gate 8 Postmark Recovery (read-only)
+
+# MANUAL ONLY, READ-ONLY RECOVERY. Resolves ONE already-known owner-ingress smoke that failed closed
+# on an ambiguous send (RECOVERY_REQUIRED) by asking Postmark — with GET reads ONLY — whether the one
+# authorized message exists. It performs GET /server, a bounded GET outbound search by the unique
+# action_request correlation tag, and GET outbound details for exact-identity reconciliation. It has
+# NO database, issues NO POST /email, touches NO mutation endpoint, and CANNOT send (the transport is
+# wrapped read-only). Classifies RECOVERY_CONFIRMED_SENT / RECOVERY_CONFIRMED_NOT_FOUND /
+# RECOVERY_AMBIGUOUS. Fail-closed against the accepted-main SHA. Sanitized evidence only — no token,
+# no raw provider body. No push / pull_request / schedule trigger, no retry. NOT auto-dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RUN_POSTMARK_RECOVERY_READONLY to authorize the read-only provider reconciliation'
+        required: true
+        default: ''
+      accepted_sha:
+        description: 'Exact accepted main commit SHA to fail-close against (must equal the checked-out commit)'
+        required: true
+        default: ''
+      action_request_id:
+        description: 'The action_request UUID of the failed owner-ingress send (its Postmark correlation tag)'
+        required: true
+        default: ''
+      postmark_server_id:
+        description: 'The expected Postmark Server ID (non-secret; GET /server must match)'
+        required: true
+        default: ''
+      sender:
+        description: 'The authorized From address the original send used'
+        required: true
+        default: ''
+      recipient:
+        description: 'The owner-controlled recipient the original send targeted'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  postmark-recovery-readonly:
+    if: ${{ github.event.inputs.confirm == 'RUN_POSTMARK_RECOVERY_READONLY' }}
+    runs-on: ubuntu-latest
+    environment: gate8-postmark-live
+
+    env:
+      CONFIRM: ${{ github.event.inputs.confirm }}
+      POSTMARK_RECOVERY_ACCEPTED_SHA: ${{ github.event.inputs.accepted_sha }}
+      POSTMARK_RECOVERY_ACTION_REQUEST_ID: ${{ github.event.inputs.action_request_id }}
+      POSTMARK_SERVER_ID: ${{ github.event.inputs.postmark_server_id }}
+      POSTMARK_SENDER: ${{ github.event.inputs.sender }}
+      POSTMARK_SMOKE_RECIPIENT: ${{ github.event.inputs.recipient }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: pip install "./packages/core"
+
+      - name: Reconcile the ambiguous owner-ingress send with Postmark reads only (no send, no DB)
+        env:
+          # SECRET: the Postmark server API token. Host-mapped into this step only; used ONLY for GET
+          # reads (the recovery transport cannot POST /email); never persisted, never printed.
+          POSTMARK_SERVER_TOKEN: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+        run: python -m aidan_core.market.postmark_recovery_readonly

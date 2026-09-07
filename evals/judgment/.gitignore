@@ -1,6 +1,7 @@
 results/
 __pycache__/
 *.pyc
+live_eval.env.ps1
 .env
 .env.local
 !.env.local.example

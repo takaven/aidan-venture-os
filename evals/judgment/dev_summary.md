@@ -27,5 +27,9 @@ Total estimated cost: **$1.812035**. Costs are the harness's approximate usage-b
 
 - All 21 arm×case records were marked OK; no parse failures were recorded.
 - T made 49 calls because the staged treatment executes sequential rounds; C0 and C1 made seven calls each.
+- The harness flags P3 as an automatic keyword-overlap heuristic, P4 as a heuristic needing human
+  review, and S2/S3 as placeholder/neutral heuristics. Those scorer limitations remain visible in
+  `scored.json`; this summary does not reinterpret them or set a threshold.
+- The cost table is the harness's approximate price table, not a billing export.
 - The complete machine-readable score record and rendered report remain local and ignored at
   `evals/judgment/results/scored.json` and `evals/judgment/results/report.md`.

@@ -36,6 +36,36 @@ PROMPT_FILE = {
     "T": PROMPTS_DIR / "t_aidan_staged.md",
 }
 
+# ---------------------------------------------------------------------------
+# local env files (gitignored) — a convenient place to put secrets/config for a live run.
+# ---------------------------------------------------------------------------
+def load_env_files() -> list[str]:
+    """Load KEY=VALUE lines from gitignored `.env` then `.env.local` in this directory into the
+    process environment. A REAL environment variable always wins (never overridden); among files,
+    `.env.local` overrides `.env`. Values may be quoted; lines starting with '#' are comments.
+    Returns the names of the files that were loaded (for diagnostics only — never prints values).
+    """
+    preexisting = set(os.environ)
+    loaded = []
+    for name in (".env", ".env.local"):
+        p = JUDGMENT_DIR / name
+        if not p.exists():
+            continue
+        loaded.append(name)
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if not k or k in preexisting:   # never override a real environment variable
+                continue
+            os.environ[k] = v               # .env.local (loaded second) overrides .env
+    return loaded
+
+
+_LOADED_ENV_FILES = load_env_files()   # populate os.environ from local files BEFORE reading defaults
+
 # Single configurable model for ALL arms (frozen-design requirement). Swap via env AIDAN_EVAL_MODEL.
 DEFAULT_MODEL = os.environ.get("AIDAN_EVAL_MODEL", "claude-opus-4-8")
 # Mode: "mock" (default, zero cost, no network) | "live" (real paid calls — must be set explicitly).

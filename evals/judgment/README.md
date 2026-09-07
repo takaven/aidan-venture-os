@@ -108,12 +108,27 @@ Outputs (under `evals/judgment/results/`, gitignored):
 - `scored.json` — per-case, per-arm, and aggregate scores (machine-readable).
 - `report.md` — the C0 vs C1 vs T summary table + per-metric means.
 
-**Live (paid) runs are explicit opt-in only** — the same single model is used for every arm:
+**Live (paid) runs are explicit opt-in only** — the same single model is used for every arm.
+
+**Where to put the API key (recommended: a gitignored local file).** `common.py` loads `.env` then
+`.env.local` from this directory into the environment before reading its defaults; both are gitignored
+and never committed. A real environment variable always wins over the files.
+
+```bash
+# one-time: create your local secrets file from the template, then edit it
+cp evals/judgment/.env.local.example evals/judgment/.env.local
+# put ANTHROPIC_API_KEY=sk-ant-... in it (an Anthropic console API key — pay-per-token,
+# separate from any Claude.ai subscription). Optionally set AIDAN_EVAL_MODE=live there too.
+```
+
+Then run live (either mode via flag, or set `AIDAN_EVAL_MODE=live` in `.env.local`):
 
 ```bash
 # ONLY when you intend to spend. Same model for all arms; cost is read from API usage.
-AIDAN_EVAL_MODE=live ANTHROPIC_API_KEY=sk-... \
-  python evals/judgment/run_dev.py --mode live --model claude-opus-4-8
+python evals/judgment/run_dev.py --mode live --model claude-opus-4-8
+
+# equivalently, without a file, via inline env vars:
+AIDAN_EVAL_MODE=live ANTHROPIC_API_KEY=sk-... python evals/judgment/run_dev.py --mode live
 ```
 
 Flags: `--mode {mock,live}` · `--model <id>` (default `claude-opus-4-8`, override via `AIDAN_EVAL_MODEL`)
@@ -133,7 +148,8 @@ evals/judgment/
 ├── README.md                 # this file — frozen design + run instructions
 ├── run_dev.py                # top-level: run all arms × all dev cases, score, write results/
 ├── common.py                 # shared: case loading, prompt rendering, model client, JSON parse, cost
-├── .gitignore                # ignores results/ and __pycache__
+├── .env.local.example        # copy to .env.local (gitignored) and add your ANTHROPIC_API_KEY
+├── .gitignore                # ignores results/, __pycache__, .env, .env.local
 ├── cases/
 │   ├── development/          # 7 dev cases (authored; inspectable)
 │   └── holdout/              # 12–15 SEALED cases (empty by design; do NOT create/peek yet)

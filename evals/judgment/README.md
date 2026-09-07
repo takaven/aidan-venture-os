@@ -136,6 +136,11 @@ Flags: `--mode {mock,live}` · `--model <id>` (default `claude-opus-4-8`, overri
 same model (frozen-design requirement). Cost figures in live mode use an **approximate** price table
 in `common.py` — verify pricing before relying on the dollar numbers.
 
+Live calls retry transient faults only (DNS/connection/timeout + HTTP 429/5xx) with bounded
+exponential backoff — deterministic 4xx are not retried. Tune via `AIDAN_EVAL_MAX_RETRIES` (default 4)
+and `AIDAN_EVAL_BACKOFF` (default 2.0s). A sanitized summary of the first live run is in
+`dev_summary.md`.
+
 > Scoring today applies **no** PASS/AMBIGUOUS/FAIL thresholds. After a real (live) development run we
 > review the numbers, then pre-register the thresholds (`rubrics/primary.md`) **before** any holdout
 > work. Deterministic metrics (P1/P2/P5, staged P6, part of S1) are computed directly; P3/P4/S2/S3 use

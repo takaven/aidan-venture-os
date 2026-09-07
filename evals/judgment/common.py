@@ -71,6 +71,11 @@ DEFAULT_MODEL = os.environ.get("AIDAN_EVAL_MODEL", "claude-opus-4-8")
 # Mode: "mock" (default, zero cost, no network) | "live" (real paid calls — must be set explicitly).
 DEFAULT_MODE = os.environ.get("AIDAN_EVAL_MODE", "mock")
 
+# Live-call resilience: retry only TRANSIENT faults (DNS/connection/timeout + these HTTP statuses).
+MAX_LIVE_RETRIES = int(os.environ.get("AIDAN_EVAL_MAX_RETRIES", "4"))
+BASE_BACKOFF_SECONDS = float(os.environ.get("AIDAN_EVAL_BACKOFF", "2.0"))
+_RETRY_STATUS = {429, 500, 502, 503, 529}
+
 # Approximate USD per 1M tokens. APPROX ONLY — verify before relying on cost figures. Used only in
 # live mode to estimate cost from returned usage; mock mode is always 0.
 _APPROX_PRICE_PER_MTOK = {
@@ -281,7 +286,6 @@ class AnthropicModelClient:
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
                  case: Optional[dict] = None, want_json: bool = False) -> tuple[str, CostRecord]:  # pragma: no cover - network
-        import urllib.request
         body = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -289,14 +293,10 @@ class AnthropicModelClient:
         }
         if system:
             body["system"] = system
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read())
+        payload = json.dumps(body).encode("utf-8")
+        headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                   "content-type": "application/json"}
+        data = self._post_with_retry(payload, headers)
         text = "".join(blk.get("text", "") for blk in data.get("content", []) if blk.get("type") == "text")
         usage = data.get("usage", {})
         cost = CostRecord(
@@ -305,6 +305,35 @@ class AnthropicModelClient:
             cost_usd=estimate_cost(self.model, usage.get("input_tokens", 0), usage.get("output_tokens", 0)),
             calls=1)
         return (text, cost)
+
+    def _post_with_retry(self, payload: bytes, headers: dict) -> dict:  # pragma: no cover - network
+        """POST with bounded exponential backoff. Retries transient faults only — DNS/connection
+        errors (getaddrinfo), timeouts, and HTTP 429/500/502/503/529. Deterministic 4xx
+        (400/401/403/404/422) are NOT retried (they will not fix themselves). Never logs the key."""
+        import random
+        import socket
+        import urllib.error
+        import urllib.request
+
+        last = None
+        for attempt in range(MAX_LIVE_RETRIES + 1):
+            try:
+                req = urllib.request.Request("https://api.anthropic.com/v1/messages",
+                                             data=payload, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRY_STATUS and attempt < MAX_LIVE_RETRIES:
+                    last = f"HTTP {exc.code}"
+                else:
+                    raise  # deterministic 4xx (or retries exhausted) -> surface
+            except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+                if attempt < MAX_LIVE_RETRIES:
+                    last = f"{type(exc).__name__}"
+                else:
+                    raise
+            time.sleep(BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 0.5))
+        raise RuntimeError(f"exhausted retries ({last})")  # unreachable
 
 
 def estimate_cost(model: str, in_tok: int, out_tok: int) -> float:

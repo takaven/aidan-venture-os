@@ -139,7 +139,8 @@ in `common.py` — verify pricing before relying on the dollar numbers.
 Live calls retry transient faults only (DNS/connection/timeout + HTTP 429/5xx) with bounded
 exponential backoff — deterministic 4xx are not retried. Tune via `AIDAN_EVAL_MAX_RETRIES` (default 4)
 and `AIDAN_EVAL_BACKOFF` (default 2.0s). A sanitized summary of the first live run is in
-`dev_summary.md`.
+`dev_summary.md`; the interpretation (C1 ≈ C0 > T on quality and cost — simplicity kill test
+triggered) and the proposed lightweight T revision are in `ANALYSIS_DEV.md`.
 
 > Scoring today applies **no** PASS/AMBIGUOUS/FAIL thresholds. After a real (live) development run we
 > review the numbers, then pre-register the thresholds (`rubrics/primary.md`) **before** any holdout

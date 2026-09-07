@@ -10,27 +10,28 @@
 - **Primary (objective-dominant): 75%** (band 70–80%).
 - **Secondary (qualitative): 25%** (band 20–30%).
 
-Within each group the weights below sum to the group total. Objective metrics dominate so an arm
-cannot win on prose.
+All weights below are **percent of the total** and sum to **100** (primary 75 + secondary 25). Objective
+metrics dominate so an arm cannot win on prose. These weights are mirrored in `scorer/score.py`
+(`WEIGHTS`) — keep the two in sync.
 
 ## Primary metrics — 75%
 
 | # | Metric | Weight | Scored how | Objective / human |
 |---|---|---|---|---|
-| P1 | **Opportunity ranking** — does the arm's ranking match the ground-truth ranking? | 18% | Rank-correlation vs `hidden_ground_truth.ranking` (e.g. top-1 correct + rank distance). | **Objective / deterministic** |
-| P2 | **Kill accuracy** — does it kill exactly the fatally-flawed opportunities and not the sound ones? | 18% | Precision/recall of the arm's KILL set vs `hidden_ground_truth.fund_hold_kill`. | **Objective / deterministic** |
-| P3 | **Critical-unknown identification** — does it name the one unknown the decision actually hinges on? | 15% | Match of the arm's stated critical unknown to `hidden_ground_truth.critical_unknown`. Exact/semantic match is objective; near-misses need light human judgement. | **Mostly objective; human tie-break** |
-| P4 | **Experiment-discrimination quality** — is the proposed cheapest test one that would actually discriminate the critical unknown, within budget? | 12% | Compared to `hidden_ground_truth.good_cheap_test` on: targets the critical unknown, is genuinely cheap/fast, and is decision-changing. | **Human judgement (rubric-guided)** |
-| P5 | **Capital efficiency** — is spend within the case ceiling and directed at the highest decision-value action (not over-scaled)? | 12% | Deterministic ceiling check (fail if over `capital_ceiling_usd`) + allocation vs ground-truth Fund/Hold/Kill. | **Objective / deterministic** |
-| P6 | **Calibration & updating** — is stated confidence proportionate to evidence, and (staged cases) does it update correctly across `T0→T1→T2` without over/under-reacting? | 15% | Staged cases: did the final call move in the correct direction after the contradictory round? Confidence vs evidence strength. | **Mostly objective on staged direction; human on calibration** |
+| P1 | **Opportunity ranking** — does the arm's ranking match the ground-truth ranking? | 15% | Rank-correlation vs `hidden_ground_truth.ranking` (top-1 correct + rank distance). | **Objective / deterministic** |
+| P2 | **Kill accuracy** — does it kill exactly the fatally-flawed opportunities and not the sound ones? | 15% | F1 of the arm's KILL set vs `hidden_ground_truth.fund_hold_kill`. | **Objective / deterministic** |
+| P3 | **Critical-unknown identification** — does it name the one unknown the decision actually hinges on? | 12% | Overlap of the arm's stated critical unknown with `hidden_ground_truth.critical_unknown`; auto keyword-overlap proxy now, human tie-break later. | **Mostly objective; human tie-break** |
+| P4 | **Experiment-discrimination quality** — is the proposed cheapest test one that would actually discriminate the critical unknown, within budget? | 10% | Vs `hidden_ground_truth.good_cheap_test`: within budget + targets the unknown + decision-changing. | **Human judgement (heuristic now)** |
+| P5 | **Capital efficiency** — is spend within the case ceiling and directed at the highest decision-value action (not over-scaled)? | 11% | Deterministic ceiling check (fail if over `capital_ceiling_usd`) + allocation vs ground-truth Fund/Hold/Kill. | **Objective / deterministic** |
+| P6 | **Calibration & updating** — (staged) does the final call end in the correct place after contradictory `T0→T1→T2` evidence, and is confidence proportionate? | 12% | Staged: final decision matches ground truth / expected update direction (deterministic). Non-staged: light confidence-calibration heuristic. | **Objective on staged direction; heuristic otherwise** |
 
 ## Secondary metrics — 25%
 
 | # | Metric | Weight | Objective / human |
 |---|---|---|---|
-| S1 | **Evidence discipline** — load-bearing claims are traceable to the pack; observation vs interpretation kept distinct; no fabricated/hallucinated facts. | 10% | Mostly objective (fabrication is checkable against the pack); human for the obs/interp distinction. |
-| S2 | **Decision usefulness & clarity** — an investor could act on the output directly (clear Fund/Hold/Kill, rationale, next step). | 8% | Human judgement (rubric-guided). |
-| S3 | **Reasoning soundness** — absence of unforced logical errors, no seductive-narrative capture. | 7% | Human judgement (rubric-guided). |
+| S1 | **Evidence discipline** — no fabricated opportunities/facts; observation vs interpretation kept distinct. | 10% | Partly objective now (no invented opportunity ids is checkable); obs/interp distinction is human later. |
+| S2 | **Decision usefulness & clarity** — an investor could act directly (clear Fund/Hold/Kill, rationale, next step). | 8% | Heuristic now (structural completeness); human later. |
+| S3 | **Reasoning soundness** — no unforced logical errors, no seductive-narrative capture. | 7% | Placeholder now (neutral); human later. |
 
 ## Objective vs human judgement — summary
 

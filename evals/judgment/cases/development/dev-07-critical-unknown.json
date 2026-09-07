@@ -1,0 +1,32 @@
+{
+  "case_id": "dev-07-critical-unknown",
+  "title": "Decision hinges on a single unknown — the correct move is the cheap test, not fund or kill",
+  "archetype": "critical-unknown",
+  "staged": false,
+  "capital_ceiling_usd": 400,
+  "mandate": "Decide Fund/Hold/Kill within the ceiling. If the decision hinges on one unresolved unknown that a cheap experiment could settle, the best action may be to HOLD capital and run that test rather than fund or kill now. Identify the critical unknown and design the discriminating test.",
+  "opportunities": [
+    { "id": "A", "name": "TideTally", "summary": "A tool that auto-fills a specific government rebate form for small coastal tourism operators; strong pain, but legality of auto-submission is unverified.", "ask_usd": 400 },
+    { "id": "B", "name": "GlimmerBox", "summary": "A monthly mystery-box of generic gadgets.", "ask_usd": 400 }
+  ],
+  "evidence": {
+    "items": [
+      "A (TideTally): 11 of 13 coastal tourism operators interviewed lose the annual government rebate (avg $2,300 each) because the form is confusing and they miss the deadline. 5 signed LOIs at $19/mo. Strong, quantified, recurring pain.",
+      "A: The product's value depends on programmatically pre-filling and submitting the official rebate form. It is UNKNOWN whether the rebate authority permits third-party automated submission or whether it violates the program's terms — this has not been checked. If auto-submission is prohibited, the core value collapses to a mere reminder (much weaker).",
+      "A: A single email/phone query to the rebate authority (free) or reading the program's published terms would resolve the legality question quickly.",
+      "B (GlimmerBox): Generic subscription box, commodity gadgets, no differentiation, high churn category, 0 demand evidence. Classic weak consumer play."
+    ]
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": "A",
+    "ranking": ["A", "B"],
+    "fund_hold_kill": { "A": "HOLD", "B": "KILL" },
+    "kills": {
+      "B": "Undifferentiated commodity subscription box, high-churn category, no demand evidence. Kill."
+    },
+    "critical_unknown": "Whether the rebate authority permits third-party automated pre-fill/submission of the official form (or whether it is prohibited by the program terms). If prohibited, TideTally's core value collapses to a weak reminder.",
+    "good_cheap_test": "Before committing build capital, resolve the legality with a near-zero-cost step: read the program's published terms and send one written query to the rebate authority. If auto-submission is permitted -> proceed to a paid pilot with the 5 LOI operators; if prohibited -> either pivot to a (weaker) reminder/assist tool or kill.",
+    "rationale": "Tests critical-unknown identification and the discipline to HOLD rather than fund or kill when one cheap test dominates the decision. A is genuinely attractive on pain/willingness-to-pay but entirely gated on the legality unknown; funding the build now is premature, and killing outright wastes a strong opportunity. Correct: HOLD A, run the free/near-free discriminating check, kill B.",
+    "notes": "Not staged. Objective checks: A decision == HOLD (not FUND, not KILL); B == KILL; critical_unknown == legality of automated submission; cheapest test is the free terms-check/authority query (est_cost ~ $0), decision_if_pass/fail branch correctly."
+  }
+}

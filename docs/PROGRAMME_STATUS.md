@@ -8,13 +8,37 @@
 | | |
 |---|---|
 | **Repository** | `takaven/aidan-venture-os` |
-| **Documented main SHA at freeze** | `d4b44ff1c6235559d75796d1213c6319c1316424` |
-| **Documentation freeze date** | 2026-09-06 |
-| **Current programme phase** | **Gate 8 — active, not complete.** Real research / coding-worker / deployment boundaries proven; canonical real **market-ingress** verification unresolved. |
-| **Highest-value unresolved uncertainty** | Whether AIDAN's **venture judgment** (opportunity selection, kill decisions, capital allocation quality) is any good. It is entirely unproven. Everything proven so far is *execution/governance plumbing*, not judgment. |
-| **Exact recommended first action on resumption** | Deterministically fix the Postmark **inbound-domain / Reply-To validation + full-verifier observability** defect (Section H) with **no provider call**, land one bounded repair, and only then adjudicate whether one final owner-controlled live market-ingress proof is justified. Do **not** send another live email before that fix. |
+| **Documented main SHA at doc freeze** | `d4b44ff1c6235559d75796d1213c6319c1316424` |
+| **Strategic-pivot doc SHA** | `b598aeb8d53d26bc39cb8915f49fadf4c5bc33a3` |
+| **Last updated** | 2026-09-07 (strategic pivot) |
+| **Current programme phase** | **STRATEGIC PIVOT — Phase-1 judgment evaluation (binding, 2026-09-07).** All infrastructure work is **parked** (Postmark, Fly, Codex, Factory, Operate, Gate 9, Gate 10). The only allowed work is the judgment evaluation harness in `evals/judgment/`. |
+| **The existential question** | Does the **same frontier model**, routed through AIDAN's structured decision process (**T**), produce **materially better, cost-adjusted** venture decisions than (1) a strong general prompt (**C0**) and (2) a much simpler distilled-AIDAN prompt (**C1**)? If the structure adds no material lift over C1, the structure is not justified. |
+| **Highest-value unresolved uncertainty** | Whether AIDAN's **venture judgment** (opportunity selection, kill decisions, capital allocation quality) is any good — and specifically whether the *structure* earns its complexity. Everything proven so far is *execution/governance plumbing*, not judgment. |
+| **Exact recommended first action on resumption** | **Build and run the blinded, same-model judgment evaluation harness in `evals/judgment/`** (design frozen in `evals/judgment/README.md`). Develop the harness on the development cases, keep the holdout sealed, score with objective-dominant rubrics, and apply the precommitted PASS/AMBIGUOUS/FAIL + simplicity-kill decision tree. **Do NOT resume any infrastructure work** (Postmark/Fly/Codex/Gate 9/10) — it is all parked pending this evaluation. |
 
-**Where a fresh agent should start reading:** `README.md` → this document → `docs/architecture/ARCHITECTURE.md` → relevant ADRs. See also `AGENTS.md` at the repo root.
+**Where a fresh agent should start reading:** `README.md` → this document → `evals/judgment/README.md` → `docs/architecture/ARCHITECTURE.md` → relevant ADRs. See also `AGENTS.md` at the repo root.
+
+---
+
+## 0. Strategic pivot (binding, 2026-09-07)
+
+The programme has **paused all infrastructure work** and pivoted to answering its existential
+question directly. Rationale: three isolated real boundaries (research, coding worker, deployment)
+plus a real-but-unverified market send prove the *plumbing*, but the north-star thesis — that AIDAN's
+**structured decision process** produces better venture judgment — remains entirely untested.
+Continuing to grind infrastructure edges (the Postmark loop being the cautionary example) defers the
+only question that determines whether the whole design is worth building.
+
+**Parked (do not resume this session or without explicit re-authorization):** Postmark market
+ingress, Fly deployment, Codex coding worker, Factory/Execution runtime extensions, Operate runtime,
+Gate 9 exit, Gate 10. Their documented state below (Sections F–L) remains accurate as *parked*
+context; it is **no longer the next action**.
+
+**The only allowed next work** is the Phase-1 judgment evaluation harness under `evals/judgment/`
+(see that directory's `README.md` for the frozen experimental design). Its purpose is to measure
+whether the same frontier model, routed through AIDAN's staged decision process, beats a strong
+general prompt and a simpler distilled prompt on cost-adjusted decision quality — and to **kill the
+structure** if a simpler arm captures nearly all of its benefit.
 
 ---
 
@@ -249,18 +273,25 @@ Before another consequential attempt:
 |---|---|
 | **Gate 0** | COMPLETE / historical foundation preserved (`docs/GATE_0_EXECUTION_RECORD.md`). |
 | **Gates 1–7** | Engineering foundations implemented sufficiently to support current Gate-8 work. (Do not rewrite historical detail beyond repo evidence.) |
-| **Gate 8** | **ACTIVE / NOT COMPLETE.** Proven individual real boundaries: research, coding worker, deployment. Unresolved: canonical real **market-ingress** verification. |
+| **Gate 8** | **PARKED (was active).** Proven individual real boundaries: research, coding worker, deployment. Unresolved and **parked**: canonical real **market-ingress** verification (Sections G–I). Not the next action — see Section 0. |
+| **Phase-1 judgment evaluation** | **ACTIVE / ONLY ALLOWED WORK.** Blinded same-model judgment harness in `evals/judgment/` (skeleton + frozen design present; implementation pending). This is the current programme focus. |
 | **Gate 9** | Engineering work parked on branch `gate9/reliability-matrix`, SHA `2aa69844f971afad6a25df5235f552348dab3715`; historical CI `32557590457` (1054 tests passed). Status: **GATE 9 ENGINEERING EVIDENCE COMPLETE — FORMAL EXIT DEFERRED PENDING GATE 8 SEQUENCE.** **Do NOT merge Gate 9 merely because documentation is being updated.** |
 | **Gate 10** | NOT STARTED / no authorization. |
 
 ---
 
-## K. After market-ingress closure — the real objective
+## K. The real objective — venture judgment
 
 **The programme must NOT return to endless isolated infrastructure completion.**
 
-After canonical market-ingress is proven, the **next major objective is a thin genuine end-to-end
-venture loop:**
+> **Pivot note (2026-09-07):** the judgment question is now being tested **directly and offline
+> first**, via the blinded same-model evaluation harness in `evals/judgment/` (Section 0), *before*
+> any further composed real-world loop. The thin end-to-end venture loop below remains the eventual
+> objective, but it is now **downstream** of the harness proving that AIDAN's structure adds material,
+> cost-adjusted judgment lift. If the harness shows a simpler arm captures nearly all the benefit, the
+> structure is simplified before any composed-loop investment.
+
+The eventual **thin genuine end-to-end venture loop:**
 
 ```
 research → opportunity judgment → Kill Case → assumptions → small capital decision
@@ -342,20 +373,25 @@ fresh agent wants to "confirm" it.**
 
 ## P. Exact resumption plan
 
-When work resumes:
+When work resumes (strategic pivot in effect — Section 0):
 1. Inspect current live `main`.
 2. Read `README.md`.
-3. Read this document (`docs/PROGRAMME_STATUS.md`).
-4. Read `docs/architecture/ARCHITECTURE.md`.
-5. Consult relevant ADRs only as needed.
-6. Verify no material repo drift from this freeze (main should still be
-   `d4b44ff1c6235559d75796d1213c6319c1316424` unless later work landed).
-7. Fix the Postmark **inbound-domain / Reply-To validation + full-verifier observability** defect
-   **deterministically** (Section H).
-8. **No provider call during engineering.**
-9. Review / merge **one** bounded repair.
-10. Only then adjudicate whether **one** final owner-controlled live market-ingress proof is justified.
-11. Once Gate-8 real ingress closes, **leave infrastructure-smoke mode and begin the thin real
-    venture / judgment loop** (Section K).
+3. Read this document (`docs/PROGRAMME_STATUS.md`), especially **Section 0**.
+4. Read **`evals/judgment/README.md`** — the frozen experimental design for the judgment harness.
+5. Read `docs/architecture/ARCHITECTURE.md`; consult ADRs only as needed.
+6. Verify no material repo drift from the pivot (main should be
+   `b598aeb8d53d26bc39cb8915f49fadf4c5bc33a3` plus the pivot PR, unless later work landed).
+7. **Build the Phase-1 judgment evaluation harness in `evals/judgment/`:** author the development
+   cases, the three arm prompts (C0 general, C1 distilled-AIDAN, T AIDAN-staged), the runners, and the
+   objective-dominant scorer — developing only against the **development** cases while the **holdout**
+   stays sealed.
+8. **No live research or provider calls** — all arms run the **same model** on **fixed frozen evidence
+   packs**. Track cost per arm.
+9. Run all three arms blinded, score with the frozen rubric, and apply the precommitted
+   **PASS / AMBIGUOUS / FAIL** decision tree plus the **simplicity kill test** (if C1 captures nearly
+   all of T's benefit → simplify the structure).
+10. Report the result and hand back to the orchestrator. **Do NOT** resume any parked infrastructure
+    (Postmark/Fly/Codex/Gate 9/10) unless the evaluation outcome plus explicit authorization direct it.
 
-**No prospect/customer outreach is authorized. Gate 9 remains parked. Gate 10 is not started.**
+**All infrastructure work is parked. No prospect/customer outreach is authorized. Gate 9 remains
+parked. Gate 10 is not started.**

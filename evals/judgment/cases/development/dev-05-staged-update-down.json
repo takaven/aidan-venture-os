@@ -1,0 +1,40 @@
+{
+  "case_id": "dev-05-staged-update-down",
+  "title": "Staged: an early winning signal is later revealed to be an artifact",
+  "archetype": "seductive-but-weak",
+  "staged": true,
+  "capital_ceiling_usd": 600,
+  "mandate": "Evidence arrives in three rounds (T0 -> T1 -> T2). At the end, decide Fund/Hold/Kill for the opportunity with calibrated confidence. Update correctly as new rounds arrive; do not anchor on the first round.",
+  "opportunities": [
+    { "id": "A", "name": "BrightFunnel", "summary": "A landing-page product for indie course creators; early paid-ad test looked outstanding.", "ask_usd": 600 }
+  ],
+  "evidence": {
+    "rounds": {
+      "T0": [
+        "A (BrightFunnel): First paid-ad landing test converted at an eye-popping 14% to a $29/mo signup — roughly 5x typical. Founder wants to fund the full build immediately.",
+        "The test drove 1,000 clicks and 140 signups in week 1."
+      ],
+      "T1": [
+        "On closer read, 128 of the 140 'signups' came from a single referral source URL, not the paid ad, and that source was a giveaway post ('sign up free to win an iPad').",
+        "Only 12 signups came from the actual paid ad audience — a 1.2% conversion, and none entered card details."
+      ],
+      "T2": [
+        "Follow-up: of the 140 signups, 3 remained after the giveaway ended; 0 converted to paid once a card was required. The 14% headline was an artifact of the giveaway traffic, not genuine paid demand.",
+        "Re-run of a clean paid-ad-only test: 0.9% signup, 0 paid."
+      ]
+    }
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": null,
+    "ranking": ["A"],
+    "fund_hold_kill": { "A": "KILL" },
+    "kills": {
+      "A": "The headline 14% conversion was a measurement artifact from giveaway referral traffic, not paid demand. Clean tests show ~1% signup and 0 paid. Fatal flaw = no genuine paying demand; the attractive T0 number does not survive T1/T2."
+    },
+    "expected_update_direction": "DOWN",
+    "critical_unknown": "Whether the impressive T0 conversion reflects genuine paying demand or an attribution/traffic-source artifact — resolved negatively by T1/T2.",
+    "good_cheap_test": "The clean paid-ad-only test with a card-required step (already effectively run in T2) is exactly the cheap discriminating test; it confirms no paid demand. No further capital warranted.",
+    "rationale": "Tests calibration and correct downward updating. A model that anchors on the T0 14% and funds is mis-calibrated; correct judgment recognises the artifact by T2 and kills, with LOW confidence in the original signal and HIGH confidence in the kill. Over-anchoring on T0 is the failure mode.",
+    "notes": "Staged (T0->T1->T2). Objective checks: final decision A == KILL; expected_update_direction == DOWN (final call worse than T0-implied); kill_reason cites attribution/artifact, not merely 'competition'."
+  }
+}

@@ -17,11 +17,19 @@ Hard rules (frozen design):
 """
 from __future__ import annotations
 
-# TODO: reuse the shared types (Case, ArmResult, CostRecord) from the control runner's module.
-# TODO: load_case(path) -> Case  (frozen evidence pack + metadata; NEVER the answer key at run time)
-# TODO: STAGES = [...]  ordered stage definitions sourced from prompts/t_aidan_staged.md
+# Same case schema and same model-facing/hidden split as control_runner.py — `hidden_ground_truth`
+# MUST be stripped before any model call. Same STRICT shared output JSON is emitted by the FINAL
+# stage (Stage 7) and is the only artifact scored; earlier stages are retained for cost + inspection.
+#
+# TODO: reuse the shared types (Case, ArmResult, CostRecord) + model_facing_view() from the control
+#       runner's module.
+# TODO: load_case(path) -> Case  (keep `hidden_ground_truth` OUT of any model-facing view)
+# TODO: STAGES = [S1 observations, S2 claims/contradictions, S3 Kill Case, S4 critical assumptions,
+#       S5 critical unknown, S6 cheapest discriminating test, S7 capital ranking + final JSON]
+#       sourced from prompts/t_aidan_staged.md; each stage receives the shared context + {{PRIOR}}.
 # TODO: run_stage(stage, state, case) -> (stage_output, cost)  — single model client, no research tools
-# TODO: run_treatment(case) -> ArmResult  — thread state across stages, sum cost across stages
+# TODO: run_treatment(case) -> ArmResult  — thread {{PRIOR}} across stages; SUM cost across ALL stages
+#       (this total is what the simplicity kill test weighs against C1); parse Stage-7 STRICT JSON.
 # TODO: main(): iterate cases/development (or a passed set), write results as JSON for scorer/score.py
 
 

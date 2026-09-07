@@ -1,0 +1,34 @@
+{
+  "case_id": "dev-02-seductive-but-weak",
+  "title": "AI tutor with a huge market and a buried fatal flaw",
+  "archetype": "seductive-but-weak",
+  "staged": false,
+  "capital_ceiling_usd": 1000,
+  "mandate": "Decide whether to fund a single consumer opportunity up to the ceiling. The opportunity has an exciting narrative; determine whether it is genuinely fundable or a seductive trap, and if the latter, name the fatal flaw and kill it cheaply.",
+  "opportunities": [
+    { "id": "A", "name": "LuminaLearn", "summary": "AI personal tutor for K-12 that 'replaces expensive human tutoring' — massive TAM, viral growth story, slick demo.", "ask_usd": 1000 },
+    { "id": "B", "name": "QuietLedger", "summary": "A boring bookkeeping-reminder SMS service for solo tradespeople.", "ask_usd": 300 }
+  ],
+  "evidence": {
+    "items": [
+      "A (LuminaLearn): TAM cited at $100B+ global tutoring. Demo is impressive; a landing page got 5,000 signups from a single viral video.",
+      "A: Of the 5,000 email signups, an activation cohort was emailed a working beta link: 3.1% opened it, 0.4% completed a session, and 0 returned a second week.",
+      "A: The value prop depends on parents paying $20/mo. A pricing survey of 200 signups: 71% said they signed up 'out of curiosity' and would not pay; the 29% 'maybe' skewed to 'if it improves grades', which is unmeasured.",
+      "A: Two incumbents with $80M+ raised already give a similar product away free (ad-supported), and app-store distribution for education is saturated and CAC-heavy.",
+      "A: Retention is the whole game for consumer edtech; the beta shows ~0% week-2 retention.",
+      "B (QuietLedger): 9 of 12 solo tradespeople interviewed forget to log expenses and get penalised at tax time; 4 pre-paid $8/mo for a 3-month pilot of an SMS 'log your receipt' nudge. Tiny but real, cheap to run, retention plausible because the pain recurs monthly."
+    ]
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": "B",
+    "ranking": ["B", "A"],
+    "fund_hold_kill": { "A": "KILL", "B": "FUND" },
+    "kills": {
+      "A": "The seductive one. Huge TAM and viral signups are vanity metrics; the load-bearing fact is ~0% week-2 retention plus survey evidence that signups will not pay, against free well-funded incumbents. Fatal flaw = no retained, paying demand. Kill cheaply despite the exciting narrative."
+    },
+    "critical_unknown": "Whether LuminaLearn can achieve any durable week-over-week retention with paying users — and the evidence already answers it negatively, so it should not consume more capital.",
+    "good_cheap_test": "For B (the real opportunity): extend the paid SMS pilot to ~20 tradespeople for one month (well under ceiling) to confirm paid retention and referral. For A, no further spend is warranted; the existing beta+survey already falsify the paying-retention assumption.",
+    "rationale": "This case tests resistance to narrative capture. A frontier model that anchors on TAM/virality will fund A; correct judgment kills A on the retention+willingness-to-pay evidence and funds the small-but-real B. The critical unknown for A is already resolved negatively by the pack.",
+    "notes": "Not staged. Objective checks: top-1 == B; A in KILL set; A's kill_reason cites retention / no paying demand (not merely 'competition')."
+  }
+}

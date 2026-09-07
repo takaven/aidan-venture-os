@@ -1,0 +1,38 @@
+{
+  "case_id": "dev-01-genuinely-attractive",
+  "title": "Vertical scheduling tool for independent physiotherapy clinics",
+  "archetype": "genuinely-attractive",
+  "staged": false,
+  "capital_ceiling_usd": 500,
+  "mandate": "Allocate up to the capital ceiling to the single best micro-SaaS opportunity for an independent solo founder aiming for a small, durable, profitable software business within 6 months. Rank all opportunities, kill the unsound ones, and prefer a cheap discriminating experiment over premature commitment.",
+  "opportunities": [
+    { "id": "A", "name": "SlotWeaver", "summary": "Booking + no-show-reduction tool purpose-built for independent physiotherapy clinics (2-6 practitioners).", "ask_usd": 500 },
+    { "id": "B", "name": "PulseWrap", "summary": "A general-purpose 'AI calendar assistant' browser extension for anyone.", "ask_usd": 500 },
+    { "id": "C", "name": "GiftLoom", "summary": "A marketplace for handmade corporate gifts.", "ask_usd": 500 }
+  ],
+  "evidence": {
+    "items": [
+      "A (SlotWeaver): Founder ran a physio clinic for 5 years; has warm intros to 40 independent clinics. 12 of 15 clinics interviewed said late cancellations/no-shows cost them 8-15% of revenue and that existing generic booking tools do not do physio-specific reminders or waitlist backfill.",
+      "A: 6 clinics signed a non-binding LOI to pay $39/mo if a waitlist-backfill feature ships; 2 pre-paid a $50 deposit.",
+      "A: Competitor scan shows generic schedulers (broad) and one dental-specific tool, but nothing physio-specific with waitlist backfill. Switching cost is low; clinics already export CSVs.",
+      "A: Build estimate for an MVP (booking + SMS reminders + waitlist backfill) is ~3 weeks solo; SMS costs pass through to clinics.",
+      "B (PulseWrap): Large TAM ('everyone with a calendar'). No specific user segment identified. 0 interviews. Founder cites 'huge market' and 3 competitors with $50M+ raised.",
+      "B: No differentiated wedge; distribution plan is 'go viral on social'.",
+      "C (GiftLoom): Two-sided marketplace. 0 supply signed, 0 demand signed. Founder assumes both sides will appear. Corporate gifting is seasonal and low-frequency.",
+      "C: Marketplace liquidity typically needs far more than $500 to seed both sides."
+    ]
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": "A",
+    "ranking": ["A", "B", "C"],
+    "fund_hold_kill": { "A": "FUND", "B": "KILL", "C": "KILL" },
+    "kills": {
+      "B": "No wedge, no segment, no demand evidence; competing head-on with well-funded incumbents on 'everyone' — undifferentiated, not fundable at this stage.",
+      "C": "Two-sided marketplace with zero liquidity on either side and a budget far too small to seed it; wrong shape for $500."
+    },
+    "critical_unknown": "Will physio clinics actually pay recurring $39/mo once the waitlist-backfill feature exists (do the LOIs convert to paid retention), vs. only expressing interest?",
+    "good_cheap_test": "Convert 2-3 of the LOI clinics to a paid pilot ($39/mo) on a thin manual/concierge waitlist-backfill (no full build) for one month; measure paid conversion and whether no-shows drop. Cheap, fast, and directly resolves willingness-to-pay before the 3-week build.",
+    "rationale": "A pairs a founder-market fit, a specific painful problem quantified by the segment, low switching cost, a shippable MVP within budget, and early willingness-to-pay signal (LOIs + deposits). B and C are classic no-wedge / no-liquidity traps. The correct move is a cheap paid-pilot discriminating test on A before committing the full build.",
+    "notes": "Not staged. Objective checks: top-1 == A; KILL set == {B, C}; critical unknown == willingness-to-pay conversion for A; allocation within $500."
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "case_id": "dev-06-staged-update-up",
+  "title": "Staged: an unpromising-looking opportunity is later revealed to be genuinely strong",
+  "archetype": "genuinely-attractive",
+  "staged": true,
+  "capital_ceiling_usd": 600,
+  "mandate": "Evidence arrives in three rounds (T0 -> T1 -> T2). Decide Fund/Hold/Kill at the end with calibrated confidence. Do not kill prematurely on an ambiguous first round; update correctly as evidence strengthens.",
+  "opportunities": [
+    { "id": "A", "name": "FerroDesk", "summary": "A niche compliance-logging tool for small independent metal-plating workshops.", "ask_usd": 600 }
+  ],
+  "evidence": {
+    "rounds": {
+      "T0": [
+        "A (FerroDesk): Unsexy niche. First 3 cold interviews were lukewarm: workshops said 'we already have a binder', and the founder had no warm network. Surface impression: small, boring, maybe no pain.",
+        "No signups, no LOIs at T0."
+      ],
+      "T1": [
+        "Deeper interviews (12 total) reveal that the 'binder' is exactly the problem: 10 of 12 workshops failed or nearly failed an environmental compliance audit in the last 2 years because paper logs were incomplete; fines ranged $5k-$40k.",
+        "Workshops are legally required to keep these logs; the pain is regulatory, recurring, and expensive."
+      ],
+      "T2": [
+        "5 of the 12 workshops signed LOIs at $89/mo; 2 pre-paid a $100 deposit for a digital audit-ready logging tool. A regional trade association offered to feature the tool in its newsletter (cheap distribution to ~300 similar workshops).",
+        "MVP feasible in ~4 weeks; switching cost low (replace the binder)."
+      ]
+    }
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": "A",
+    "ranking": ["A"],
+    "fund_hold_kill": { "A": "FUND" },
+    "kills": {},
+    "expected_update_direction": "UP",
+    "critical_unknown": "Whether the regulatory pain translates into recurring willingness-to-pay (LOI -> paid retention) — increasingly answered YES across T1/T2 (fines context, signed LOIs, deposits, cheap association distribution).",
+    "good_cheap_test": "Convert 2-3 LOI workshops to a one-month paid concierge pilot ($89/mo) with manual audit-ready logging, and secure the trade-association newsletter slot; confirms paid retention and a cheap distribution channel before the 4-week build. Well within the $600 ceiling.",
+    "rationale": "Tests the inverse failure mode of dev-05: a model that kills on the lukewarm T0 mis-judges. Correct judgment withholds the kill on ambiguous early evidence, updates UP as the regulatory pain and paid signal emerge, and funds with rising confidence. Premature kill at T0 is the failure mode.",
+    "notes": "Staged (T0->T1->T2). Objective checks: final decision A == FUND; expected_update_direction == UP (final call better than T0-implied); A not killed at final; allocation ≤ $600."
+  }
+}

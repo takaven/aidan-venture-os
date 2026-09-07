@@ -1,0 +1,34 @@
+{
+  "case_id": "dev-03-obviously-weak",
+  "title": "Two obviously weak opportunities — kill both quickly",
+  "archetype": "obviously-weak",
+  "staged": false,
+  "capital_ceiling_usd": 300,
+  "mandate": "Decide whether either opportunity merits any capital. If neither is sound, kill both cheaply and preserve the capital — a fast, correct kill is the desired outcome.",
+  "opportunities": [
+    { "id": "A", "name": "EverGlow Coin", "summary": "A new cryptocurrency token whose value 'will grow because more people will buy it'.", "ask_usd": 300 },
+    { "id": "B", "name": "OmniShop", "summary": "'An app that does everything Amazon, Uber, and TikTok do, but better', built solo in 6 months for $300.", "ask_usd": 300 }
+  ],
+  "evidence": {
+    "items": [
+      "A (EverGlow Coin): No product, no utility, no users. The entire thesis is that the token price rises if more people buy it. No mechanism of value beyond speculation; founder has no compliance plan.",
+      "A: Regulatory exposure is high and unaddressed; the only 'evidence' is a Discord of 200 people who joined for a giveaway.",
+      "B (OmniShop): Scope is three of the most capital-intensive businesses in the world, combined, promised solo in 6 months on a $300 budget.",
+      "B: 0 users, 0 interviews, no wedge, no feasible path; the plan is internally impossible on the stated resources.",
+      "General: The capital ceiling is $300. Neither opportunity has any evidence of real, retained demand or a feasible build."
+    ]
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": null,
+    "ranking": ["A", "B"],
+    "fund_hold_kill": { "A": "KILL", "B": "KILL" },
+    "kills": {
+      "A": "No source of value beyond speculation; unaddressed regulatory risk; no product/users. Not an operating venture.",
+      "B": "Physically infeasible scope for the stated time/budget; no wedge, no demand evidence. Impossible on its face."
+    },
+    "critical_unknown": "There is no decision-relevant unknown worth paying to resolve: both fail on already-present, decisive evidence. The correct action is to kill both and preserve capital, not to buy an experiment.",
+    "good_cheap_test": "None warranted — spending any of the $300 to 'test' either would be wasted; the right move is a zero-cost kill of both and holding the full reserve.",
+    "rationale": "This case rewards a fast, cheap, correct double-kill and preservation of capital. A model that tries to fund or even run a paid experiment on either is mis-judging; the evidence is already decisive. total_allocated_usd should be ~0.",
+    "notes": "Not staged. Objective checks: KILL set == {A, B}; total_allocated_usd == 0; no fundable opportunity; no expensive test proposed."
+  }
+}

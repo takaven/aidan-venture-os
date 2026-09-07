@@ -1,0 +1,35 @@
+{
+  "case_id": "dev-04-mixed-portfolio",
+  "title": "Mixed portfolio — one attractive, one seductive-weak, one obviously weak",
+  "archetype": "mixed-portfolio",
+  "staged": false,
+  "capital_ceiling_usd": 800,
+  "mandate": "Rank three opportunities, fund the sound one(s) within the ceiling, kill the unsound ones with their specific fatal flaws, and identify the cheapest experiment that most improves the portfolio decision.",
+  "opportunities": [
+    { "id": "A", "name": "RootRoster", "summary": "Shift-swap + compliance-reminder tool for independent aged-care home managers.", "ask_usd": 500 },
+    { "id": "B", "name": "NimbusVerse", "summary": "A 'metaverse for corporate offsites' with photoreal avatars.", "ask_usd": 800 },
+    { "id": "C", "name": "SnackDash", "summary": "15-minute grocery delivery in a single small town, solo-operated.", "ask_usd": 800 }
+  ],
+  "evidence": {
+    "items": [
+      "A (RootRoster): 8 of 10 aged-care managers interviewed spend 4-6 hrs/week manually reconciling shift swaps against staffing-ratio compliance rules and fear fines. 3 signed LOIs at $59/mo; compliance pain is recurring and regulated (sticky). MVP feasible in ~4 weeks; switching cost low (they use spreadsheets).",
+      "A: Risk — the compliance rules vary by region; the founder has validated one region only.",
+      "B (NimbusVerse): Big vision, striking demo. 0 companies signed. VR offsite tools have repeatedly failed on hardware friction and low repeat usage. No evidence of willingness to pay; needs heavy capital for content.",
+      "C (SnackDash): 15-minute grocery delivery has famously brutal unit economics even at metro scale; solo in one small town has no density, no margin, and the $800 covers almost nothing. 0 demand evidence beyond 'people like fast delivery'.",
+      "General: Ceiling is $800; a good discriminating experiment for A is cheap (concierge pilot in the validated region)."
+    ]
+  },
+  "hidden_ground_truth": {
+    "strongest_opportunity": "A",
+    "ranking": ["A", "B", "C"],
+    "fund_hold_kill": { "A": "FUND", "B": "KILL", "C": "KILL" },
+    "kills": {
+      "B": "Seductive-but-weak: compelling demo, zero paying/committed demand, repeated category failure on hardware friction and repeat usage, capital-hungry. Fatal flaw = no demonstrated demand + wrong capital shape.",
+      "C": "Obviously weak: structurally negative unit economics with no density; $800 cannot buy a test that changes that. Fatal flaw = unit economics + no demand evidence."
+    },
+    "critical_unknown": "Whether RootRoster's compliance value generalises beyond the single validated region (regional rule variation) — the main threat to an otherwise strong, sticky, paying opportunity.",
+    "good_cheap_test": "Run a 3-4 week concierge pilot with the 3 LOI aged-care homes in the validated region at $59/mo, delivering shift-swap+compliance reconciliation manually; confirm paid retention and quantify time saved. Cheap, within ceiling, resolves willingness-to-pay before the build; regional generalisation is a later, separate test.",
+    "rationale": "Tests ranking + kill accuracy + capital efficiency simultaneously: fund A (within $800, e.g. reserve for the pilot), kill B (narrative trap) and C (unit-economics trap) with correct distinct reasons. Critical unknown is A's regional generalisation, and the cheapest decisive test is the paid concierge pilot.",
+    "notes": "Not staged. Objective checks: top-1 == A; KILL set == {B, C}; allocation ≤ $800 and concentrated on A/its pilot; B and C kill reasons are distinct (narrative/demand vs unit-economics)."
+  }
+}

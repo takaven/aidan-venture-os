@@ -1,49 +1,69 @@
 # Primary Rubric — Judgment Evaluation
 
-> **Status:** PLACEHOLDER / design skeleton. The metric *categories* and the objective-dominant split
-> are frozen; the exact per-metric definitions, weights, and numeric thresholds are **TODO** and must
-> be pre-registered (committed) **before** the holdout is scored. See `../README.md`.
+> **Status:** metric families, weights, and the objective/human split are **frozen** below. The
+> numeric **PASS/AMBIGUOUS/FAIL thresholds and the cost-adjustment formula are NOT frozen yet** — they
+> are pre-registered (committed to the repo) **before** the holdout is unsealed (see the placeholder
+> at the end). All scoring is per case against that case's `hidden_ground_truth`, then aggregated.
 
-## Weighting (frozen split)
+## Weighting
 
-- **Objective / verifiable metrics: 70–80%** of the score.
-- **Secondary / qualitative metrics: 20–30%** of the score.
+- **Primary (objective-dominant): 75%** (band 70–80%).
+- **Secondary (qualitative): 25%** (band 20–30%).
 
-Objective metrics dominate so the result cannot be won on prose quality or document completeness.
+Within each group the weights below sum to the group total. Objective metrics dominate so an arm
+cannot win on prose.
 
-## Objective metrics (70–80%) — scored against a per-case answer key
+## Primary metrics — 75%
 
-> TODO: define exact scoring (0/1 or graded) and weights for each. Each metric must be checkable
-> against the case's sealed answer key, not judged subjectively.
+| # | Metric | Weight | Scored how | Objective / human |
+|---|---|---|---|---|
+| P1 | **Opportunity ranking** — does the arm's ranking match the ground-truth ranking? | 18% | Rank-correlation vs `hidden_ground_truth.ranking` (e.g. top-1 correct + rank distance). | **Objective / deterministic** |
+| P2 | **Kill accuracy** — does it kill exactly the fatally-flawed opportunities and not the sound ones? | 18% | Precision/recall of the arm's KILL set vs `hidden_ground_truth.fund_hold_kill`. | **Objective / deterministic** |
+| P3 | **Critical-unknown identification** — does it name the one unknown the decision actually hinges on? | 15% | Match of the arm's stated critical unknown to `hidden_ground_truth.critical_unknown`. Exact/semantic match is objective; near-misses need light human judgement. | **Mostly objective; human tie-break** |
+| P4 | **Experiment-discrimination quality** — is the proposed cheapest test one that would actually discriminate the critical unknown, within budget? | 12% | Compared to `hidden_ground_truth.good_cheap_test` on: targets the critical unknown, is genuinely cheap/fast, and is decision-changing. | **Human judgement (rubric-guided)** |
+| P5 | **Capital efficiency** — is spend within the case ceiling and directed at the highest decision-value action (not over-scaled)? | 12% | Deterministic ceiling check (fail if over `capital_ceiling_usd`) + allocation vs ground-truth Fund/Hold/Kill. | **Objective / deterministic** |
+| P6 | **Calibration & updating** — is stated confidence proportionate to evidence, and (staged cases) does it update correctly across `T0→T1→T2` without over/under-reacting? | 15% | Staged cases: did the final call move in the correct direction after the contradictory round? Confidence vs evidence strength. | **Mostly objective on staged direction; human on calibration** |
 
-- [ ] **Decision correctness** — did the arm reach the correct GO / KILL / DEFER decision?
-- [ ] **Kill discipline** — did it correctly kill the weak/seductive-but-weak cases and not kill the
-      genuinely attractive ones?
-- [ ] **Cheapest-decisive-action identification** — did it name the lowest-cost action that would
-      materially change the capital decision (capital-scarcity doctrine, ADR-037)?
-- [ ] **Capital within scarcity frame** — is the proposed spend within the case's stated scarce frame
-      ($20–$2,000 class), not an over-scaled ask?
-- [ ] **Evidence grounding** — are the load-bearing claims traceable to the frozen evidence pack (no
-      fabricated facts / hallucinated evidence)?
-- [ ] **Assumption / Kill-Case surfacing** — did it surface the decisive assumptions and the condition
-      that would falsify the opportunity?
+## Secondary metrics — 25%
 
-## Secondary metrics (20–30%) — qualitative
+| # | Metric | Weight | Objective / human |
+|---|---|---|---|
+| S1 | **Evidence discipline** — load-bearing claims are traceable to the pack; observation vs interpretation kept distinct; no fabricated/hallucinated facts. | 10% | Mostly objective (fabrication is checkable against the pack); human for the obs/interp distinction. |
+| S2 | **Decision usefulness & clarity** — an investor could act on the output directly (clear Fund/Hold/Kill, rationale, next step). | 8% | Human judgement (rubric-guided). |
+| S3 | **Reasoning soundness** — absence of unforced logical errors, no seductive-narrative capture. | 7% | Human judgement (rubric-guided). |
 
-> TODO: define light rubric + weights. Kept minority so they cannot dominate.
+## Objective vs human judgement — summary
 
-- [ ] Clarity and decision-usefulness of the rationale.
-- [ ] Calibration of stated confidence to evidence strength.
-- [ ] Absence of unforced reasoning errors.
+- **Deterministic (scorer computes directly from the key):** P1, P2, P5, the fabrication check in S1,
+  and the staged-direction part of P6. These carry the majority of the primary weight and make the
+  headline result reproducible.
+- **Human judgement (independent rater, rubric-guided, blind to arm identity):** P4, S2, S3, and the
+  tie-break portions of P3 and P6. Raters must not know which arm produced an output.
 
-## Cost adjustment (required)
+Where a metric is human-judged, the design intent is that the deterministic majority is sufficient to
+detect a **material** difference between arms even if the human-judged minority is noisy.
 
-> TODO: define the exact cost-adjustment formula. The headline comparison is **quality per dollar**,
-> not raw quality. Every arm's tokens/cost per case are recorded by the runners and combined with the
-> rubric score here.
+## Cost adjustment
 
-## Answer keys
+Each arm's per-case tokens/cost are recorded by the runners. The headline metric is
+**quality-per-dollar** (raw rubric score adjusted by cost). The exact formula is part of the
+pre-registration below — it must be frozen before the holdout is scored.
 
-Each case under `cases/` ships (or will ship) a sealed answer key encoding the objective-metric
-ground truth. **TODO:** define the answer-key schema. Answer keys for `holdout/` must never be read
-during harness development.
+## Aggregation
+
+Per case → weighted rubric score in [0, 1]. Per arm → mean (and dispersion) across the case set,
+reported separately for development and holdout. The arm comparison is on the **cost-adjusted**
+aggregate.
+
+## PASS / AMBIGUOUS / FAIL thresholds — PLACEHOLDER (freeze before holdout)
+
+> **TODO — PRE-REGISTER BEFORE UNSEALING THE HOLDOUT.** Do not invent these now. When frozen, fill in:
+>
+> - `material_lift_margin`: the minimum cost-adjusted advantage of T over each control to count as
+>   "material" (not noise).
+> - `cost_adjustment_formula`: exact quality-per-dollar definition.
+> - `simplicity_kill_band`: how close C1 must be to T (cost-adjusted) to fire the simplicity kill.
+> - `noise_band`: dispersion below which differences are treated as ties.
+>
+> The decision tree that consumes these is frozen in `../README.md` (PASS / AMBIGUOUS / FAIL +
+> simplicity kill test). Only the numbers are pending.

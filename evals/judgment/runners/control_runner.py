@@ -15,13 +15,24 @@ Hard rules (frozen design):
 """
 from __future__ import annotations
 
+# Case schema (see cases/development/README.md): model-facing fields are `mandate`,
+# `capital_ceiling_usd`, `opportunities` ({id,name,summary,ask_usd}), and `evidence`
+# (single-shot `items[]` OR staged `rounds.{T0,T1,T2}`). The scorer-only `hidden_ground_truth` key
+# MUST be stripped before any model call.
+#
 # TODO: shared types (Case, ArmResult, CostRecord) — factor out into a small module shared with
 #       treatment_runner.py once implemented.
-# TODO: load_case(path) -> Case  (frozen evidence pack + metadata; NEVER the answer key at run time)
-# TODO: render_prompt(arm, case) using prompts/c0_general.md / prompts/c1_distilled_aidan.md
-# TODO: call_model(prompt) -> (raw_output, cost)  — single model client, no network research tools
-# TODO: parse_decision(raw_output) -> structured decision in the shared output schema
-# TODO: run_arm(arm in {"C0","C1"}, case) -> ArmResult
+# TODO: load_case(path) -> Case  (parse JSON; keep `hidden_ground_truth` OUT of any model-facing view)
+# TODO: model_facing_view(case) -> dict  (drops hidden_ground_truth; asserts the key is absent)
+# TODO: render_evidence(case) -> str  (flatten `items[]`, or concatenate rounds T0->T1->T2 labelled)
+# TODO: render_prompt(arm, case) -> str  (fill {{MANDATE}}, {{CAPITAL_CEILING_USD}}, {{OPPORTUNITIES}},
+#       {{EVIDENCE}} into prompts/c0_general.md (C0) or prompts/c1_distilled_aidan.md (C1); single pass)
+# TODO: call_model(prompt) -> (raw_output, cost)  — single model client, no network/research tools
+# TODO: parse_decision(raw_output) -> dict  (the STRICT shared output JSON: ranking, opportunities[
+#       {id,decision,confidence,rationale,kill_reason,critical_assumptions}], critical_unknown,
+#       cheapest_discriminating_test, capital_allocation, total_allocated_usd, overall_recommendation,
+#       confidence)
+# TODO: run_arm(arm in {"C0","C1"}, case) -> ArmResult  (decision + CostRecord)
 # TODO: main(): iterate cases/development (or a passed set), write results as JSON for scorer/score.py
 
 
